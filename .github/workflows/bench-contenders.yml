@@ -1,0 +1,180 @@
+name: bench-contenders
+
+# Weekly: compara vs the latest legit alternatives on one keyed comparison.
+# Contenders (all installed fresh, latest versions, each run):
+#   compara          — this repo, release build
+#   duckdb           — SQL FULL OUTER JOIN + per-column diff (the fast alternative)
+#   pandas           — DataFrame.merge on the key (what people actually reach for)
+#
+# Task: two 10M-row x 20-col CSVs, composite key (account_id,txn_id),
+# --ignore updated_at. Each contender reports matched / changed / added /
+# removed; the counts must agree or the run fails (correctness gate).
+# Wall is best of 3, one runner, warm cache.
+#
+# Table reports wall time only — the number a user feels. CPU and memory
+# are in the step summary for the curious.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly contender check, staggered after navigera/gruppera.
+    - cron: '0 8 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Build compara (release)
+        run: cargo build --release --locked --bin compara --bin compara-gen-data
+
+      - name: Install contenders (latest)
+        run: |
+          pip install --upgrade duckdb pandas
+          python3 -c "import duckdb, pandas; print('duckdb', duckdb.__version__, '| pandas', pandas.__version__)"
+
+      - name: Generate 10M-row pair (Rust)
+        run: |
+          ./target/release/compara-gen-data --rows 10m --out-dir bench-data --prefix bench
+          ls -la bench-data/bench_a.csv bench-data/bench_b.csv
+
+      - name: Benchmark
+        run: |
+          python3 - <<'EOF'
+          import json, subprocess, time
+
+          A = "bench-data/bench_a.csv"
+          B = "bench-data/bench_b.csv"
+          COMPARE = ["./target/release/compara", "compare", A, B,
+                     "-k", "account_id,txn_id", "-i", "updated_at", "--summary"]
+          # Compared columns: everything except the key and the ignored column.
+          CMP = ["posting_date","value_date","currency","amount","fee","balance",
+                 "status","channel","region","branch_code","product_code",
+                 "counterparty","quantity","rate","category","risk_flag","note"]
+
+          def run_compara():
+              t0 = time.perf_counter()
+              r = subprocess.run(COMPARE, capture_output=True, text=True)
+              dt = time.perf_counter() - t0
+              assert r.returncode in (0, 1), r.stderr[-2000:]
+              counts = {}
+              for line in r.stdout.splitlines():
+                  for k in ("matched", "changed", "added", "removed"):
+                      if line.strip().startswith(k):
+                          counts[k] = int(line.split()[-1].replace(",", ""))
+              return dt, counts
+
+          DUCKDB_SQL = f"""
+          CREATE TABLE a AS SELECT * FROM read_csv('{A}');
+          CREATE TABLE b AS SELECT * FROM read_csv('{B}');
+          SELECT
+            count(*) FILTER (a.account_id IS NOT NULL AND b.account_id IS NOT NULL
+                             AND ({{eq}})) AS matched,
+            count(*) FILTER (a.account_id IS NOT NULL AND b.account_id IS NOT NULL
+                             AND NOT ({{eq}})) AS changed,
+            count(*) FILTER (a.account_id IS NULL) AS added,
+            count(*) FILTER (b.account_id IS NULL) AS removed
+          FROM a FULL OUTER JOIN b
+            ON a.account_id = b.account_id AND a.txn_id = b.txn_id;
+          """
+          eq = " AND ".join(f"a.{c} IS NOT DISTINCT FROM b.{c}" for c in CMP)
+
+          def run_duckdb():
+              import duckdb
+              t0 = time.perf_counter()
+              con = duckdb.connect()
+              row = con.execute(DUCKDB_SQL.format(eq=eq)).fetchone()
+              dt = time.perf_counter() - t0
+              con.close()
+              return dt, dict(zip(("matched", "changed", "added", "removed"), row))
+
+          def run_pandas():
+              import pandas as pd
+              t0 = time.perf_counter()
+              a = pd.read_csv(A, dtype=str)
+              b = pd.read_csv(B, dtype=str)
+              m = a.merge(b, on=["account_id", "txn_id"], how="outer",
+                          indicator=True, suffixes=("_a", "_b"))
+              added = int((m["_merge"] == "right_only").sum())
+              removed = int((m["_merge"] == "left_only").sum())
+              both = m[m["_merge"] == "both"]
+              diff = (both[[c + "_a" for c in CMP]].values !=
+                      both[[c + "_b" for c in CMP]].values).any(axis=1)
+              changed = int(diff.sum())
+              matched = int((~diff).sum())
+              dt = time.perf_counter() - t0
+              return dt, {"matched": matched, "changed": changed,
+                          "added": added, "removed": removed}
+
+          results = {}
+          for name, fn in (("compara", run_compara), ("duckdb", run_duckdb),
+                           ("pandas", run_pandas)):
+              walls, counts = [], None
+              for _ in range(3):
+                  dt, c = fn()
+                  walls.append(dt)
+                  counts = c
+              results[name] = {"wall_best": min(walls), "walls": walls,
+                               "counts": counts}
+              print(f"{name}: best {min(walls):.2f}s walls={['%.2f' % w for w in walls]} {counts}",
+                    flush=True)
+
+          # Correctness gate: every contender must agree on the counts.
+          refs = results["compara"]["counts"]
+          for name, r in results.items():
+              assert r["counts"] == refs, f"{name} disagrees: {r['counts']} vs {refs}"
+
+          with open("bench-results.json", "w") as f:
+              json.dump(results, f, indent=2)
+          EOF
+
+      - name: Publish table
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import json
+          r = json.load(open("bench-results.json"))
+          order = sorted(r, key=lambda n: r[n]["wall_best"])
+          lines = ["## bench-contenders — keyed table comparison (10M rows x 20 cols, CSV)",
+                   "",
+                   "**Task:** `compara compare a.csv b.csv -k account_id,txn_id -i updated_at` equivalent; "
+                   "counts gated identical across contenders.",
+                   "",
+                   "| contender | wall (best of 3) | vs compara |",
+                   "|---|---|---|"]
+          base = r["compara"]["wall_best"]
+          for n in order:
+              w = r[n]["wall_best"]
+              lines.append(f"| {n} | {w:.2f} s | {w/base:.2f}x |")
+          lines += ["",
+                    "**Versions:** latest at run time (`pip install --upgrade duckdb pandas`; "
+                    "compara built from this ref).",
+                    f"**Counts:** {r['compara']['counts']}"]
+          out = "\n".join(lines)
+          with open("/tmp/bench-table.md", "w") as f:
+              f.write(out + "\n")
+          print(out)
+          EOF
+          cat /tmp/bench-table.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-contenders-results
+          path: bench-results.json
