@@ -2,10 +2,11 @@
 //!
 //! This is the Rust twin of `cpp/src/parquet.cpp`, and it makes the same
 //! bargain: it reads exactly what this job needs and refuses the rest by name.
-//! `BYTE_ARRAY` columns, PLAIN and dictionary encodings, uncompressed and
-//! snappy, v1 data pages. That covers what DuckDB, polars and this project's
-//! own generator write for string columns, and it is the shape the comparison
-//! actually meets.
+//! `BYTE_ARRAY` columns and the word-sized types (BOOLEAN, INT32, INT64, FLOAT,
+//! DOUBLE, a decimal in up to eight fixed bytes), PLAIN and dictionary
+//! encodings, uncompressed and snappy, v1 data pages. That covers what DuckDB,
+//! polars and this project's own generator write for string and numeric
+//! columns, and it is the shape the comparison actually meets.
 //!
 //! Two things it does that a general reader would not.
 //!
@@ -37,7 +38,13 @@ fn unsupported<T>(what: &str, path: &str) -> Result<T> {
 }
 
 // parquet.thrift, the handful of values this reader meets.
+const TYPE_BOOLEAN: i64 = 0;
+const TYPE_INT32: i64 = 1;
+const TYPE_INT64: i64 = 2;
+const TYPE_FLOAT: i64 = 4;
+const TYPE_DOUBLE: i64 = 5;
 const TYPE_BYTE_ARRAY: i64 = 6;
+const TYPE_FIXED_LEN_BYTE_ARRAY: i64 = 7;
 const ENC_PLAIN: i64 = 0;
 const ENC_PLAIN_DICTIONARY: i64 = 2;
 const ENC_RLE: i64 = 3;
@@ -128,13 +135,39 @@ pub struct Column {
     /// so this one field says where every slice in the column points: into
     /// `owned` when it is non-empty, into the mapping when it is not.
     pub owned: Vec<u8>,
+    /// Word form, for a column of word-sized values; the fields above are then
+    /// empty.
+    pub words: Option<Words>,
+}
+
+/// A column of word-sized values: one canonical word per row, so that two
+/// cells are the same value exactly when their words are equal. A float has
+/// two zeros and many NaNs, each of which reads as one text, and each is
+/// stored as one word; a null row is zero, with its bit set in `nulls`.
+#[derive(Default)]
+pub struct Words {
+    /// Little-endian: an INT32 sign-extended, an INT64 as it is, a float as its
+    /// bits, a boolean as 0 or 1, a fixed-length decimal as its unscaled value
+    /// sign-extended.
+    pub values: Vec<[u8; 8]>,
+    /// One bit per row that is null, or empty when no row is.
+    pub nulls: Vec<u64>,
+}
+
+impl Words {
+    #[inline]
+    pub fn is_null(&self, row: usize) -> bool {
+        !self.nulls.is_empty() && self.nulls[row >> 6] >> (row & 63) & 1 != 0
+    }
 }
 
 impl Column {
     pub const NULL: i32 = -1;
 
     pub fn rows(&self) -> usize {
-        if self.dictionary {
+        if let Some(words) = &self.words {
+            words.values.len()
+        } else if self.dictionary {
             self.index.len()
         } else {
             self.values.len()
@@ -149,11 +182,20 @@ pub struct Meta {
     pub names: Vec<String>,
     pub rows: i64,
     pub row_groups: usize,
+    /// About how many bytes [`read_column`] holds for each column while it is
+    /// in memory: a word or a handle per row, and for a compressed byte-array
+    /// column the expanded pages its handles point into.
+    pub held: Vec<u64>,
 }
 
 // ---------------------------------------------------------------------------
 // Thrift compact protocol
 // ---------------------------------------------------------------------------
+
+/// How deep `skip` follows nested structs and lists. Parquet's metadata nests
+/// a few levels; a footer nested thousands deep exists only to overflow the
+/// stack of a reader that recurses.
+const MAX_NESTING: u32 = 64;
 
 struct Thrift<'a> {
     d: &'a [u8],
@@ -197,13 +239,27 @@ impl<'a> Thrift<'a> {
     }
 
     fn binary(&mut self) -> Result<&'a [u8]> {
-        let len = self.varint()? as usize;
-        if self.at + len > self.d.len() {
+        let len = self.varint()?;
+        if len > (self.d.len() - self.at) as u64 {
             return fail("a string in the metadata runs past the end", self.path);
         }
-        let out = &self.d[self.at..self.at + len];
-        self.at += len;
+        let out = &self.d[self.at..self.at + len as usize];
+        self.at += len as usize;
         Ok(out)
+    }
+
+    /// A container's element count, refused when the bytes left could not
+    /// hold that many elements (every element, even a bool in a list, takes
+    /// at least one), so a forged count can neither size an allocation nor
+    /// spin a loop.
+    fn count(&mut self, n: u64) -> Result<usize> {
+        if n > (self.d.len() - self.at) as u64 {
+            return fail(
+                "a list in the parquet metadata is longer than the metadata",
+                self.path,
+            );
+        }
+        Ok(n as usize)
     }
 
     /// Reads a field header. Returns the type, or `T_STOP` at the end of a
@@ -218,26 +274,42 @@ impl<'a> Thrift<'a> {
         *id = if delta == 0 {
             self.zigzag()? as i16
         } else {
-            *last + delta as i16
+            last.wrapping_add(delta as i16)
         };
         *last = *id;
         Ok(ty)
     }
 
     /// Reads a list header, returning the element type and the count.
-    fn list(&mut self) -> Result<(u8, u32)> {
+    fn list(&mut self) -> Result<(u8, usize)> {
         let h = self.byte()?;
-        let mut count = ((h & 0xF0) >> 4) as u32;
+        let mut count = ((h & 0xF0) >> 4) as u64;
         if count == 15 {
-            count = self.varint()? as u32;
+            count = self.varint()?;
         }
-        Ok((h & 0x0F, count))
+        Ok((h & 0x0F, self.count(count)?))
     }
 
     /// Steps over a value without interpreting it, so a struct can be read for
     /// the few fields that matter and the rest skipped.
     fn skip(&mut self, ty: u8) -> Result<()> {
+        self.skip_nested(ty, 0, false)
+    }
+
+    /// `skip` at a nesting `depth`; an `element` sits in a list, set or map,
+    /// where a bool takes a byte of its own instead of living in the field
+    /// header.
+    fn skip_nested(&mut self, ty: u8, depth: u32, element: bool) -> Result<()> {
+        if depth > MAX_NESTING {
+            return fail(
+                "the parquet metadata nests deeper than any writer produces",
+                self.path,
+            );
+        }
         match ty {
+            T_TRUE | T_FALSE if element => {
+                self.byte()?;
+            }
             T_TRUE | T_FALSE => {}
             T_BYTE => {
                 self.byte()?;
@@ -256,16 +328,17 @@ impl<'a> Thrift<'a> {
             T_LIST | T_SET => {
                 let (elem, n) = self.list()?;
                 for _ in 0..n {
-                    self.skip(elem)?;
+                    self.skip_nested(elem, depth + 1, true)?;
                 }
             }
             T_MAP => {
                 let n = self.varint()?;
+                let n = self.count(n)?;
                 if n > 0 {
                     let kinds = self.byte()?;
                     for _ in 0..n {
-                        self.skip(kinds >> 4)?;
-                        self.skip(kinds & 0x0F)?;
+                        self.skip_nested(kinds >> 4, depth + 1, true)?;
+                        self.skip_nested(kinds & 0x0F, depth + 1, true)?;
                     }
                 }
             }
@@ -276,7 +349,7 @@ impl<'a> Thrift<'a> {
                     if t == T_STOP {
                         break;
                     }
-                    self.skip(t)?;
+                    self.skip_nested(t, depth + 1, false)?;
                 }
             }
             _ => return fail("unknown type in the parquet metadata", self.path),
@@ -310,6 +383,8 @@ struct FileMeta {
     names: Vec<String>,
     /// 1 where the column may be null.
     optional: Vec<bool>,
+    /// Bytes per value of a FIXED_LEN_BYTE_ARRAY column.
+    type_length: Vec<usize>,
     groups: Vec<RowGroupMeta>,
     rows: i64,
 }
@@ -358,7 +433,7 @@ fn read_row_group(t: &mut Thrift, out: &mut RowGroupMeta) -> Result<()> {
         }
         if id == 1 {
             let (_, n) = t.list()?;
-            out.columns = vec![ChunkMeta::default(); n as usize];
+            out.columns = vec![ChunkMeta::default(); n];
             for c in out.columns.iter_mut() {
                 read_chunk(t, c)?;
             }
@@ -391,16 +466,18 @@ fn read_file_meta(data: &[u8], path: &str) -> Result<FileMeta> {
             2 => {
                 let (_, n) = t.list()?;
                 for i in 0..n {
-                    // SchemaElement: repetition_type is 3, name 4, num_children 5.
+                    // SchemaElement: type_length is 2, repetition_type 3, name 4,
+                    // num_children 5.
                     let (mut sid, mut slast) = (0i16, 0i16);
                     let mut name = String::new();
-                    let (mut repetition, mut children) = (-1i64, 0i64);
+                    let (mut repetition, mut children, mut type_length) = (-1i64, 0i64, 0i64);
                     loop {
                         let st = t.field(&mut sid, &mut slast)?;
                         if st == T_STOP {
                             break;
                         }
                         match sid {
+                            2 => type_length = t.zigzag()?,
                             3 => repetition = t.zigzag()?,
                             4 => name = String::from_utf8_lossy(t.binary()?).into_owned(),
                             5 => children = t.zigzag()?,
@@ -417,12 +494,14 @@ fn read_file_meta(data: &[u8], path: &str) -> Result<FileMeta> {
                     }
                     out.names.push(name);
                     out.optional.push(repetition == 1);
+                    out.type_length
+                        .push(type_length.clamp(0, i32::MAX as i64) as usize);
                 }
             }
             3 => out.rows = t.zigzag()?,
             4 => {
                 let (_, n) = t.list()?;
-                out.groups = vec![RowGroupMeta::default(); n as usize];
+                out.groups = vec![RowGroupMeta::default(); n];
                 for g in out.groups.iter_mut() {
                     read_row_group(&mut t, g)?;
                 }
@@ -688,10 +767,10 @@ impl<'a> RleReader<'a> {
             // straight to the next header while `bit` walks inside it.
             self.packed = true;
             let groups = (h >> 1) as usize;
-            self.left = groups * 8;
+            self.left = groups.saturating_mul(8);
             self.bit = self.at * 8;
-            let run = groups * self.width as usize;
-            self.at = (self.at + run).min(self.d.len());
+            let run = groups.saturating_mul(self.width as usize);
+            self.at = self.at.saturating_add(run).min(self.d.len());
         }
         self.left > 0
     }
@@ -788,11 +867,12 @@ fn plain_slices(
     // rows a group, twenty groups, nine rounds, and the two builds could not be
     // told apart. Twenty groups is too few for a quadratic to show. It stays on
     // the scaling argument, which costs nothing to take.
-    alloc::room(
-        out,
-        count.max(0) as usize,
-        "one handle per value in the page",
-    )?;
+    // Every value takes a four-byte length, so a count the page cannot hold is
+    // refused before it sizes anything.
+    if count < 0 || count as usize > page.len() / 4 {
+        return fail("a parquet page holds fewer values than it says", path);
+    }
+    alloc::room(out, count as usize, "one handle per value in the page")?;
     let mut at = 0usize;
     for _ in 0..count {
         if at + 4 > page.len() {
@@ -820,10 +900,24 @@ fn plain_slices(
 /// something this reader does not implement.
 pub fn read_meta(data: &[u8], path: &str) -> Result<Meta> {
     let fm = read_file_meta(data, path)?;
+    let rows = fm.rows.max(0) as u64;
+    let held = (0..fm.names.len())
+        .map(|c| {
+            let expanded: u64 = fm
+                .groups
+                .iter()
+                .filter_map(|g| g.columns.get(c))
+                .filter(|m| m.ty == TYPE_BYTE_ARRAY && m.codec != CODEC_UNCOMPRESSED)
+                .map(|m| m.total_uncompressed_size.max(0) as u64)
+                .sum();
+            rows.saturating_mul(8).saturating_add(expanded)
+        })
+        .collect();
     Ok(Meta {
         names: fm.names,
         rows: fm.rows,
         row_groups: fm.groups.len(),
+        held,
     })
 }
 
@@ -834,6 +928,14 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
         return fail("no such column in the parquet file", path);
     }
     let optional = fm.optional[which];
+    let ty = fm
+        .groups
+        .first()
+        .and_then(|g| g.columns.get(which))
+        .map_or(TYPE_BYTE_ARRAY, |c| c.ty);
+    if ty != TYPE_BYTE_ARRAY {
+        return read_words(data, &fm, which, ty, path);
+    }
 
     // The column's parts are held as locals rather than in a `Column`, because
     // a page is read *out of* `owned` while its values are pushed *into* `dict`
@@ -899,16 +1001,21 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
         } else {
             c.data_page_offset as usize
         };
-        let stop = at + c.total_compressed_size as usize;
+        let stop = at.saturating_add(c.total_compressed_size.max(0) as usize);
         let mut seen = 0i64;
         let dict_base = dict.len();
 
         while at < stop && at < data.len() && seen < c.num_values {
             let h = read_page_head(data, at, path)?;
-            let body_len = h.compressed as usize;
-            if h.after + body_len > data.len() {
+            // Both sizes are the file's word, so neither may wrap a bound: a
+            // negative one cast to usize would.
+            if h.compressed < 0 || h.compressed as u64 > (data.len() - h.after) as u64 {
                 return fail("a parquet page runs past the file", path);
             }
+            if h.num_values < 0 {
+                return fail("a parquet page has a negative number of values", path);
+            }
+            let body_len = h.compressed as usize;
 
             // Where the page's bytes live, and what a slice into them counts
             // from. `in_owned` is the whole of the distinction.
@@ -1083,7 +1190,240 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
         index,
         values,
         owned,
+        words: None,
     })
+}
+
+/// Reads a column of word-sized values across every row group, into
+/// [`Column::words`]. The page walk is [`read_column`]'s; what differs is that
+/// a value is decoded into its word as it is read, so a dictionary page is
+/// decoded once and its entries copied per row.
+fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) -> Result<Column> {
+    let width = match ty {
+        TYPE_BOOLEAN => 0,
+        TYPE_INT32 | TYPE_FLOAT => 4,
+        TYPE_INT64 | TYPE_DOUBLE => 8,
+        TYPE_FIXED_LEN_BYTE_ARRAY if (1..=8).contains(&fm.type_length[which]) => {
+            fm.type_length[which]
+        }
+        _ => {
+            return unsupported(
+                "only byte-array and word-sized parquet columns are read here",
+                path,
+            );
+        }
+    };
+    let optional = fm.optional[which];
+    let rows = fm.rows.max(0) as usize;
+    let mut values: Vec<[u8; 8]> = alloc::sized(rows, "one value per row")?;
+    let mut nulls: Vec<u64> = Vec::new();
+    let mut dict: Vec<[u8; 8]> = Vec::new();
+    let mut page: Vec<u8> = Vec::new();
+    let mut defs: Vec<i32> = Vec::new();
+    let mut idx: Vec<i32> = Vec::new();
+    let mut got: Vec<[u8; 8]> = Vec::new();
+
+    for rg in &fm.groups {
+        let Some(c) = rg.columns.get(which) else {
+            return fail("a row group is missing a column", path);
+        };
+        if c.ty != ty {
+            return fail("a parquet column changes type between row groups", path);
+        }
+        if c.codec != CODEC_UNCOMPRESSED && c.codec != CODEC_SNAPPY {
+            return unsupported("only uncompressed and snappy parquet are read here", path);
+        }
+        dict.clear();
+        let mut at = if c.dictionary_page_offset > 0 {
+            c.dictionary_page_offset as usize
+        } else {
+            c.data_page_offset as usize
+        };
+        let stop = at.saturating_add(c.total_compressed_size.max(0) as usize);
+        let mut seen = 0i64;
+
+        while at < stop && at < data.len() && seen < c.num_values {
+            let h = read_page_head(data, at, path)?;
+            if h.compressed < 0 || h.compressed as u64 > (data.len() - h.after) as u64 {
+                return fail("a parquet page runs past the file", path);
+            }
+            if h.num_values < 0 {
+                return fail("a parquet page has a negative number of values", path);
+            }
+            let stored = &data[h.after..h.after + h.compressed as usize];
+            let body: &[u8] = if c.codec == CODEC_SNAPPY {
+                page.clear();
+                if !snappy_append(stored, &mut page)? {
+                    return fail(
+                        "a snappy page in the parquet file will not decompress",
+                        path,
+                    );
+                }
+                &page
+            } else {
+                stored
+            };
+            let n_vals = h.num_values as usize;
+
+            if h.ty == PAGE_DICTIONARY {
+                if h.encoding != ENC_PLAIN && h.encoding != ENC_PLAIN_DICTIONARY {
+                    return unsupported("only PLAIN parquet dictionaries are read here", path);
+                }
+                if !plain_words(body, n_vals, ty, width, &mut dict) {
+                    return fail("a parquet page holds fewer values than it says", path);
+                }
+            } else if h.ty == PAGE_DATA {
+                if n_vals > rows - values.len() {
+                    return fail(
+                        "a parquet column holds more values than the file has rows",
+                        path,
+                    );
+                }
+                let mut vat = 0usize;
+                let mut real = n_vals;
+                if optional {
+                    if h.def_encoding != ENC_RLE {
+                        return fail("parquet definition levels are not RLE", path);
+                    }
+                    if body.len() < 4 {
+                        return fail("a parquet page has no definition levels", path);
+                    }
+                    let dl = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+                    if dl > body.len() - 4 {
+                        return fail("a parquet page ends inside its levels", path);
+                    }
+                    fit(&mut defs, n_vals, "definition levels for the page")?;
+                    if !RleReader::new(&body[4..4 + dl], 1).fill(&mut defs[..n_vals]) {
+                        return fail("a parquet page ran out of definition levels", path);
+                    }
+                    real = defs[..n_vals].iter().filter(|&&d| d != 0).count();
+                    vat = 4 + dl;
+                }
+
+                got.clear();
+                if h.encoding == ENC_PLAIN {
+                    if !plain_words(&body[vat..], real, ty, width, &mut got) {
+                        return fail("a parquet page holds fewer values than it says", path);
+                    }
+                } else if h.encoding == ENC_PLAIN_DICTIONARY || h.encoding == ENC_RLE_DICTIONARY {
+                    if dict.is_empty() && real > 0 {
+                        return fail(
+                            "a parquet data page wants a dictionary there is none of",
+                            path,
+                        );
+                    }
+                    let Some(&bits) = body.get(vat) else {
+                        return fail("a parquet page has no bit width", path);
+                    };
+                    if bits > 32 {
+                        return fail("a parquet dictionary index is wider than 32 bits", path);
+                    }
+                    fit(&mut idx, real, "dictionary indices for the page")?;
+                    if !RleReader::new(&body[vat + 1..], bits as u32).fill(&mut idx[..real]) {
+                        return fail("a parquet page ran out of dictionary indices", path);
+                    }
+                    alloc::room(&mut got, real, "the values of a parquet page")?;
+                    for &k in &idx[..real] {
+                        let Some(&word) = dict.get(k as u32 as usize) else {
+                            return fail("a parquet dictionary index is out of range", path);
+                        };
+                        got.push(word);
+                    }
+                } else {
+                    return unsupported(
+                        "only PLAIN and dictionary parquet encodings are read here",
+                        path,
+                    );
+                }
+
+                if real == n_vals {
+                    values.extend_from_slice(&got);
+                } else {
+                    if nulls.is_empty() {
+                        nulls = alloc::filled(0u64, rows.div_ceil(64), "a null flag per row")?;
+                    }
+                    let mut k = 0usize;
+                    for &d in &defs[..n_vals] {
+                        let row = values.len();
+                        if d != 0 {
+                            values.push(got[k]);
+                            k += 1;
+                        } else {
+                            nulls[row >> 6] |= 1u64 << (row & 63);
+                            values.push([0; 8]);
+                        }
+                    }
+                }
+                seen += n_vals as i64;
+            } else if h.ty == PAGE_DATA_V2 {
+                return unsupported("parquet data page v2 is not read here", path);
+            } else if h.ty != PAGE_INDEX {
+                return fail("unknown parquet page type", path);
+            }
+            at = h.after + h.compressed as usize;
+        }
+    }
+    Ok(Column {
+        words: Some(Words { values, nulls }),
+        ..Column::default()
+    })
+}
+
+/// PLAIN values of a word-sized type, appended to `out` as their words.
+/// `false` when the page is too short to hold `count` of them.
+fn plain_words(page: &[u8], count: usize, ty: i64, width: usize, out: &mut Vec<[u8; 8]>) -> bool {
+    if ty == TYPE_BOOLEAN {
+        if count.div_ceil(8) > page.len() {
+            return false;
+        }
+        out.extend((0..count).map(|i| [(page[i / 8] >> (i % 8)) & 1, 0, 0, 0, 0, 0, 0, 0]));
+        return true;
+    }
+    let Some(len) = count.checked_mul(width).filter(|&n| n <= page.len()) else {
+        return false;
+    };
+    out.extend(page[..len].chunks_exact(width).map(|v| word(ty, v)));
+    true
+}
+
+/// One stored value as its word: see [`Words::values`].
+#[inline]
+fn word(ty: i64, v: &[u8]) -> [u8; 8] {
+    let w = match ty {
+        TYPE_INT32 => i32::from_le_bytes(v.try_into().unwrap()) as i64 as u64,
+        TYPE_INT64 => u64::from_le_bytes(v.try_into().unwrap()),
+        TYPE_FLOAT => {
+            let f = f32::from_le_bytes(v.try_into().unwrap());
+            let f = if f == 0.0 {
+                0.0
+            } else if f.is_nan() {
+                f32::NAN
+            } else {
+                f
+            };
+            f.to_bits() as u64
+        }
+        TYPE_DOUBLE => {
+            let f = f64::from_le_bytes(v.try_into().unwrap());
+            let f = if f == 0.0 {
+                0.0
+            } else if f.is_nan() {
+                f64::NAN
+            } else {
+                f
+            };
+            f.to_bits()
+        }
+        // A decimal: big-endian two's complement.
+        _ => {
+            let mut w: i64 = if v[0] & 0x80 != 0 { -1 } else { 0 };
+            for &b in v {
+                w = (w << 8) | b as i64;
+            }
+            w as u64
+        }
+    };
+    w.to_le_bytes()
 }
 
 /// True when the file begins with Parquet's `PAR1` magic. Cheap: four bytes.

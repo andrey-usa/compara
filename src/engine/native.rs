@@ -8,10 +8,11 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::columns::{detect_delimiter, empty_to_null, normalise, resolve};
-use crate::contract::{EngineResult, Val};
+use crate::columns::{detect_delimiter, resolve};
+use crate::contract::EngineResult;
 use crate::error::{Error, Result};
 use crate::options::Options;
+use crate::phases::Phases;
 use crate::rowstore::{RowStore, join};
 use crate::sections::assemble;
 
@@ -19,15 +20,37 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let a_header = read_header(a_path, opt)?;
     let b_header = read_header(b_path, opt)?;
     let resolved = resolve(&a_header, &b_header, opt)?;
+    let mut phases = Phases::new("");
 
-    let a = read_store(a_path, &a_header, &resolved.compared, opt)?;
-    let b = read_store(b_path, &b_header, &resolved.compared, opt)?;
+    // The two files share nothing until the join, so with a second thread to
+    // spare they are read at once.
+    let read_b = || read_store(b_path, &b_header, &resolved.compared, opt);
+    let (a, b) = if opt.thread_budget() > 1 {
+        std::thread::scope(|scope| {
+            let b = scope.spawn(read_b);
+            let a = read_store(a_path, &a_header, &resolved.compared, opt);
+            let b = b
+                .join()
+                .unwrap_or_else(|_| Err(Error::new("reading the B file panicked")));
+            (a, b)
+        })
+    } else {
+        (
+            read_store(a_path, &a_header, &resolved.compared, opt),
+            read_b(),
+        )
+    };
+    let (a, b) = (a?, b?);
+    phases.mark("read (2 ways)");
 
     let dup_a = a.duplicate_section();
     let dup_b = b.duplicate_section();
     let joined = join(&a, &b, opt);
+    phases.mark("join");
     let meta = resolved.meta(&opt.key, a_header.len(), b_header.len());
-    assemble(meta, joined, dup_a, dup_b, opt, &resolved.compared)
+    let out = assemble(meta, joined, dup_a, dup_b, opt, &resolved.compared);
+    phases.mark("assemble");
+    out
 }
 
 /// Opens a CSV reader with the delimiter forced or sniffed from the header.
@@ -70,6 +93,9 @@ fn read_header(path: &Path, opt: &Options) -> Result<Vec<String>> {
     Ok(headers.iter().map(str::to_string).collect())
 }
 
+/// How many rows are read before the rest of the file is estimated from them.
+const EXPECT_AFTER: usize = 10_000;
+
 /// Reads a file straight into a [`RowStore`], projecting and normalising as it goes.
 fn read_store(
     path: &Path,
@@ -85,19 +111,25 @@ fn read_store(
 
     let mut store = RowStore::new(opt, compared);
     let mut rdr = reader(path, opt)?;
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let mut record = csv::StringRecord::new();
+    let mut read = 0usize;
     while rdr
         .read_record(&mut record)
         .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?
     {
-        let row: Vec<Val> = index
-            .iter()
-            .map(|at| match at {
-                Some(i) => normalise(record.get(*i).and_then(empty_to_null), opt),
-                None => None,
-            })
-            .collect();
-        store.add(row);
+        store.add(index.iter().map(|at| at.and_then(|i| record.get(i))), opt)?;
+        read += 1;
+        // A sample of rows says how long one is, and so about how many the
+        // file holds: enough to size the store once rather than let it grow.
+        // No row is shorter than a byte a column, which bounds a sample that
+        // happens to be short.
+        if read == EXPECT_AFTER {
+            let at = rdr.position().byte().max(1);
+            let rows = (size / at).saturating_mul(read as u64) + read as u64;
+            let most = size / index.len().max(1) as u64 + read as u64;
+            store.expect(rows.min(most) as usize);
+        }
     }
     Ok(store)
 }

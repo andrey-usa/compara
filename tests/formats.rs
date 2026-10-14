@@ -218,3 +218,257 @@ fn the_format_comes_from_the_bytes_rather_than_the_name() {
     );
     fs::remove_dir_all(&dir).ok();
 }
+
+/// A typed Parquet value has one rendering, and a CSV of the same data need not
+/// use it: `0.50` for the DOUBLE 0.5, `12345` for the DECIMAL 12345.00, a space
+/// for the `T` of a timestamp, a zero fraction or a `Z`. Against a typed column
+/// those are the same value; before, each was a changed cell, so a CSV compared
+/// with its own export to Parquet came out changed on every row.
+#[test]
+fn a_typed_value_is_compared_by_value_rather_than_by_its_spelling() {
+    let dir = std::env::temp_dir().join(format!("compara-typed-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let header = "id,count,big,ratio,flag,day,at,money\n";
+    let rows = [
+        "K-0000,0,0,0.0,true,1970-01-01,2024-01-01 00:00:00,0",
+        "K-0001,1,1,0.50,false,2024-01-01,2024-01-01 12:34:56.000,1.0",
+        "K-0002,-1,-1,-0.250,true,2024-02-29,1970-01-01T00:00:00Z,-1",
+        "K-0003,42,1099511627776,1.50,true,1969-12-31,2026-09-07 22:15:00,12345",
+        "K-0004,1000,-1099511627776,3.0,false,2000-03-01,1999-12-31 23:59:59+00:00,-12345.0",
+        "K-0005,-1000,7,1e10,false,1999-12-31,2000-01-01 00:00:01,999999",
+        "K-0006,2147483647,8,1.0e-10,true,2038-01-19,2024-06-30 06:30:30.000000,100",
+        "K-0007,-2147483648,9,2.250,false,2026-09-07,2024-12-25 18:45:15,-100",
+    ];
+    let respelled = dir.join("respelled.csv");
+    fs::write(&respelled, format!("{header}{}\n", rows.join("\n"))).expect("write");
+    let parquet = fixture("typed.parquet");
+    for (a, b) in [(&respelled, &parquet), (&parquet, &respelled)] {
+        let result = run(a, b, &mut options(&["id"]));
+        assert_eq!(
+            (result.counts.matched, result.counts.changed),
+            (8, 0),
+            "{}",
+            answer(&result)
+        );
+    }
+
+    // A real change in a typed column is still one, and --tolerance still
+    // applies to the numbers.
+    let mut changed = rows.map(String::from);
+    changed[7] = "K-0007,-2147483648,9,2.26,false,2026-09-07,2024-12-25 18:45:16,-100.01".into();
+    let drifted = dir.join("drifted.csv");
+    fs::write(&drifted, format!("{header}{}\n", changed.join("\n"))).expect("write");
+    let result = run(&drifted, &parquet, &mut options(&["id"]));
+    let per_column: Vec<_> = result
+        .columns
+        .iter()
+        .filter(|c| c.changed > 0)
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(
+        (result.counts.changed, per_column),
+        (1, vec!["ratio", "at", "money"])
+    );
+    let mut opt = options(&["id"]);
+    opt.tolerance = 0.02;
+    let result = run(&drifted, &parquet, &mut opt);
+    let per_column: Vec<_> = result
+        .columns
+        .iter()
+        .filter(|c| c.changed > 0)
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!((result.counts.changed, per_column), (1, vec!["at"]));
+
+    // Between two CSVs there is no type to go by: the text is the value.
+    let result = run(&respelled, &fixture("typed.csv"), &mut options(&["id"]));
+    assert_eq!(result.counts.changed, 8, "{}", answer(&result));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Everything a comparison reports but the run's own facts (which files, how
+/// long, which path), so two paths over one pair can be held to each other
+/// cell for cell.
+fn whole(r: &CompareResult) -> String {
+    let mut v = serde_json::to_value(r).expect("the result serialises");
+    for at in [Some("meta"), None] {
+        let target = match at {
+            Some(k) => v.get_mut(k),
+            None => Some(&mut v),
+        };
+        if let Some(o) = target.and_then(|t| t.as_object_mut()) {
+            for gone in ["a", "b", "seconds", "engine", "generated", "options"] {
+                o.remove(gone);
+            }
+        }
+    }
+    serde_json::to_string(&v).unwrap()
+}
+
+/// A Parquet pair whose columns hold numbers, dates, times and booleans is
+/// compared a column at a time, one word per value, instead of being turned
+/// into rows of text: before, a single such column sent the whole pair to the
+/// row-by-row reader. The answer has to be that reader's -- every count, every
+/// changed cell as it reads, every added, removed and duplicated row -- under
+/// each option that changes how a value is compared.
+#[test]
+fn a_parquet_pair_of_word_columns_is_compared_without_making_rows() {
+    type Tweak = fn(&mut Options);
+    let tweaks: [(&str, Tweak); 6] = [
+        ("defaults", |_| {}),
+        ("--trim", |o| o.trim = true),
+        ("--ignore-case", |o| o.ignore_case = true),
+        ("--empty-is-null", |o| o.empty_is_null = true),
+        ("--tolerance 0.3", |o| o.tolerance = 0.3),
+        ("--max-rows 3", |o| o.max_rows = 3),
+    ];
+    let columnar = |a: &str, b: &str, tweak: Tweak| {
+        let mut opt = options(&["id"]);
+        opt.engine = "auto".to_string();
+        tweak(&mut opt);
+        run(&fixture(a), &fixture(b), &mut opt)
+    };
+    for (a, b) in [
+        ("words_a.parquet", "words_b.parquet"),
+        ("words_a_plain.parquet", "words_b_plain.parquet"),
+    ] {
+        for (label, tweak) in tweaks {
+            let got = columnar(a, b, tweak);
+            assert_eq!(
+                got.meta.engine, "parquet",
+                "{a} {b} {label}: not the columnar path"
+            );
+            let mut rows = options(&["id"]);
+            tweak(&mut rows);
+            let want = run(&fixture(a), &fixture(b), &mut rows);
+            assert_eq!(whole(&got), whole(&want), "{a} against {b}, {label}");
+        }
+    }
+
+    // The fixture's drift, so the agreement above is about something: every
+    // column changes somewhere, and B's -0.0 and NaN are A's 0.0 and NaN.
+    let r = columnar("words_a.parquet", "words_b.parquet", |_| {});
+    assert_eq!(
+        (r.counts.added, r.counts.removed, r.counts.b_dup_keys),
+        (1, 1, 1)
+    );
+    for c in &r.columns {
+        assert!(c.changed > 0, "{} never changes", c.name);
+    }
+    let changed = |name: &str| r.columns.iter().find(|c| c.name == name).unwrap().changed;
+    assert_eq!((changed("ratio"), changed("single")), (30, 7));
+
+    // A column the two files store as different types is not compared word for
+    // word: `small` is INT64 in one, `money` an INT64 decimal against a
+    // fixed-length one in the other. Those pairs read row by row, and the
+    // answer is the same data's.
+    let want = whole(&r);
+    for b in ["words_b_wider.parquet", "words_b_plain.parquet"] {
+        let got = columnar("words_a.parquet", b, |_| {});
+        assert_eq!(got.meta.engine, "turbo", "{b}");
+        assert_eq!(whole(&got), want, "{b}");
+    }
+}
+
+/// `--memory` on two Parquet files decides how many columns are read at once,
+/// and a budget too small for the key columns, their index and one column of
+/// each file is refused before anything is read. The columnar path used to
+/// take any budget and ignore it.
+#[test]
+fn a_parquet_pair_keeps_to_a_stated_memory_budget() {
+    let (a, b) = (fixture("words_a.parquet"), fixture("words_b.parquet"));
+    let mut opt = options(&["id"]);
+    opt.engine = "auto".to_string();
+    let want = whole(&run(&a, &b, &mut opt.clone()));
+
+    let mut tight = opt.clone();
+    tight.memory = Some(4 << 10);
+    let err = compare(&a, &b, &mut tight).expect_err("a 4 KB budget is refused");
+    assert!(
+        err.to_string().contains("more than the 0 MB budget"),
+        "{err}"
+    );
+
+    let mut enough = opt.clone();
+    enough.memory = Some(64 << 20);
+    let got = run(&a, &b, &mut enough);
+    assert_eq!(got.meta.engine, "parquet");
+    assert_eq!(whole(&got), want);
+}
+
+/// A UTF-8 byte order mark (what Excel and many Windows tools write first) is
+/// not part of the first column's name, in any engine that reads the file. It
+/// was, in the byte-level engine: the key `id` became `\u{feff}id` and the
+/// comparison failed with "key column(s) missing".
+#[test]
+fn a_byte_order_mark_is_not_part_of_the_first_column() {
+    let dir = std::env::temp_dir().join(format!("compara-bom-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let with_bom = |name: &str| {
+        let mut bytes = b"\xEF\xBB\xBF".to_vec();
+        bytes.extend(fs::read(fixture(name)).expect("fixture"));
+        let path = dir.join(name);
+        fs::write(&path, bytes).expect("write");
+        path
+    };
+    let (a_bom, b_bom, a_json_bom) = (with_bom("a.csv"), with_bom("b.csv"), with_bom("a.ndjson"));
+    let (a, b) = (fixture("a.csv"), fixture("b.csv"));
+    for engine in ["turbo", "sortmerge", "native"] {
+        let mut opt = options(&["id"]);
+        opt.engine = engine.to_string();
+        let expected = answer(&run(&a, &b, &mut opt.clone()));
+        assert_eq!(
+            answer(&run(&a_bom, &b, &mut opt.clone())),
+            expected,
+            "{engine}: BOM on A"
+        );
+        assert_eq!(
+            answer(&run(&a, &b_bom, &mut opt.clone())),
+            expected,
+            "{engine}: BOM on B"
+        );
+        assert_eq!(
+            answer(&run(&a_bom, &b_bom, &mut opt)),
+            expected,
+            "{engine}: BOM on both"
+        );
+    }
+    let expected = answer(&run(&fixture("a.ndjson"), &b, &mut options(&["id"])));
+    assert_eq!(
+        answer(&run(&a_json_bom, &b, &mut options(&["id"]))),
+        expected,
+        "BOM before JSON"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// sortmerge and native read CSV only. Named on a Parquet or JSON input they
+/// are refused; before, a Parquet pair quietly took the columnar path and
+/// reported it, as if the named engine had been an option it could ignore.
+#[test]
+fn a_csv_only_engine_named_for_parquet_or_json_is_refused() {
+    let pairs = [
+        ("a_plain_none.parquet", "b_dict_snappy.parquet"),
+        ("a_plain_none.parquet", "b.csv"),
+        ("a.ndjson", "b.csv"),
+        ("a.csv", "b.ndjson"),
+    ];
+    for engine in ["sortmerge", "native"] {
+        for (a, b) in pairs {
+            let mut opt = options(&["id"]);
+            opt.engine = engine.to_string();
+            let err = compare(&fixture(a), &fixture(b), &mut opt).expect_err("refused");
+            assert!(
+                err.to_string().contains("reads CSV only"),
+                "{engine} {a} {b}: {err}"
+            );
+        }
+    }
+    for engine in ["auto", "turbo"] {
+        for (a, b) in pairs {
+            let mut opt = options(&["id"]);
+            opt.engine = engine.to_string();
+            run(&fixture(a), &fixture(b), &mut opt);
+        }
+    }
+}

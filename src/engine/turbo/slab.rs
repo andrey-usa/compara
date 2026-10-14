@@ -41,7 +41,12 @@ enum Bytes {
 pub(super) struct Slab {
     bytes: Bytes,
     dialect: Dialect,
+    /// Where the data starts: past a UTF-8 byte order mark, which is not part
+    /// of the first header name (or of the first JSON object).
+    start: usize,
 }
+
+const BOM: &[u8] = b"\xEF\xBB\xBF";
 
 impl Slab {
     /// Maps a file read-only, with a hint that it will be read front to back.
@@ -60,9 +65,11 @@ impl Slab {
         // own. Without the gate this port does not compile on Windows at all.
         #[cfg(unix)]
         let _ = map.advise(memmap2::Advice::Sequential);
+        let start = if map.starts_with(BOM) { BOM.len() } else { 0 };
         Ok(Slab {
             bytes: Bytes::Mapped { _file: file, map },
             dialect: Dialect::Csv,
+            start,
         })
     }
 
@@ -72,7 +79,7 @@ impl Slab {
     pub(super) fn will_need(&self, from: usize, len: usize) {
         #[cfg(unix)]
         if let Bytes::Mapped { map, .. } = &self.bytes {
-            let from = from.min(map.len());
+            let from = (from + self.start).min(map.len());
             let len = len.min(map.len() - from);
             if len > 0 {
                 let _ = map.advise_range(memmap2::Advice::WillNeed, from, len);
@@ -87,6 +94,7 @@ impl Slab {
         Slab {
             bytes: Bytes::Owned(data),
             dialect,
+            start: 0,
         }
     }
 
@@ -100,7 +108,7 @@ impl Slab {
 
     pub(super) fn data(&self) -> &[u8] {
         match &self.bytes {
-            Bytes::Mapped { map, .. } => map,
+            Bytes::Mapped { map, .. } => &map[self.start..],
             Bytes::Owned(v) => v,
         }
     }

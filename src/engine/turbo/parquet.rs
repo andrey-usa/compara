@@ -33,6 +33,8 @@ use super::encoding::{Hybrid, bit_width, delta_binary_packed};
 use super::field::{ABSENT, Field, is_real, pack};
 use super::slab::Slab;
 use super::thrift::{self, kind};
+use crate::alloc;
+use crate::columns::Typed;
 use crate::error::{Error, Result};
 
 const MAGIC: &[u8; 4] = b"PAR1";
@@ -147,6 +149,88 @@ pub(super) fn looks_like_parquet(data: &[u8]) -> bool {
     data.len() >= 12 && &data[..4] == MAGIC && &data[data.len() - 4..] == MAGIC
 }
 
+/// What one column holds, as the columnar path (`pqdiff`) needs to know it: how
+/// its values are stored and how each reads as text. A column of the same kind
+/// in both files can be compared value by value, without rendering a row, and
+/// [`ValueKind::write`] renders the cells a report shows by this reader's rule
+/// -- so the columnar path and this one give the same answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValueKind {
+    physical: Physical,
+    render: Render,
+    type_length: usize,
+}
+
+/// Every leaf column's kind, in schema order. `data` is the whole file.
+pub(crate) fn value_kinds(data: &[u8]) -> Result<Vec<ValueKind>> {
+    if !looks_like_parquet(data) {
+        return Err(Error::new("not a Parquet file"));
+    }
+    let end = data.len();
+    let footer_len =
+        u32::from_le_bytes(data[end - 8..end - 4].try_into().expect("four bytes")) as usize;
+    let from = end
+        .checked_sub(8 + footer_len)
+        .ok_or_else(|| Error::new("the Parquet footer is longer than the file"))?;
+    let (columns, _, _) = read_metadata(&data[from..end - 8])?;
+    Ok(columns
+        .iter()
+        .map(|c| ValueKind {
+            physical: c.physical,
+            render: c.render,
+            type_length: c.type_length,
+        })
+        .collect())
+}
+
+impl ValueKind {
+    /// A byte array read as text: the value is its bytes.
+    pub(crate) fn is_text(self) -> bool {
+        self.physical == Physical::ByteArray && self.render == Render::Text
+    }
+
+    /// Whether the value fits a word: a boolean, an integer, a float, or a
+    /// decimal of up to eight bytes. These are what the columnar path keeps as
+    /// one `u64` per row.
+    pub(crate) fn is_word(self) -> bool {
+        match self.physical {
+            Physical::Boolean
+            | Physical::Int32
+            | Physical::Int64
+            | Physical::Float
+            | Physical::Double => true,
+            Physical::FixedLen => {
+                matches!(self.render, Render::Decimal { .. }) && (1..=8).contains(&self.type_length)
+            }
+            Physical::Int96 | Physical::ByteArray => false,
+        }
+    }
+
+    /// Writes a word-sized value out as text, as [`plain`] would have. `raw` is
+    /// what the columnar reader keeps: an INT32 sign-extended, an INT64 as it
+    /// is, a float as its bits, a boolean as 0 or 1, a fixed-length decimal as
+    /// its unscaled value sign-extended.
+    pub(crate) fn write(self, raw: u64, out: &mut Vec<u8>) {
+        match self.physical {
+            Physical::Boolean => out.extend_from_slice(if raw != 0 { b"true" } else { b"false" }),
+            Physical::Int32 => {
+                let v = raw as i64 as i32;
+                match self.render {
+                    Render::Date => write_date(out, v as i64),
+                    Render::Int { signed: false } => {
+                        write_number(out, (v as u32) as i64, self.render)
+                    }
+                    _ => write_number(out, v as i64, self.render),
+                }
+            }
+            Physical::Int64 | Physical::FixedLen => write_number(out, raw as i64, self.render),
+            Physical::Float => write_f32(out, f32::from_bits(raw as u32)),
+            Physical::Double => write_f64(out, f64::from_bits(raw)),
+            Physical::Int96 | Physical::ByteArray => {}
+        }
+    }
+}
+
 impl Reader {
     pub(super) fn open(path: &Path) -> Result<Reader> {
         let slab = Slab::map(path)?;
@@ -182,6 +266,24 @@ impl Reader {
 
     pub(super) fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// What the column holds, for comparing it with another file's text: its
+    /// typed values are rendered in one canonical spelling (see the module
+    /// notes), so only their value can be compared.
+    pub(super) fn typed(&self, name: &str) -> Typed {
+        match self
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.render)
+        {
+            Some(Render::Int { .. } | Render::Float | Render::Double | Render::Decimal { .. }) => {
+                Typed::Number
+            }
+            Some(Render::Date | Render::Time { .. } | Render::Timestamp { .. }) => Typed::Instant,
+            _ => Typed::Text,
+        }
     }
 
     /// Decodes the wanted columns into row-major field words and the arena they
@@ -743,7 +845,9 @@ impl Reader {
                 Some(dict) if dict < chunk.data_page_offset => dict,
                 _ => chunk.data_page_offset,
             } as usize;
-            let end = (start + chunk.total_compressed_size.max(0) as usize).min(data.len());
+            let end = start
+                .saturating_add(chunk.total_compressed_size.max(0) as usize)
+                .min(data.len());
             let mut at = start;
             // A dictionary belongs to one column chunk, so it is decoded once
             // per row group and every row of that group points into it.
@@ -822,7 +926,13 @@ impl Reader {
                 .ok_or_else(|| Error::new("a Parquet v2 page is shorter than its levels"))?;
             let rest = &body[level_bytes..];
             let values = if header.v2_compressed && chunk.codec != Codec::None {
-                decompress(chunk.codec, rest, header.uncompressed - level_bytes)?
+                let expected = header
+                    .uncompressed
+                    .checked_sub(level_bytes)
+                    .ok_or_else(|| {
+                        Error::new("a Parquet v2 page's levels are longer than the whole page")
+                    })?;
+                decompress(chunk.codec, rest, expected)?
             } else {
                 rest.to_vec()
             };
@@ -850,7 +960,7 @@ impl Reader {
         };
 
         // Which rows have a value at all, and how many values the page holds.
-        let mut present = vec![true; header.num_values];
+        let mut present = alloc::filled(true, header.num_values, "the page's null flags")?;
         let mut wanted = header.num_values;
         if info.max_def_level > 0 {
             let mut hybrid = Hybrid::new(&levels, bit_width(info.max_def_level as u32));
@@ -919,7 +1029,7 @@ fn decode_values(
                 .first()
                 .ok_or_else(|| Error::new("a dictionary-encoded Parquet page is empty"))?;
             let mut hybrid = Hybrid::new(&data[1..], width);
-            let mut out = Vec::with_capacity(count);
+            let mut out = alloc::sized(count, "the values of a Parquet page")?;
             for _ in 0..count {
                 let at = hybrid.next()? as usize;
                 out.push(*dictionary.get(at).ok_or_else(|| {
@@ -931,7 +1041,7 @@ fn decode_values(
         3 => {
             // RLE, which in a data page means booleans.
             let mut hybrid = Hybrid::new(&data[4.min(data.len())..], 1);
-            let mut out = Vec::with_capacity(count);
+            let mut out = alloc::sized(count, "the values of a Parquet page")?;
             for _ in 0..count {
                 out.push(push_bool(arena, hybrid.next()? != 0));
             }
@@ -939,7 +1049,7 @@ fn decode_values(
         }
         5 => {
             let (ints, _) = delta_binary_packed(data, count)?;
-            let mut out = Vec::with_capacity(count);
+            let mut out = alloc::sized(count, "the values of a Parquet page")?;
             for &v in ints.iter().take(count) {
                 out.push(push_number(arena, scratch, v, info));
             }
@@ -948,7 +1058,7 @@ fn decode_values(
         6 => {
             let (lengths, used) = delta_binary_packed(data, count)?;
             let mut at = used;
-            let mut out = Vec::with_capacity(count);
+            let mut out = alloc::sized(count, "the values of a Parquet page")?;
             for &len in lengths.iter().take(count) {
                 let len = len.max(0) as usize;
                 let bytes = data
@@ -966,7 +1076,7 @@ fn decode_values(
             let (suffixes, used2) = delta_binary_packed(&data[used..], count)?;
             let mut at = used + used2;
             let mut previous: Vec<u8> = Vec::new();
-            let mut out = Vec::with_capacity(count);
+            let mut out = alloc::sized(count, "the values of a Parquet page")?;
             for i in 0..count.min(prefixes.len()).min(suffixes.len()) {
                 let prefix = prefixes[i].max(0) as usize;
                 let len = suffixes[i].max(0) as usize;
@@ -1000,7 +1110,7 @@ fn plain(
     arena: &mut Vec<u8>,
     scratch: &mut Vec<u8>,
 ) -> Result<Vec<Field>> {
-    let mut out = Vec::with_capacity(count);
+    let mut out = alloc::sized(count, "the values of a Parquet page")?;
     let mut at = 0usize;
     let short = || Error::new("a plain-encoded Parquet page ends mid-value");
     for i in 0..count {
@@ -1116,17 +1226,21 @@ fn push_scalar(
 /// An integer value, rendered by whatever the column's logical type makes of it.
 fn push_number(arena: &mut Vec<u8>, scratch: &mut Vec<u8>, value: i64, info: &ColumnInfo) -> Field {
     scratch.clear();
-    match info.render {
-        Render::Decimal { scale } => write_decimal(scratch, value as i128, scale),
-        Render::Date => write_date(scratch, value),
-        Render::Time { unit } => write_time(scratch, value, unit),
-        Render::Timestamp { unit, utc } => write_timestamp(scratch, value, unit, utc),
+    write_number(scratch, value, info.render);
+    push_bytes(arena, scratch)
+}
+
+fn write_number(out: &mut Vec<u8>, value: i64, render: Render) {
+    match render {
+        Render::Decimal { scale } => write_decimal(out, value as i128, scale),
+        Render::Date => write_date(out, value),
+        Render::Time { unit } => write_time(out, value, unit),
+        Render::Timestamp { unit, utc } => write_timestamp(out, value, unit, utc),
         _ => {
             let mut buffer = itoa(value);
-            scratch.append(&mut buffer);
+            out.append(&mut buffer);
         }
     }
-    push_bytes(arena, scratch)
 }
 
 fn push_date(arena: &mut Vec<u8>, scratch: &mut Vec<u8>, days: i64) -> Field {

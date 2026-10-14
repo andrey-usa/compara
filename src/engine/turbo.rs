@@ -36,7 +36,7 @@
 mod codec;
 mod encoding;
 mod field;
-mod parquet;
+pub(super) mod parquet;
 mod slab;
 mod text;
 mod thrift;
@@ -53,7 +53,7 @@ use text::{
 };
 
 use crate::alloc;
-use crate::columns::{Resolved, compare_keys, differs, empty_to_null, normalise, resolve};
+use crate::columns::{Resolved, Typed, compare_keys, differs, empty_to_null, normalise, resolve};
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
 use crate::error::{Error, Result};
 use crate::options::Options;
@@ -116,6 +116,9 @@ struct Side {
     slab: Slab,
     rows: Rows,
     width: usize,
+    /// Per field slot, what this file stores (a typed Parquet column renders
+    /// one canonical spelling of each value; text is just text).
+    typed: Vec<Typed>,
 }
 
 impl Side {
@@ -261,6 +264,18 @@ fn plain_differs(a: &Slab, x: Field, xa: bool, b: &Slab, y: Field, yb: bool) -> 
         return xa != yb;
     }
     !same_bytes(a, x, b, y)
+}
+
+/// Whether two present cells, unequal as text, hold the same typed value.
+fn same_value(kind: Typed, a: &Slab, x: Field, b: &Slab, y: Field) -> bool {
+    fn bytes(slab: &Slab, f: Field) -> std::borrow::Cow<'_, [u8]> {
+        if field::is_escaped(f) {
+            slab.logical(f).collect::<Vec<u8>>().into()
+        } else {
+            slab.raw(f).into()
+        }
+    }
+    kind.same_value(&bytes(a, x), &bytes(b, y))
 }
 
 fn cell_differs(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
@@ -2016,6 +2031,11 @@ struct JoinCtx<'a> {
     guard: Option<(u8, usize)>,
     runs: Option<Runs>,
     json_proof: bool,
+    /// Per compared column, whether either file stores it typed: then two
+    /// cells that differ as text but hold the same value are the same, because
+    /// a typed value has no spelling of its own to compare (`31.40` in a CSV is
+    /// the 31.4 a Parquet file stores).
+    typed: Vec<Typed>,
 }
 
 /// One row-join's scratch: the two rows' fields, the runs' spans, and the proof
@@ -2320,7 +2340,12 @@ fn join_row(
         for i in 0..ctx.nc {
             let (x, y) = (scratch.fa[ctx.key_size + i], scratch.fb[ctx.key_size + i]);
             let (xa, yb) = (plain_absent(x), plain_absent(y));
-            if plain_differs(&ctx.a.slab, x, xa, &ctx.b.slab, y, yb) {
+            if plain_differs(&ctx.a.slab, x, xa, &ctx.b.slab, y, yb)
+                && !(ctx.typed[i] != Typed::Text
+                    && !xa
+                    && !yb
+                    && same_value(ctx.typed[i], &ctx.a.slab, x, &ctx.b.slab, y))
+            {
                 any = true;
                 out.changed_per[i] += 1;
                 // Absence is already known rather than asked for again.
@@ -2335,7 +2360,16 @@ fn join_row(
     } else {
         for i in 0..ctx.nc {
             let (x, y) = (scratch.fa[ctx.key_size + i], scratch.fb[ctx.key_size + i]);
-            if cell_differs(&ctx.a.slab, x, &ctx.b.slab, y, ctx.opt) {
+            let differ = if ctx.typed[i] != Typed::Text {
+                ctx.typed[i].differs(
+                    &value(&ctx.a.slab, x, ctx.opt),
+                    &value(&ctx.b.slab, y, ctx.opt),
+                    ctx.opt,
+                )
+            } else {
+                cell_differs(&ctx.a.slab, x, &ctx.b.slab, y, ctx.opt)
+            };
+            if differ {
                 any = true;
                 out.changed_per[i] += 1;
                 if is_absent(&ctx.b.slab, y, ctx.opt) {
@@ -2461,6 +2495,9 @@ fn join_setup<'a>(
     // See `json_values_agree`.
     let json_proof =
         nc > 0 && a.slab.dialect() == Dialect::Json && b.slab.dialect() == Dialect::Json;
+    let typed = (0..nc)
+        .map(|i| Typed::of_pair(a.typed[key_size + i], b.typed[key_size + i]))
+        .collect();
     // Which of B's rows some key of A matched.
     //
     // B's half of the join used to answer "is this key in A?" for every key in
@@ -2493,6 +2530,7 @@ fn join_setup<'a>(
         guard,
         runs,
         json_proof,
+        typed,
     };
     (ctx, seen)
 }
@@ -2712,7 +2750,7 @@ fn join_tail(
             let build = |kept: Option<&KeptRows>| {
                 let (sa, fa) = row_fields(a, ai, kept, true, p.row);
                 let (sb, fb) = row_fields(b, bi, kept, false, p.mate);
-                changed_row(sa, &fa, sb, &fb, key_size, nc, opt)
+                changed_row(sa, &fa, sb, &fb, key_size, &ctx.typed, opt)
             };
             match kept {
                 // A copy that does not decode leaves the file to answer, as
@@ -2759,7 +2797,8 @@ fn join_tail(
         let mut cells: Vec<CellDiff> = Vec::new();
         for i in 0..nc {
             let (x, y) = (&ar[key_size + i], &br[key_size + i]);
-            if differs(x, y, opt) {
+            let differ = ctx.typed[i].differs(x, y, opt);
+            if differ {
                 alloc::push(
                     &mut cells,
                     CellDiff {
@@ -2983,7 +3022,7 @@ fn changed_row(
     sb: &Slab,
     fb: &[Field],
     key_size: usize,
-    nc: usize,
+    typed: &[Typed],
     opt: &Options,
 ) -> Result<(Vec<Val>, Vec<CellDiff>)> {
     let mut keys: Vec<Val> = alloc::sized(key_size, "a changed row's key")?;
@@ -2991,14 +3030,15 @@ fn changed_row(
         keys.push(value_checked(sa, *f, opt, "a changed row's key")?);
     }
     let mut cells: Vec<CellDiff> = Vec::new();
-    for i in 0..nc {
+    for (i, &kind) in typed.iter().enumerate() {
         let (x, y) = (fa[key_size + i], fb[key_size + i]);
         if field::is_real(x) && field::is_real(y) && same_bytes(sa, x, sb, y) {
             continue;
         }
         let xv = value_checked(sa, x, opt, "a changed cell")?;
         let yv = value_checked(sb, y, opt, "a changed cell")?;
-        if differs(&xv, &yv, opt) {
+        let differ = kind.differs(&xv, &yv, opt);
+        if differ {
             alloc::push(
                 &mut cells,
                 CellDiff {
@@ -3535,6 +3575,7 @@ impl Input {
                     slab,
                     rows: Rows::Text { parser, keys, from },
                     width,
+                    typed: vec![Typed::Text; width],
                 })
             }
             Input::Parquet { reader, header } => {
@@ -3543,6 +3584,7 @@ impl Input {
                     .map(|n| header.iter().any(|c| c == *n).then_some(n.as_str()))
                     .collect();
                 let rows = reader.rows();
+                let typed = wanted.iter().map(|n| reader.typed(n)).collect();
                 let (fields, arena) = reader.project(&names, threads, usize::MAX)?;
                 // The mapping is finished with: everything the join reads now
                 // lives in the arena, so the file's pages can be given back.
@@ -3551,6 +3593,7 @@ impl Input {
                     slab: Slab::owned(arena, Dialect::Raw),
                     rows: Rows::Columnar { fields, rows },
                     width,
+                    typed,
                 })
             }
         }

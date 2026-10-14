@@ -3,3 +3,4 @@
 /data/
 /out/
 /compara.toml
+__pycache__/

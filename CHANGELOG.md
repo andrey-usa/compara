@@ -4,6 +4,76 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.5.1] - 2026-10-14
+
+### Changed
+
+- `compare` writes the HTML report only with `-o`/`--out`. Without an output
+  flag it prints the counts and writes nothing; before, it wrote
+  `<a>__vs__<b>.html` into the working directory. `--json` and
+  `--export-dir` write their files on their own, and `--no-compress` without
+  `-o` is an error.
+- `--engine sortmerge` or `--engine native` on a Parquet or JSON input exits 2
+  with a message. Before, a Parquet pair took the columnar path anyway and
+  the report said `parquet`.
+- `--memory` and `COMPARA_MEMORY` apply to two Parquet files: they decide how
+  many columns are read at once, and a pair that needs more than a stated
+  budget is refused before anything is read. Before, the columnar path
+  ignored them.
+- Two Parquet files with boolean, integer, float, date, time, timestamp or
+  decimal columns are compared on the columnar path, a word per value. Before,
+  one such column sent the pair through the row-by-row reader: a 1M-row file
+  written by DuckDB took 1.9 s and 4.5 s of CPU, now 0.4 s and 1.0 s.
+- `native` holds rows packed and indexes keys without copying them: a 1M-row
+  pair took 27 s and 2.9 GB, now 1.6 s and 0.7 GB; 10M rows take 33 s and
+  6.7 GB, where 72 s and 25.7 GB were reported.
+- `sortmerge` reads and sorts the two files at once and merges with a heap:
+  a 1M-row pair took 9.8 s, now 2-3 s; 10M rows 209 s, now 35 s, in 260 MB.
+
+### Fixed
+
+- A CSV or JSON side compared with a Parquet side showed changed cells that
+  held the same value: `31.40` against the DOUBLE 31.4, `12345` against the
+  DECIMAL 12345.00, `2026-09-01 02:15:00` against the timestamp
+  `2026-09-01T02:15:00`. A column Parquet stores as numbers now compares by
+  exact value, and a temporal one by instant; a 100k-row CSV against its own
+  Parquet export went from 100,000 changed rows to none.
+- A UTF-8 byte order mark at the start of a CSV or NDJSON file became part of
+  the first column's name in the default engine (`key column(s) missing`),
+  and made an NDJSON file read as CSV.
+- The weekly contender benchmark now holds DuckDB and pandas to compara's
+  counts on the same question: it counted duplicate keys per row, read empty
+  strings as NULL and did not map `unchanged`.
+
+Hostile Parquet and NDJSON files are refused with exit 2 and a message,
+where before a few bytes could crash or exhaust the process (found by
+mutation fuzzing; each case is a test in `tests/hostile.rs`):
+
+- a zstd page whose stream expands past its header's size was decompressed
+  in full first: a 133 KB file used 8 GB of memory. Decompression now
+  stops one byte past the declared size (zstd, gzip, snappy, LZ4).
+- a footer nested 200,000 structs deep overflowed the stack; nesting past
+  64 levels is refused.
+- a list count larger than the footer could hold sized an allocation of
+  up to 100 GB (abort) or, for lists of bools, looped for hours.
+- a string length, page size or value count near 2^64 or negative wrapped
+  the bounds checks and panicked.
+- a `DELTA_BINARY_PACKED` header claiming a 10^16-value miniblock, and an
+  RLE run of billions of values, were materialized up front (abort).
+- an NDJSON file cut off right after a key's opening quote panicked
+  `head` and `compare`.
+- `--no-compress` reports: a value holding `<!--<script>` kept the
+  report's script from running (a blank page). Every `<` in the embedded
+  JSON is now written `\u003c`.
+
+### Security
+
+- Release workflow: read-only token by default, write access only for the
+  job that creates the release; signed build provenance for the archives;
+  every action pinned to a commit. CI runs `cargo audit`.
+
 ## [0.5.0] - 2026-10-09
 
 First release as a standalone project.
@@ -29,4 +99,5 @@ First release as a standalone project.
 - The data generator and the benchmark harness are `compara-gen-data` and
   `compara-bench` (the latter behind the `bench` feature).
 
+[0.5.1]: https://github.com/andrey-usa/compara/releases/tag/v0.5.1
 [0.5.0]: https://github.com/andrey-usa/compara/releases/tag/v0.5.0

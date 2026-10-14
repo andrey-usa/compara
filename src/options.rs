@@ -96,9 +96,11 @@ pub struct Options {
     pub export_dir: Option<String>,
 
     /// How much memory the comparison may count on, in bytes, or `None` to
-    /// ask the machine (see [`crate::memory`]). It decides whether a large
-    /// pair is joined after both files are indexed or inside A's sweep; it is
-    /// not a cap, and nothing is refused for going past it.
+    /// ask the machine (see [`crate::memory`]). For text it decides whether a
+    /// large pair is joined after both files are indexed or inside A's sweep.
+    /// For two Parquet files it decides how many columns are decoded at once,
+    /// and a pair that needs more than a budget set here even one column at a
+    /// time is refused.
     #[serde(skip)]
     pub memory: Option<u64>,
 

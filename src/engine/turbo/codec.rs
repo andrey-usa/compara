@@ -60,15 +60,23 @@ pub(super) fn decompress(codec: Codec, input: &[u8], expected: usize) -> Result<
         Codec::Snappy => snappy(input, expected)?,
         Codec::Lz4Raw => lz4(input, expected)?,
         Codec::Gzip => {
-            let mut out = Vec::with_capacity(expected);
+            let mut out = crate::alloc::sized(expected, "a decompressed Parquet page")?;
             flate2::read::MultiGzDecoder::new(input)
-                .take(expected as u64)
+                .take(expected as u64 + 1)
                 .read_to_end(&mut out)
                 .map_err(|e| Error::new(format!("a gzip Parquet page will not decode: {e}")))?;
             out
         }
-        Codec::Zstd => zstd::stream::decode_all(input)
-            .map_err(|e| Error::new(format!("a zstd Parquet page will not decode: {e}")))?,
+        // Into a buffer of exactly the size the header gives, which zstd will
+        // not write past: a few kilobytes of zstd can expand to gigabytes, and
+        // decode_all would have produced all of them before the length check.
+        Codec::Zstd => {
+            let mut out = crate::alloc::sized(expected, "a decompressed Parquet page")?;
+            zstd::bulk::Decompressor::new()
+                .and_then(|mut d| d.decompress_to_buffer(input, &mut out))
+                .map_err(|e| Error::new(format!("a zstd Parquet page will not decode: {e}")))?;
+            out
+        }
     };
     if out.len() != expected {
         return Err(Error::new(format!(
@@ -81,6 +89,17 @@ pub(super) fn decompress(codec: Codec, input: &[u8], expected: usize) -> Result<
 
 /// Copies `len` bytes from `distance` back in `out`, which may overlap itself:
 /// a run of the same byte is written as a one-byte match repeated.
+/// Refuses a page that has already decompressed past the size its header
+/// gives, so a forged one cannot expand without bound before the final check.
+fn within(out: &[u8], more: usize, expected: usize) -> Result<()> {
+    if more > expected.saturating_sub(out.len()) {
+        return Err(Error::new(format!(
+            "a Parquet page decompresses past the {expected} bytes its header says"
+        )));
+    }
+    Ok(())
+}
+
 fn copy_within(out: &mut Vec<u8>, distance: usize, len: usize) -> Result<()> {
     if distance == 0 || distance > out.len() {
         return Err(Error::new(
@@ -119,7 +138,7 @@ fn snappy(input: &[u8], expected: usize) -> Result<Vec<u8>> {
             "a snappy Parquet page declares {declared} bytes where its header says {expected}"
         )));
     }
-    let mut out = Vec::with_capacity(expected);
+    let mut out = crate::alloc::sized(expected, "a decompressed Parquet page")?;
     while at < input.len() {
         let tag = input[at];
         at += 1;
@@ -138,6 +157,7 @@ fn snappy(input: &[u8], expected: usize) -> Result<Vec<u8>> {
             len += 1;
             let bytes = input.get(at..at + len).ok_or_else(truncated)?;
             at += len;
+            within(&out, bytes.len(), expected)?;
             out.extend_from_slice(bytes);
             continue;
         }
@@ -167,6 +187,7 @@ fn snappy(input: &[u8], expected: usize) -> Result<Vec<u8>> {
                 )
             }
         };
+        within(&out, len, expected)?;
         copy_within(&mut out, distance, len)?;
     }
     Ok(out)
@@ -174,7 +195,7 @@ fn snappy(input: &[u8], expected: usize) -> Result<Vec<u8>> {
 
 /// LZ4's block format: a token, literals, then a two-byte back-reference.
 fn lz4(input: &[u8], expected: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(expected);
+    let mut out = crate::alloc::sized(expected, "a decompressed Parquet page")?;
     let mut at = 0usize;
 
     let extend = |at: &mut usize, mut len: usize| -> Result<usize> {
@@ -197,6 +218,7 @@ fn lz4(input: &[u8], expected: usize) -> Result<Vec<u8>> {
         let literals = extend(&mut at, (token >> 4) as usize)?;
         let bytes = input.get(at..at + literals).ok_or_else(truncated)?;
         at += literals;
+        within(&out, bytes.len(), expected)?;
         out.extend_from_slice(bytes);
         // The last sequence of a block is literals only, with no match after it.
         if at >= input.len() {
@@ -206,6 +228,7 @@ fn lz4(input: &[u8], expected: usize) -> Result<Vec<u8>> {
         at += 2;
         let distance = u16::from_le_bytes([b[0], b[1]]) as usize;
         let len = extend(&mut at, (token & 0x0f) as usize)? + 4;
+        within(&out, len, expected)?;
         copy_within(&mut out, distance, len)?;
     }
     Ok(out)

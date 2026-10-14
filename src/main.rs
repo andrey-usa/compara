@@ -20,7 +20,8 @@ const USAGE: &str = "\
 usage: compara <command> [options]
 
 commands:
-  compare A B     Compare two CSV files on a composite key and write an HTML report
+  compare A B     Compare two tables on a composite key: print the counts, and with -o
+                  write an HTML report
   columns FILE    Print one file's column names, one per line
   head FILE       Print the first rows of one file (default 10)
   version         Print the version (also --version)
@@ -49,14 +50,16 @@ compare options:
       --engine E          auto | turbo | sortmerge | native
       --threads N
       --memory SIZE       Memory to plan for, e.g. 8G (default: what the machine or
-                          container has free); decides when large files are joined
-                          in one pass instead of two
+                          container has free); decides when large text files are
+                          joined in one pass instead of two, and how many columns of
+                          two Parquet files are read at once; Parquet that needs
+                          more than SIZE one column at a time is refused
       --export-dir DIR    Write full changed/added/removed CSVs here
-  -o, --out PATH          Report path (default: <a>__vs__<b>.html in the current directory)
-      --json PATH         Also write a JSON summary (counts + column stats) here
-      --no-compress       Embed plain JSON instead of gzip (older browsers)
-      --summary           Print the counts and write nothing: no report, no rows (the way to
-                          run without leaving a file behind)
+  -o, --out PATH          Write the HTML report here (no report without it)
+      --json PATH         Write a JSON summary (counts + column stats) here
+      --no-compress       Report: embed plain JSON instead of gzip (older browsers)
+      --summary           Print the counts and write nothing, and refuse any flag that would
+                          (the default without -o, --json or --export-dir)
       --fail-on-dups      Exit 3 when either file has duplicate keys
 
 Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (with --fail-on-dups).
@@ -315,15 +318,12 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
         return Err(Error::new("--key (or a profile with key) is required"));
     }
 
-    // `--summary` is the invocation that writes nothing: it prints the counts
-    // line and stops. That is what the other three ports in this repository do
-    // without an output flag, and it is what the benchmark ladder times -- so
-    // this port was being timed rendering, gzipping and writing a report the
-    // others never built.
-    //
-    // It refuses an output flag rather than quietly ignoring one, because
-    // "write this here" and "write nothing" cannot both be honoured and
-    // guessing which was meant is how a report silently stops appearing.
+    // Without -o there is no report: the counts line is the answer, and the
+    // engine skips collecting the rows a report would embed. `--summary` says
+    // so explicitly, and refuses an output flag rather than quietly ignoring
+    // one, because "write this here" and "write nothing" cannot both be
+    // honoured and guessing which was meant is how a file silently stops
+    // appearing.
     let summary_only = args.flag("summary");
     if summary_only {
         for (flag, short) in [("out", Some("o")), ("json", None), ("export-dir", None)] {
@@ -333,27 +333,28 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
                 )));
             }
         }
-        opt.row_lists = false;
     }
+    let report = args.get("out", Some("o")).map(PathBuf::from);
+    if report.is_none() && args.flag("no-compress") {
+        return Err(Error::new(
+            "--no-compress is about the HTML report; add -o <path> to write one",
+        ));
+    }
+    // The rows a report embeds are also the rows an export writes.
+    opt.row_lists = report.is_some() || opt.export_dir.is_some();
 
     let result = compare(a_path, b_path, &mut opt)?;
 
     let mut written: Option<PathBuf> = None;
-    if !summary_only {
-        let out_path = match args.get("out", Some("o")) {
-            Some(p) => PathBuf::from(p),
-            None => PathBuf::from(format!("{}__vs__{}.html", stem(a_path), stem(b_path))),
-        };
+    if let Some(out_path) = report {
         let html = render(&result, !args.flag("no-compress"))?;
         fs::write(&out_path, html)
             .map_err(|e| Error::new(format!("cannot write {}: {e}", out_path.display())))?;
-
-        if let Some(path) = args.get("json", None) {
-            let summary = serde_json::to_string_pretty(&result.summary())?;
-            fs::write(path, summary)
-                .map_err(|e| Error::new(format!("cannot write {path}: {e}")))?;
-        }
         written = Some(out_path);
+    }
+    if let Some(path) = args.get("json", None) {
+        let summary = serde_json::to_string_pretty(&result.summary())?;
+        fs::write(path, summary).map_err(|e| Error::new(format!("cannot write {path}: {e}")))?;
     }
 
     let c = &result.counts;
@@ -392,12 +393,6 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     // 45ms of a 1.7s run on a 4M-row pair -- for nothing anyone can observe.
     std::mem::forget(result);
     Ok(code)
-}
-
-fn stem(path: &Path) -> String {
-    path.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 /// Groups a count with thousands separators, matching the other implementations.

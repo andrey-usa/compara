@@ -33,11 +33,23 @@ pub struct Memory {
 /// `COMPARA_MEMORY` (bytes, or with a K, M, G or T suffix). Where nothing can
 /// be read, 16 GB is assumed.
 pub fn streaming_threshold(budget: Option<u64>) -> u64 {
-    let available = budget
-        .or_else(from_env)
+    available(budget) / 2
+}
+
+/// What a comparison may count on: the budget it was given, `COMPARA_MEMORY`,
+/// or what the machine has free without swapping, in that order; 16 GB where
+/// nothing can be read.
+pub fn available(budget: Option<u64>) -> u64 {
+    stated(budget)
         .or_else(|| probe().map(|m| m.available.min(m.limit)))
-        .unwrap_or(16 << 30);
-    available / 2
+        .unwrap_or(16 << 30)
+}
+
+/// The budget someone set, by `--memory` or `COMPARA_MEMORY`, as distinct from
+/// one the probe found. A stated budget is a limit to keep to; a probed one is
+/// only a guide to planning.
+pub fn stated(budget: Option<u64>) -> Option<u64> {
+    budget.or_else(from_env)
 }
 
 fn from_env() -> Option<u64> {

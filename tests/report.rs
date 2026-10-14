@@ -81,22 +81,22 @@ fn the_gzip_payload_is_smaller_than_plain_json() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// An uncompressed payload sits inside a `<script>`, where a literal `</` would
-/// end the element early and break the page.
+/// An uncompressed payload sits inside a `<script>`, where markup in a value
+/// can end the element early (`</script>`) or, subtler, keep it from ending at
+/// all (`<!--<script>`, which leaves the element's own end tag as data and the
+/// report's code with it). No `<` may reach the page; JSON reads `\u003c`.
 #[test]
-fn a_plain_payload_escapes_the_script_end() {
+fn a_plain_payload_holds_no_markup() {
     let (mut result, dir) = sample();
-    result.meta.a.name = "a</script>x.csv".to_string();
-    let html = render(&result, false).expect("render");
-    let (mode, body) = payload(&html);
-    assert_eq!(mode, "json");
-    assert!(
-        !body.contains("</script>"),
-        "the payload can end its own element"
-    );
-    let decoded: serde_json::Value =
-        serde_json::from_str(&body.replace("<\\/", "</")).expect("valid JSON");
-    assert_eq!(decoded["meta"]["a"]["name"], "a</script>x.csv");
+    for name in ["a</script>x.csv", "a<!--<script>x.csv", "<!--"] {
+        result.meta.a.name = name.to_string();
+        let html = render(&result, false).expect("render");
+        let (mode, body) = payload(&html);
+        assert_eq!(mode, "json");
+        assert!(!body.contains('<'), "markup in the payload: {name}");
+        let decoded: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(decoded["meta"]["a"]["name"], name);
+    }
     let _ = fs::remove_dir_all(dir);
 }
 

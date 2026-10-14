@@ -129,19 +129,27 @@ fn base64(data: &[u8]) -> Result<String> {
     String::from_utf8(buf).map_err(|_| Error::new("the base64 payload is not UTF-8"))
 }
 
-/// `s.replace("</", "<\\/")` that refuses instead of aborting.
+/// JSON made safe to sit inside a `<script>` element: every `<` written as
+/// `\u003c`, which JSON reads back as the same character. Escaping only `</`
+/// was not enough: a value holding `<!--<script>` puts the HTML parser in the
+/// script element's "double escaped" state, where the element's own `</script>`
+/// no longer ends it and the report's code is swallowed as data. In JSON a `<`
+/// can only stand inside a string, so the rewrite is always valid. Refuses
+/// rather than aborts when the copy does not fit.
 fn escaped_script_text(s: &str) -> Result<String> {
-    // One extra byte per occurrence; asking for the whole length plus that is a
-    // single reserve rather than a doubling walk.
-    let mut out: Vec<u8> =
-        crate::alloc::sized(s.len() + s.matches("</").count(), "the report payload")?;
-    let mut rest = s;
-    while let Some(at) = rest.find("</") {
-        out.extend_from_slice(&rest.as_bytes()[..at]);
-        out.extend_from_slice(b"<\\/");
-        rest = &rest[at + 2..];
+    // Five extra bytes per `<`; one reserve for all of it rather than a
+    // doubling walk.
+    let lt = s.bytes().filter(|&b| b == b'<').count();
+    let mut out: Vec<u8> = crate::alloc::sized(s.len() + 5 * lt, "the report payload")?;
+    for part in s.as_bytes().split_inclusive(|&b| b == b'<') {
+        match part.split_last() {
+            Some((b'<', head)) => {
+                out.extend_from_slice(head);
+                out.extend_from_slice(b"\\u003c");
+            }
+            _ => out.extend_from_slice(part),
+        }
     }
-    out.extend_from_slice(rest.as_bytes());
     String::from_utf8(out).map_err(|_| Error::new("the report payload is not UTF-8"))
 }
 

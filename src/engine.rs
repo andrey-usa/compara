@@ -85,16 +85,27 @@ fn run(
 ) -> Result<(EngineResult, String)> {
     // Parquet is not a text format and is not read as one. Two Parquet files go
     // to the columnar path, which never materialises a row: it joins on the key
-    // columns and then compares whole columns as integers. None of sortmerge or
-    // native can read Parquet at all, so naming one of those does not change the
-    // route -- but `--engine turbo` now does, because there is a second reader
-    // behind it and asking for it should reach it.
+    // columns and then compares whole columns as integers. `--engine turbo`
+    // changes the route, because there is a second reader behind it and asking
+    // for it should reach it.
     //
     // One Parquet file against a text one has no column to compare a byte
     // stream against, so that path is not available. `turbo` reads it anyway,
     // by decoding the pages into rows (`turbo/parquet.rs`); it costs what the
     // columnar path exists to avoid, and it answers the question rather than
     // refusing it.
+    //
+    // sortmerge and native read CSV only, so naming one of them on a Parquet
+    // or JSON input is refused: taking another path instead would report an
+    // answer from an engine that was not asked for.
+    if matches!(requested, Engine::SortMerge | Engine::Native)
+        && (turbo::only_this_engine_reads(a) || turbo::only_this_engine_reads(b))
+    {
+        return Err(Error::new(format!(
+            "the {requested} engine reads CSV only; for Parquet or JSON use --engine auto \
+             (or turbo)"
+        )));
+    }
     let (a_pq, b_pq) = (pqdiff::is_parquet(a), pqdiff::is_parquet(b));
     if a_pq && b_pq {
         // `requested`, not `engine`: `auto` has already been resolved to
@@ -130,12 +141,6 @@ engine, which reads more of the format, failed too: {turbo_err}"
             }
             Err(e) => return Err(Error::new(format!("the parquet engine failed: {e}"))),
         }
-    }
-    if (a_pq || b_pq) && !matches!(engine, Engine::Turbo | Engine::Auto) {
-        return Err(Error::new(format!(
-            "the {engine} engine cannot read parquet; use --engine turbo, \
-             or convert the other side to parquet too"
-        )));
     }
     if a_pq || b_pq {
         return turbo::compare(a, b, opt)

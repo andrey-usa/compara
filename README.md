@@ -40,20 +40,22 @@ and the same binaries through package managers:
 
 ```sh
 compara compare a.csv b.csv -k account_id,txn_id -i updated_at
+compara compare a.csv b.csv -k account_id,txn_id -i updated_at -o report.html
 compara compare a.csv b.csv -k account_id,txn_id --trim --tolerance 0.005
-compara compare export.csv warehouse.parquet -k id --summary
+compara compare export.csv warehouse.parquet -k id
 compara compare a.csv b.csv --profile orders --json summary.json --export-dir out/
 compara columns data.parquet          # column names (reads only the footer)
 compara head data.ndjson -n 5         # first rows, aligned
 ```
 
-`compare` writes `<a>__vs__<b>.html` (or `--out PATH`): counts, per-column
-statistics, and the changed, added, removed and duplicate rows, each section
-capped at `--max-rows` (counts are always exact). [`examples/report.html`](examples/report.html)
-is one, made from the two files next to it:
+`compare` prints the counts and writes nothing else unless asked. `-o PATH`
+writes the HTML report: counts, per-column statistics, and the changed,
+added, removed and duplicate rows, each section capped at `--max-rows`
+(counts are always exact). [`examples/report.html`](examples/report.html) is
+one, made from the two files next to it:
 
 ```sh
-compara compare examples/orders_2026-08.csv examples/orders_2026-09.csv -k order_id,line_no -i updated_at
+compara compare examples/orders_2026-08.csv examples/orders_2026-09.csv -k order_id,line_no -i updated_at -o examples/report.html
 ```
 
 | Option | Effect |
@@ -64,14 +66,15 @@ compara compare examples/orders_2026-08.csv examples/orders_2026-09.csv -k order
 | `--trim`, `--ignore-case`, `--empty-is-null` | normalisation before comparing (applies to key and values) |
 | `--tolerance` | absolute numeric tolerance where both sides parse as numbers |
 | `--delimiter`, `--encoding` | override auto-detection (CSV only) |
-| `--threads` | how wide the default engine runs; the default is every core |
-| `--memory` | memory to plan for (e.g. `8G`); decides when large files are joined in one pass instead of two |
+| `--threads` | how wide the engines run; the default is every core |
+| `--memory` | memory to plan for (e.g. `8G`); decides when large text files are joined in one pass instead of two, and how many columns of two Parquet files are read at once (a Parquet pair that needs more than a stated budget is refused) |
 | `--max-rows` | rows embedded per report section (default 50 000) |
+| `-o`, `--out` | write the HTML report here; there is no report without it |
 | `--export-dir` | full, uncapped changed/added/removed CSVs |
-| `--json` | also write a JSON summary (counts and column stats; schema in `docs/contract.schema.json`) |
-| `--summary` | print the counts and write nothing |
-| `--engine` | `auto` (default), `turbo`, `sortmerge` or `native` |
-| `--no-compress` | plain JSON payload in the report, for pre-2023 browsers |
+| `--json` | write a JSON summary (counts and column stats; schema in `docs/contract.schema.json`) |
+| `--summary` | print the counts and refuse any flag that writes a file (the default without `-o`, `--json` or `--export-dir`) |
+| `--engine` | `auto` (default), `turbo`, `sortmerge` or `native`; `sortmerge` and `native` read CSV only |
+| `--no-compress` | plain JSON payload in the report, for pre-2023 browsers (with `-o`) |
 | `--fail-on-dups` | exit 3 when either file has duplicate keys |
 
 Duplicate keys are counted and listed per file; the first occurrence of each
@@ -114,7 +117,11 @@ order.
 
 All three read values as text, with no type inference, so `1.0` and `1` stay
 different unless a tolerance is set, and all three treat an empty field as
-absent whether or not it is quoted.
+absent whether or not it is quoted. A Parquet column is the exception, on
+either side: it stores typed values, so a column it holds as numbers
+compares by value with the other file's text (`31.40` against the DOUBLE
+31.4 is no change), and a date, time or timestamp column by instant (`T` or
+a space, a zero fraction or none, `Z` or nothing).
 
 ### Input formats
 
@@ -123,7 +130,7 @@ magic number, a leading `{`, or a CSV header.
 
 | Format | How it is read |
 |---|---|
-| CSV | mapped, scanned eight bytes at a time; a field is an offset and a length |
+| CSV | mapped, scanned eight bytes at a time; a field is an offset and a length; a UTF-8 byte order mark is skipped |
 | newline-delimited JSON | the same, addressed by key rather than by column number; `\uXXXX` is decoded, so an escaped and a literal character compare equal |
 | Parquet | pages decoded into an arena; dictionary-encoded columns point at the dictionary entry, so a repeated value costs eight bytes a row |
 
@@ -138,6 +145,15 @@ A typed Parquet value is rendered to text by a fixed rule: byte arrays as their
 bytes, booleans `true`/`false`, integers and decimals in full, floats in the
 shortest round-trip form, dates `YYYY-MM-DD`, timestamps ISO 8601.
 `tests/fixtures/formats/typed.csv` is that rule written down.
+
+Two Parquet files take a columnar path instead, which never builds a row: it
+joins on the key columns, then compares one column at a time, string columns
+by dictionary id or bytes and booleans, integers, floats, dates, times,
+timestamps and decimals of up to eight bytes as one word per value. A cell is
+rendered by the rule above only when the report shows it. A column the two
+files store as different types, or with a codec or encoding outside PLAIN,
+dictionary, snappy and v1 pages, goes the row-by-row way instead, with the
+same answer.
 
 ## Contributing
 

@@ -348,7 +348,7 @@ fn an_engine_that_cannot_read_parquet_says_so() {
     let err = compare(&f.path("a", ".parquet"), &f.path("b", ".csv"), &mut opt)
         .expect_err("sortmerge cannot read parquet");
     assert!(
-        err.to_string().contains("cannot read parquet"),
+        err.to_string().contains("reads CSV only"),
         "the error should say which: {err}"
     );
 }

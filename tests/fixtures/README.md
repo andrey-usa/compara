@@ -44,6 +44,9 @@ CSV, as newline-delimited JSON, or as any of the Parquet encodings a writer migh
 | `a_delta_v2.parquet` | version-2 data pages with the DELTA_BYTE_ARRAY family, a different decoder |
 | `a_dict_row_groups.parquet` | five row groups, so a dictionary has to be carried per column chunk |
 | `typed.parquet` + `typed.csv` | every non-string type, against the text it is required to render as |
+| `words_a.parquet`, `words_b.parquet` | a pair of numbers, dates, times and booleans, with nulls, both zeros, NaN and infinities, on dictionary pages: the columnar path compares these a word per value and must give the row-by-row answer |
+| `words_a_plain.parquet`, `words_b_plain.parquet` | the same pair on plain uncompressed pages, with the decimals stored as integers, as DuckDB writes them |
+| `words_b_wider.parquet` | B with one column stored as INT64, which the columnar path does not compare word for word with A's INT32 |
 
 They are written by pyarrow (`scripts/make_parquet_fixtures.py`), not by this project: a reader
 tested only against files its own writer produced tests nothing. `typed.csv` is the stated
@@ -62,3 +65,15 @@ Its `pad` column holds values that are only whitespace, which generated data nev
 `--trim` such a value is `""`, and `""` is a value: only `--empty-is-null` makes it absent. The
 Parquet path once read it as absent under `--trim` alone, and gave a different answer
 for the same rows as Parquet than as CSV.
+
+# Hostile
+
+`hostile/` holds Parquet files that are not meant to be compared at all: each broke a reader once,
+and `tests/hostile.rs` requires a clean refusal from all of them. The rest of that test's cases are
+footers small enough to write inline.
+
+| File | What it was |
+|---|---|
+| `zstd_bomb.parquet` | one zstd page whose header says 36 KB and whose stream inflates to 256 MB of zeros (written by pyarrow, then the page body swapped) |
+| `negative_page_size.parquet` | a mutant of `formats/b_dict_snappy.parquet` with a negative compressed page size |
+| `delta_header.parquet` | a mutant of `formats/a_delta_v2.parquet` whose `DELTA_BINARY_PACKED` header asks for a 10^16-value miniblock |

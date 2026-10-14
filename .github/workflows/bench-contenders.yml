@@ -7,8 +7,11 @@ name: bench-contenders
 #   pandas           — DataFrame.merge on the key (what people actually reach for)
 #
 # Task: two 10M-row x 20-col CSVs, composite key (account_id,txn_id),
-# --ignore updated_at. Each contender reports matched / changed / added /
-# removed; the counts must agree or the run fails (correctness gate).
+# --ignore updated_at. Each contender reports unchanged / changed / added /
+# removed keys; the counts must agree or the run fails (correctness gate).
+# Every contender gets compara's semantics: values compared as text (an
+# empty field equals only an empty field), and a key that appears twice in
+# one file is compared by its first row.
 # Wall is best of 3, one runner, warm cache.
 #
 # Table reports wall time only — the number a user feels. CPU and memory
@@ -28,15 +31,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v2
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
         with:
           toolchain: stable
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.13'
 
@@ -61,7 +64,9 @@ jobs:
           A = "bench-data/bench_a.csv"
           B = "bench-data/bench_b.csv"
           COMPARE = ["./target/release/compara", "compare", A, B,
-                     "-k", "account_id,txn_id", "-i", "updated_at", "--summary"]
+                     "-k", "account_id,txn_id", "-i", "updated_at",
+                     "--json", "compara-counts.json"]
+          KEY = ["account_id", "txn_id"]
           # Compared columns: everything except the key and the ignored column.
           CMP = ["posting_date","value_date","currency","amount","fee","balance",
                  "status","channel","region","branch_code","product_code",
@@ -72,16 +77,18 @@ jobs:
               r = subprocess.run(COMPARE, capture_output=True, text=True)
               dt = time.perf_counter() - t0
               assert r.returncode in (0, 1), r.stderr[-2000:]
-              counts = {}
-              for line in r.stdout.splitlines():
-                  for k in ("matched", "changed", "added", "removed"):
-                      if line.strip().startswith(k):
-                          counts[k] = int(line.split()[-1].replace(",", ""))
-              return dt, counts
+              # compara's `matched` is every key present in both files;
+              # `unchanged` is the part of it the others call matched.
+              c = json.load(open("compara-counts.json"))["counts"]
+              return dt, {"matched": c["unchanged"], "changed": c["changed"],
+                          "added": c["added"], "removed": c["removed"]}
 
+          first = f"QUALIFY row_number() OVER (PARTITION BY {', '.join(KEY)} ORDER BY rowid) = 1"
           DUCKDB_SQL = f"""
-          CREATE TABLE a AS SELECT * FROM read_csv('{A}');
-          CREATE TABLE b AS SELECT * FROM read_csv('{B}');
+          CREATE TABLE ra AS SELECT * FROM read_csv('{A}', all_varchar = true);
+          CREATE TABLE rb AS SELECT * FROM read_csv('{B}', all_varchar = true);
+          CREATE TABLE a AS SELECT * FROM ra {first};
+          CREATE TABLE b AS SELECT * FROM rb {first};
           SELECT
             count(*) FILTER (a.account_id IS NOT NULL AND b.account_id IS NOT NULL
                              AND ({{eq}})) AS matched,
@@ -106,9 +113,9 @@ jobs:
           def run_pandas():
               import pandas as pd
               t0 = time.perf_counter()
-              a = pd.read_csv(A, dtype=str)
-              b = pd.read_csv(B, dtype=str)
-              m = a.merge(b, on=["account_id", "txn_id"], how="outer",
+              a = pd.read_csv(A, dtype=str, keep_default_na=False).drop_duplicates(KEY)
+              b = pd.read_csv(B, dtype=str, keep_default_na=False).drop_duplicates(KEY)
+              m = a.merge(b, on=KEY, how="outer",
                           indicator=True, suffixes=("_a", "_b"))
               added = int((m["_merge"] == "right_only").sum())
               removed = int((m["_merge"] == "left_only").sum())
@@ -174,7 +181,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: bench-contenders-results
           path: bench-results.json

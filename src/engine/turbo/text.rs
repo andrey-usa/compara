@@ -20,6 +20,7 @@ use std::path::Path;
 /// A CSV header can begin with anything else, and a `{` in the first column of a
 /// CSV header is not something this project has ever had to read.
 pub(super) fn sniff_dialect(data: &[u8]) -> Dialect {
+    let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
     for &b in data.iter().take(64) {
         if json_space(b) {
             continue;
@@ -781,7 +782,8 @@ impl RowParser {
             }
             let key_from = pos + 1;
             let key_end = skip_json_string(data, pos, end).0;
-            if key_end > end || key_end < 2 {
+            // A row cut off right after a key's opening quote has no key.
+            if key_end > end || key_end <= key_from {
                 break;
             }
             let key = &data[key_from..key_end - 1];

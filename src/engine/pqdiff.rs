@@ -20,9 +20,16 @@
 //! vectorises, and the resulting mismatch mask is scanned eight bytes at a time
 //! with the same SWAR trick the CSV scanner uses to find a delimiter.
 //!
+//! A column of numbers, dates or booleans is held as one word per row, in a
+//! canonical form (see [`parquet::Words`]), so that "did this cell change" is a
+//! `u64` compare there too, and a cell is written out as text only when the
+//! report shows it -- by the `turbo` reader's own rule, so the two paths cannot
+//! disagree about how a value reads.
+//!
 //! The result is the same `EngineResult`, and therefore the same JSON, as
 //! comparing the same data as CSV.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -31,10 +38,12 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use memmap2::Mmap;
 
+use super::turbo::parquet::{ValueKind, value_kinds};
 use crate::alloc;
 use crate::columns::{compare_keys, resolve};
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
 use crate::error::{Error, Result};
+use crate::memory;
 use crate::options::Options;
 use crate::parallel;
 use crate::parquet;
@@ -53,18 +62,33 @@ pub fn is_parquet(path: &Path) -> bool {
 
 /// One cell. Parquet values carry no escaping -- a byte array is its own bytes
 /// -- so where the CSV path has to read a field through its escape decoder,
-/// here a cell is already a span.
+/// here a cell is already a span. A word-sized value is its eight bytes, with
+/// `kind` saying how they read as text.
 #[derive(Clone, Copy)]
 struct Look<'a> {
     bytes: &'a [u8],
     null: bool,
+    kind: Option<ValueKind>,
 }
 
 impl<'a> Look<'a> {
     const NONE: Look<'static> = Look {
         bytes: &[],
         null: true,
+        kind: None,
     };
+}
+
+/// A present cell as text: its bytes, or its word written out.
+fn text_of(c: Look<'_>) -> Cow<'_, str> {
+    match c.kind {
+        Some(kind) => {
+            let mut out = Vec::with_capacity(24);
+            kind.write(u64::from_le_bytes(c.bytes.try_into().unwrap()), &mut out);
+            Cow::Owned(String::from_utf8(out).unwrap_or_default())
+        }
+        None => String::from_utf8_lossy(c.bytes),
+    }
 }
 
 fn needs_normalising(opt: &Options) -> bool {
@@ -75,7 +99,7 @@ fn value_of(c: Look<'_>, opt: &Options) -> Val {
     if c.null || c.bytes.is_empty() {
         return None;
     }
-    let mut text = String::from_utf8_lossy(c.bytes).into_owned();
+    let mut text = text_of(c).into_owned();
     if opt.trim {
         text = text.trim().to_string();
     }
@@ -103,7 +127,8 @@ fn absent(c: Look<'_>, opt: &Options) -> bool {
     if c.null || c.bytes.is_empty() {
         return true;
     }
-    needs_normalising(opt) && absent_normalised(c, opt)
+    // A written-out value is never empty, trimmed or not, so only a null is.
+    needs_normalising(opt) && c.kind.is_none() && absent_normalised(c, opt)
 }
 
 #[cold]
@@ -159,8 +184,8 @@ fn cell_differs(x: Look<'_>, y: Look<'_>, opt: &Options) -> bool {
         return false;
     }
     if opt.tolerance > 0.0 && !xa && !ya {
-        let nx = as_number(&String::from_utf8_lossy(x.bytes));
-        let ny = as_number(&String::from_utf8_lossy(y.bytes));
+        let nx = as_number(&text_of(x));
+        let ny = as_number(&text_of(y));
         if let (Some(a), Some(b)) = (nx, ny) {
             return (a - b).abs() > opt.tolerance;
         }
@@ -238,11 +263,14 @@ fn fold_id(h: u64, id: i32) -> u64 {
 struct Col<'m> {
     c: parquet::Column,
     map: &'m [u8],
+    /// Set for a column held as words.
+    kind: Option<ValueKind>,
 }
 
 impl<'m> Col<'m> {
-    fn new(c: parquet::Column, map: &'m [u8]) -> Self {
-        Col { c, map }
+    fn new(c: parquet::Column, map: &'m [u8], kind: ValueKind) -> Self {
+        let kind = c.words.as_ref().map(|_| kind);
+        Col { c, map, kind }
     }
     #[inline]
     fn base(&self) -> &[u8] {
@@ -254,6 +282,13 @@ impl<'m> Col<'m> {
     }
     #[inline]
     fn at(&self, row: usize) -> Look<'_> {
+        if let Some(w) = &self.c.words {
+            return Look {
+                bytes: &w.values[row],
+                null: w.is_null(row),
+                kind: self.kind,
+            };
+        }
         look(self.base(), self.slice_at(row))
     }
     fn dict_at(&self, k: usize) -> Look<'_> {
@@ -288,6 +323,7 @@ fn look(base: &[u8], s: parquet::Slice) -> Look<'_> {
     Look {
         bytes: &base[at..at + s.length()],
         null: false,
+        kind: None,
     }
 }
 
@@ -783,7 +819,75 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
 
     let slot_of = |names: &[String], n: &str| names.iter().position(|c| c == n).unwrap();
 
+    // What each column holds. Two columns are compared here only when both
+    // files store them the same way -- as text, or as words of one kind -- since
+    // a word's eight bytes and another file's text, or a FLOAT and a DOUBLE, are
+    // not comparable by their bytes. Anything else goes to `turbo`, which
+    // compares every value as the text it reads as.
+    let kinds = |data: &[u8], names: &[String]| -> Result<Vec<ValueKind>> {
+        match value_kinds(data) {
+            Ok(k) if k.len() == names.len() => Ok(k),
+            _ => Err(Error::unsupported(
+                "the parquet schema is not one this path reads",
+            )),
+        }
+    };
+    let (a_kinds, b_kinds) = (kinds(&a_map, &a_meta.names)?, kinds(&b_map, &b_meta.names)?);
+    let a_kind = |n: &str| a_kinds[slot_of(&a_meta.names, n)];
+    let b_kind = |n: &str| b_kinds[slot_of(&b_meta.names, n)];
+    for name in opt.key.iter().chain(&resolved.compared) {
+        let (ka, kb) = (a_kind(name), b_kind(name));
+        let same_text = ka.is_text() && kb.is_text();
+        if !same_text && !(ka == kb && ka.is_word()) {
+            return Err(Error::unsupported(format!(
+                "{name} is not stored as text or as one word-sized type in both files"
+            )));
+        }
+    }
+
     let threads = opt.thread_budget();
+
+    // --- how many columns at once -----------------------------------------
+    //
+    // This path holds the key columns of both files, an index over each and
+    // the matched pairs throughout, and then each compared column of both files
+    // while it is in flight. Only the second part can be traded for time, so
+    // the memory budget (`--memory`, `COMPARA_MEMORY`, or what the machine has
+    // free) decides how many columns are decoded at once, down to one. A budget
+    // someone stated that cannot hold even one is refused before anything is
+    // read, rather than taken as a suggestion.
+    let (a_rows, b_rows) = (a_meta.rows.max(0) as u64, b_meta.rows.max(0) as u64);
+    let held = |meta: &parquet::Meta, n: &str| meta.held[slot_of(&meta.names, n)];
+    let keys: u64 = opt
+        .key
+        .iter()
+        .map(|k| held(&a_meta, k) + held(&b_meta, k))
+        .sum();
+    // Per row, the index's slot, first row, count and hash, and the hash of
+    // every row before it is inserted; per matched pair, its two rows while the
+    // ranges gather them and again once they are merged.
+    let floor = keys + (a_rows + b_rows) * 36 + a_rows.min(b_rows) * 16;
+    let per_column = resolved
+        .compared
+        .iter()
+        .map(|n| held(&a_meta, n) + held(&b_meta, n))
+        .max()
+        .unwrap_or(0);
+    if let Some(budget) = memory::stated(opt.memory)
+        && floor + per_column > budget
+    {
+        return Err(Error::new(format!(
+            "comparing these files needs about {} MB here (the key columns and their \
+             index, and one column of each file at a time), more than the {} MB budget",
+            (floor + per_column) >> 20,
+            budget >> 20
+        )));
+    }
+    let lanes = match per_column {
+        0 => threads,
+        per => (memory::available(opt.memory).saturating_sub(floor) / per)
+            .clamp(1, threads.max(1) as u64) as usize,
+    };
 
     // --- keys -------------------------------------------------------------
     //
@@ -861,7 +965,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let mut a_keys = KeySide {
         col: a_key_cols
             .into_iter()
-            .map(|c| Col::new(c, &a_map))
+            .zip(&opt.key)
+            .map(|(c, name)| Col::new(c, &a_map, a_kind(name)))
             .collect(),
         id: vec![Vec::new(); key_size],
         rows: 0,
@@ -869,7 +974,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let mut b_keys = KeySide {
         col: b_key_cols
             .into_iter()
-            .map(|c| Col::new(c, &b_map))
+            .zip(&opt.key)
+            .map(|(c, name)| Col::new(c, &b_map, b_kind(name)))
             .collect(),
         id: vec![Vec::new(); key_size],
         rows: 0,
@@ -1080,8 +1186,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     // and the two mappings, which are read-only from here on. How many are in
     // flight is a memory choice, not a parallelism one: a column of ten million
     // values costs a couple of hundred megabytes on each side while it is being
-    // read, and it is released before the next is asked for.
-    let lanes = threads.clamp(1, nc.max(1));
+    // read, and it is released before the next is asked for. `lanes` is that
+    // choice, made above.
+    let lanes = lanes.clamp(1, nc.max(1));
     let next = AtomicUsize::new(0);
     let compared = &resolved.compared;
     let (pa, pb) = (&pair_a, &pair_b);
@@ -1101,10 +1208,12 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             let a_col = Col::new(
                 parquet::read_column(&a_map, slot_of(&a_meta.names, &compared[c]), &a_name)?,
                 &a_map,
+                a_kind(&compared[c]),
             );
             let b_col = Col::new(
                 parquet::read_column(&b_map, slot_of(&b_meta.names, &compared[c]), &b_name)?,
                 &b_map,
+                b_kind(&compared[c]),
             );
             if a_col.rows() != a_keys.rows || b_col.rows() != b_keys.rows {
                 return Err(Error::new(
@@ -1138,6 +1247,50 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                     }
                     for i in 0..m {
                         neq[i] = (xa[i] != xb[i]) as u8;
+                    }
+                    alloc::room(&mut hits, m, "the changed cells in one column")?;
+                    scan_mask(&neq[..m], base, |p| hits.push(p));
+                    base += BLOCK;
+                }
+            } else if let (Some(aw), Some(bw), false) =
+                (&a_col.c.words, &b_col.c.words, needs_normalising(opt))
+            {
+                // Words of one kind on both sides: two cells read the same
+                // exactly when their words are equal, so no cell is written out
+                // to find that it did not change.
+                let any_null = !aw.nulls.is_empty() || !bw.nulls.is_empty();
+                let mut neq = vec![0u8; BLOCK];
+                let mut base = 0usize;
+                while base < npairs {
+                    let m = BLOCK.min(npairs - base);
+                    let (xs, ys) = (&pa[base..base + m], &pb[base..base + m]);
+                    for i in 0..m {
+                        neq[i] = (aw.values[xs[i] as usize] != bw.values[ys[i] as usize]) as u8;
+                    }
+                    if any_null {
+                        for i in 0..m {
+                            neq[i] |=
+                                (aw.is_null(xs[i] as usize) != bw.is_null(ys[i] as usize)) as u8;
+                        }
+                    }
+                    alloc::room(&mut hits, m, "the changed cells in one column")?;
+                    scan_mask(&neq[..m], base, |p| hits.push(p));
+                    base += BLOCK;
+                }
+            } else if a_col.c.words.is_some() || b_col.c.words.is_some() {
+                // Words under --trim, --ignore-case, --empty-is-null or
+                // --tolerance: each cell is written out and compared as the
+                // text it reads as, the way the CSV path compares it.
+                let mut neq = vec![0u8; BLOCK];
+                let mut base = 0usize;
+                while base < npairs {
+                    let m = BLOCK.min(npairs - base);
+                    for i in 0..m {
+                        neq[i] = cell_differs(
+                            a_col.at(pa[base + i] as usize),
+                            b_col.at(pb[base + i] as usize),
+                            opt,
+                        ) as u8;
                     }
                     alloc::room(&mut hits, m, "the changed cells in one column")?;
                     scan_mask(&neq[..m], base, |p| hits.push(p));

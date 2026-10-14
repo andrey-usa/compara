@@ -1,17 +1,13 @@
-//! `--summary`: the counts, and nothing on disk.
+//! Output is opt-in: without -o, --json or --export-dir, `compare` prints the
+//! counts and writes nothing, and `--summary` says so explicitly.
 //!
-//! The other three ports in this repository write nothing without an output
-//! flag. This one defaults `--out` to `<a>__vs__<b>.html`, so the invocation the
-//! benchmark ladder times -- no flags at all -- had this port rendering and
-//! gzipping a report while C, C++ and Zig printed a line. `--summary` is the
-//! invocation that does what they do.
-//!
-//! Two things have to hold for it to be worth having, and they pull against
-//! each other: it must not write anything, and the counts it prints must be the
-//! ones the full run prints. The second is the risk -- the engine skips the
-//! sections, and a section is also where its dropped-row total is recorded, so
-//! a count computed from the rows that survived rather than from the rows that
-//! matched would come out short here and nowhere else.
+//! Two things have to hold, and they pull against each other: the default run
+//! must not write anything (nor collect the rows a report would embed), and
+//! the counts it prints must be the ones a run with a report prints. The
+//! second is the risk -- the engine skips the sections, and a section is also
+//! where its dropped-row total is recorded, so a count computed from the rows
+//! that survived rather than from the rows that matched would come out short
+//! here and nowhere else.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -102,25 +98,43 @@ fn files(dir: &Path) -> Vec<String> {
 }
 
 #[test]
-fn summary_writes_nothing_and_counts_the_same() {
+fn only_an_output_flag_writes_and_the_counts_never_change() {
     let fx = Fixture::new();
     let args = ["compare", "a.csv", "b.csv", "-k", "account_id,txn_id"];
 
-    let (full_code, full_out, full_err) = run(&fx.0, &args);
-    assert_eq!(full_code, 1, "a run with differences exits 1: {full_err}");
-    assert_eq!(
-        files(&fx.0),
-        vec!["a__vs__b.html".to_string()],
-        "the default run writes the defaulted report"
+    let (plain_code, plain_out, plain_err) = run(&fx.0, &args);
+    assert_eq!(plain_code, 1, "a run with differences exits 1: {plain_err}");
+    assert!(
+        files(&fx.0).is_empty(),
+        "the default run wrote {:?}",
+        files(&fx.0)
+    );
+    assert!(
+        !plain_out.contains("Report:"),
+        "no report, but it says so: {plain_out}"
     );
 
-    fs::remove_file(fx.path("a__vs__b.html")).expect("the report");
+    let mut report_args = args.to_vec();
+    report_args.extend(["-o", "r.html", "--json", "r.json"]);
+    let (code, out, err) = run(&fx.0, &report_args);
+    assert_eq!(code, plain_code, "-o changes the exit code: {err}");
+    assert_eq!(
+        files(&fx.0),
+        vec!["r.html".to_string(), "r.json".to_string()]
+    );
+    assert!(out.contains("Report: r.html"), "{out}");
+    assert_eq!(
+        counts(&out),
+        counts(&plain_out),
+        "the run with a report counts differently"
+    );
+    fs::remove_file(fx.path("r.html")).expect("the report");
+    fs::remove_file(fx.path("r.json")).expect("the summary");
 
     let mut summary_args = args.to_vec();
     summary_args.push("--summary");
     let (code, out, err) = run(&fx.0, &summary_args);
-
-    assert_eq!(code, full_code, "--summary changes the exit code: {err}");
+    assert_eq!(code, plain_code, "--summary changes the exit code: {err}");
     assert!(
         files(&fx.0).is_empty(),
         "--summary wrote {:?}",
@@ -128,13 +142,36 @@ fn summary_writes_nothing_and_counts_the_same() {
     );
     assert_eq!(
         counts(&out),
-        counts(&full_out),
-        "--summary and the full run disagree on the counts"
+        counts(&plain_out),
+        "--summary counts differently"
     );
+
+    // An export needs no report: the same rows, with or without -o.
+    let mut export = args.to_vec();
+    export.extend(["--export-dir", "x"]);
+    let (code, _, err) = run(&fx.0, &export);
+    assert_eq!(
+        code, plain_code,
+        "--export-dir changes the exit code: {err}"
+    );
+    let changed = fs::read_to_string(fx.path("x").join("changed.csv")).expect("changed.csv");
     assert!(
-        !out.contains("Report:"),
-        "--summary claimed a report it did not write: {out}"
+        changed.lines().count() > 1,
+        "--export-dir without -o wrote no rows"
     );
+    export.extend(["-o", "r.html"]);
+    run(&fx.0, &export);
+    let with_report = fs::read_to_string(fx.path("x").join("changed.csv")).expect("changed.csv");
+    assert_eq!(changed, with_report, "-o changes what --export-dir writes");
+    fs::remove_dir_all(fx.path("x")).expect("the export");
+    fs::remove_file(fx.path("r.html")).expect("the report");
+
+    // A report option without a report is a mistake, not a no-op.
+    let mut no_report = args.to_vec();
+    no_report.push("--no-compress");
+    let (code, _, err) = run(&fx.0, &no_report);
+    assert_eq!(code, 2, "--no-compress without -o was accepted");
+    assert!(err.contains("add -o"), "{}", err.trim());
 }
 
 #[test]

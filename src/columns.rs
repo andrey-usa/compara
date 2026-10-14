@@ -163,6 +163,169 @@ fn as_number(v: &Val) -> Option<f64> {
     s.parse::<f64>().ok().filter(|f| f.is_finite())
 }
 
+/// What a column holds, as far as comparing its text goes. A file that stores
+/// typed values (Parquet) renders each in one fixed spelling, which another
+/// file's text need not share: `31.40` is the 31.4 a Parquet DOUBLE stores,
+/// and `2026-09-01 02:15:00` the timestamp it renders `2026-09-01T02:15:00`.
+/// Such a column is compared by value wherever both cells parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Typed {
+    Text,
+    Number,
+    Instant,
+}
+
+impl Typed {
+    /// The kind a compared column gets when its two files say `a` and `b`.
+    pub fn of_pair(a: Typed, b: Typed) -> Typed {
+        if a == Typed::Number || b == Typed::Number {
+            Typed::Number
+        } else if a == Typed::Instant || b == Typed::Instant {
+            Typed::Instant
+        } else {
+            Typed::Text
+        }
+    }
+
+    /// Whether two present cells' bytes, unequal as text, hold the same value.
+    pub fn same_value(self, a: &[u8], b: &[u8]) -> bool {
+        let (Ok(a), Ok(b)) = (std::str::from_utf8(a), std::str::from_utf8(b)) else {
+            return false;
+        };
+        match self {
+            Typed::Text => false,
+            Typed::Number => matches!((decimal(a), decimal(b)), (Some(x), Some(y)) if x == y),
+            Typed::Instant => matches!((instant(a), instant(b)), (Some(x), Some(y)) if x == y),
+        }
+    }
+
+    /// [`differs`] for a column of this kind.
+    pub fn differs(self, a: &Val, b: &Val, opt: &Options) -> bool {
+        match self {
+            Typed::Text => differs(a, b, opt),
+            Typed::Number if opt.tolerance > 0.0 => differs(a, b, opt),
+            Typed::Number => match (
+                a.as_deref().and_then(decimal),
+                b.as_deref().and_then(decimal),
+            ) {
+                (Some(x), Some(y)) => x != y,
+                _ => differs(a, b, opt),
+            },
+            Typed::Instant => match (
+                a.as_deref().and_then(instant),
+                b.as_deref().and_then(instant),
+            ) {
+                (Some(x), Some(y)) => x != y,
+                _ => differs(a, b, opt),
+            },
+        }
+    }
+}
+
+/// A number as its exact decimal value: the sign, the significant digits and
+/// the power of ten they are scaled by, so `31.40`, `31.4` and `3.14e1` are one
+/// value and `-0` is `0`. Exact rather than an `f64`, because two integers past
+/// 2^53 (a 19-digit id) or two DECIMAL(38) values can differ in a digit an
+/// `f64` does not keep. `None` for text that is not a number.
+fn decimal(s: &str) -> Option<(bool, Vec<u8>, i64)> {
+    let (negative, body) = match s.as_bytes().first()? {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(at) => (&body[..at], Some(&body[at + 1..])),
+        None => (body, None),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all_digits = |t: &str| t.bytes().all(|c| c.is_ascii_digit());
+    if whole.len() + fraction.len() == 0 || !all_digits(whole) || !all_digits(fraction) {
+        return None;
+    }
+    let mut scale: i64 = match exponent {
+        Some(e) => {
+            let digits = e.strip_prefix(['+', '-']).unwrap_or(e);
+            if digits.is_empty() || digits.len() > 9 || !all_digits(digits) {
+                return None;
+            }
+            e.parse().ok()?
+        }
+        None => 0,
+    };
+    scale -= fraction.len() as i64;
+    let mut digits: Vec<u8> = whole
+        .bytes()
+        .chain(fraction.bytes())
+        .skip_while(|&c| c == b'0')
+        .collect();
+    while digits.last() == Some(&b'0') {
+        digits.pop();
+        scale += 1;
+    }
+    if digits.is_empty() {
+        return Some((false, digits, 0));
+    }
+    Some((negative, digits, scale))
+}
+
+/// A date, time or timestamp in one spelling: `T` between date and time, no
+/// trailing zeros in the fraction, no UTC marker (`Z`, `+00:00`). `None` for
+/// text that is not one.
+fn instant(s: &str) -> Option<String> {
+    let s = s
+        .strip_suffix('Z')
+        .or_else(|| s.strip_suffix("+00:00"))
+        .unwrap_or(s);
+    if s.is_empty() {
+        return None;
+    }
+    let b = s.as_bytes();
+    let date = b.len() >= 10
+        && digits_in(b, 0..4)
+        && b[4] == b'-'
+        && digits_in(b, 5..7)
+        && b[7] == b'-'
+        && digits_in(b, 8..10);
+    let (date_part, time_part) = if date && b.len() == 10 {
+        (&s[..10], "")
+    } else if date && b.len() >= 19 && (b[10] == b' ' || b[10] == b'T') {
+        (&s[..10], &s[11..])
+    } else if !date {
+        ("", s)
+    } else {
+        return None;
+    };
+    let mut time = String::new();
+    if !time_part.is_empty() {
+        let t = time_part.as_bytes();
+        if !(t.len() >= 8
+            && digits_in(t, 0..2)
+            && t[2] == b':'
+            && digits_in(t, 3..5)
+            && t[5] == b':'
+            && digits_in(t, 6..8))
+        {
+            return None;
+        }
+        let fraction = &time_part[8..];
+        let fraction = match fraction.strip_prefix('.') {
+            Some(f) if f.bytes().all(|c| c.is_ascii_digit()) => f.trim_end_matches('0'),
+            None if fraction.is_empty() => "",
+            _ => return None,
+        };
+        time.push_str(&time_part[..8]);
+        if !fraction.is_empty() {
+            time.push('.');
+            time.push_str(fraction);
+        }
+    }
+    Some(format!("{date_part}T{time}"))
+}
+
+fn digits_in(b: &[u8], r: std::ops::Range<usize>) -> bool {
+    b.get(r).is_some_and(|d| d.iter().all(u8::is_ascii_digit))
+}
+
 /// SQL's `IS DISTINCT FROM`, with the numeric tolerance applied where both sides
 /// parse as numbers.
 ///
@@ -299,5 +462,61 @@ mod tests {
         let mut o = opt(&["id"], &["nope"]);
         o.compare = Some(names(&["v"]));
         assert!(resolve(&a, &a.clone(), &o).is_err());
+    }
+    #[test]
+    fn an_instant_has_one_spelling() {
+        let same = [
+            ("2026-09-01 02:15:00", "2026-09-01T02:15:00"),
+            ("2026-09-01T02:15:00Z", "2026-09-01 02:15:00"),
+            ("2026-09-01 02:15:00+00:00", "2026-09-01T02:15:00"),
+            ("2026-09-01 02:15:00.000", "2026-09-01T02:15:00"),
+            ("2026-09-01 02:15:00.250", "2026-09-01T02:15:00.25"),
+            ("02:15:00.0", "02:15:00"),
+        ];
+        for (a, b) in same {
+            assert!(
+                Typed::Instant.same_value(a.as_bytes(), b.as_bytes()),
+                "{a} vs {b}"
+            );
+        }
+        let different = [
+            ("2026-09-01 02:15:00", "2026-09-01T02:15:01"),
+            ("2026-09-01 02:15:00", "2026-08-01T02:15:00"),
+            ("2026-09-01 02:15:00.1", "2026-09-01T02:15:00.01"),
+            ("2026-09-01 02:15:00+02:00", "2026-09-01T02:15:00"),
+            ("2026-09-01", "2026-09-01T00:00:00"),
+            ("not a time", "not a time "),
+            ("", "Z"),
+        ];
+        for (a, b) in different {
+            assert!(
+                !Typed::Instant.same_value(a.as_bytes(), b.as_bytes()),
+                "{a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_number_is_compared_by_value_only_where_both_cells_parse() {
+        let opt = Options::default();
+        let v = |s: &str| Some(s.to_string());
+        assert!(!Typed::Number.differs(&v("31.40"), &v("31.4"), &opt));
+        assert!(!Typed::Number.differs(&v("1e10"), &v("10000000000"), &opt));
+        assert!(!Typed::Number.differs(&v("-0.0"), &v("0"), &opt));
+        assert!(!Typed::Number.differs(&v("+1.50E-3"), &v("0.0015"), &opt));
+        // Past 2^53 an f64 holds both of these as the same number.
+        assert!(Typed::Number.differs(&v("9007199254740993"), &v("9007199254740992"), &opt));
+        assert!(Typed::Number.differs(
+            &v("12345678901234567890.12"),
+            &v("12345678901234567890.13"),
+            &opt
+        ));
+        assert!(!Typed::Number.same_value(b"9007199254740993", b"9007199254740992"));
+        assert!(Typed::Number.differs(&v(" 1"), &v("1"), &opt));
+        assert!(Typed::Number.differs(&v("1e"), &v("1"), &opt));
+        assert!(Typed::Number.differs(&v("."), &v("0"), &opt));
+        assert!(Typed::Number.differs(&v("31.41"), &v("31.4"), &opt));
+        assert!(Typed::Number.differs(&v("n/a"), &v("N/A"), &opt));
+        assert!(Typed::Text.differs(&v("31.40"), &v("31.4"), &opt));
     }
 }

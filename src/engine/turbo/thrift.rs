@@ -26,6 +26,11 @@ pub(super) mod kind {
     pub(in super::super) const STRUCT: u8 = 12;
 }
 
+/// How deep `skip` follows nested structs and lists. Parquet's metadata nests
+/// a few levels; a footer nested thousands deep exists only to overflow the
+/// stack of a reader that recurses.
+const MAX_NESTING: u32 = 64;
+
 /// A cursor over the bytes of a compact-protocol message.
 pub(super) struct Reader<'a> {
     data: &'a [u8],
@@ -107,7 +112,7 @@ impl<'a> Reader<'a> {
         let id = if delta == 0 {
             self.zigzag()? as i16
         } else {
-            self.last_id + delta
+            self.last_id.wrapping_add(delta)
         };
         self.last_id = id;
         Ok(Some(FieldHeader { id, kind }))
@@ -140,20 +145,40 @@ impl<'a> Reader<'a> {
     pub(super) fn list_begin(&mut self) -> Result<(usize, u8)> {
         let header = self.byte()?;
         let kind = header & 0x0f;
-        let size = (header >> 4) as usize;
-        let size = if size == 15 {
-            self.varint()? as usize
-        } else {
-            size
-        };
-        Ok((size, kind))
+        let size = (header >> 4) as u64;
+        let size = if size == 15 { self.varint()? } else { size };
+        Ok((self.count(size)?, kind))
+    }
+
+    /// A container's element count, refused when the bytes left could not
+    /// hold that many elements (every element, even a bool in a list, takes
+    /// at least one), so a forged count can neither size an allocation nor
+    /// spin a loop.
+    fn count(&self, n: u64) -> Result<usize> {
+        if n > (self.data.len() - self.at) as u64 {
+            return Err(short("a list"));
+        }
+        Ok(n as usize)
     }
 
     /// Steps over a value of `kind` without interpreting it. This is what lets a
     /// file written by a newer library, carrying fields this reader has never
     /// heard of, still be read.
     pub(super) fn skip(&mut self, kind: u8) -> Result<()> {
+        self.skip_nested(kind, 0, false)
+    }
+
+    /// `skip` at a nesting `depth`; an `element` sits in a list, set or map,
+    /// where a bool takes a byte of its own instead of living in the field
+    /// header.
+    fn skip_nested(&mut self, kind: u8, depth: u32, element: bool) -> Result<()> {
+        if depth > MAX_NESTING {
+            return Err(Error::new(
+                "the Parquet metadata nests deeper than any writer produces",
+            ));
+        }
         match kind {
+            kind::TRUE | kind::FALSE if element => self.byte().map(|_| ()),
             kind::TRUE | kind::FALSE => Ok(()),
             kind::BYTE => self.byte().map(|_| ()),
             kind::I16 | kind::I32 | kind::I64 => self.zigzag().map(|_| ()),
@@ -169,27 +194,28 @@ impl<'a> Reader<'a> {
             kind::LIST | kind::SET => {
                 let (n, element) = self.list_begin()?;
                 for _ in 0..n {
-                    self.skip(element)?;
+                    self.skip_nested(element, depth + 1, true)?;
                 }
                 Ok(())
             }
             kind::MAP => {
-                let n = self.varint()? as usize;
+                let n = self.varint()?;
+                let n = self.count(n)?;
                 if n == 0 {
                     return Ok(());
                 }
                 let kinds = self.byte()?;
                 let (key, value) = (kinds >> 4, kinds & 0x0f);
                 for _ in 0..n {
-                    self.skip(key)?;
-                    self.skip(value)?;
+                    self.skip_nested(key, depth + 1, true)?;
+                    self.skip_nested(value, depth + 1, true)?;
                 }
                 Ok(())
             }
             kind::STRUCT => {
                 self.struct_begin();
                 while let Some(f) = self.field()? {
-                    self.skip(f.kind)?;
+                    self.skip_nested(f.kind, depth + 1, false)?;
                 }
                 self.struct_end();
                 Ok(())
@@ -226,7 +252,7 @@ impl<'a> Reader<'a> {
             if element == kind::STRUCT {
                 each(self)?;
             } else {
-                self.skip(element)?;
+                self.skip_nested(element, 1, true)?;
             }
         }
         Ok(())

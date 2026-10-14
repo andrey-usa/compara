@@ -87,6 +87,10 @@ pub(super) struct Hybrid<'a> {
     /// Values decoded from the current run but not yet handed out.
     buffer: Vec<u32>,
     taken: usize,
+    /// A run of one repeated value, handed out without being written down:
+    /// its length is the file's word, and one header can claim billions.
+    run: u32,
+    run_left: usize,
 }
 
 impl<'a> Hybrid<'a> {
@@ -97,18 +101,24 @@ impl<'a> Hybrid<'a> {
             width,
             buffer: Vec::new(),
             taken: 0,
+            run: 0,
+            run_left: 0,
         }
     }
 
     /// The next value, or an error if the page runs out before the rows do.
     pub(super) fn next(&mut self) -> Result<u32> {
-        if self.taken == self.buffer.len() {
+        if self.run_left == 0 && self.taken == self.buffer.len() {
             self.buffer.clear();
             self.taken = 0;
             self.fill()?;
-            if self.buffer.is_empty() {
+            if self.run_left == 0 && self.buffer.is_empty() {
                 return Err(truncated());
             }
+        }
+        if self.run_left > 0 {
+            self.run_left -= 1;
+            return Ok(self.run);
         }
         let v = self.buffer[self.taken];
         self.taken += 1;
@@ -123,12 +133,21 @@ impl<'a> Hybrid<'a> {
         if header & 1 == 1 {
             // A bit-packed run: the header counts groups of eight.
             let groups = (header >> 1) as usize;
-            let count = groups * 8;
-            let bytes = groups * self.width as usize;
+            if self.width == 0 {
+                // Zero-width values take no bytes: a run of zeros.
+                self.run = 0;
+                self.run_left = groups.saturating_mul(8);
+                return Ok(());
+            }
+            // The run's bytes must be in the page, which bounds `groups`.
+            let bytes = groups
+                .checked_mul(self.width as usize)
+                .ok_or_else(truncated)?;
             let from = self.at;
-            let slice = self.data.get(from..from + bytes).ok_or_else(truncated)?;
-            self.at += bytes;
-            unpack(slice, 0, self.width, count, &mut self.buffer)?;
+            let to = from.checked_add(bytes).ok_or_else(truncated)?;
+            let slice = self.data.get(from..to).ok_or_else(truncated)?;
+            self.at = to;
+            unpack(slice, 0, self.width, groups * 8, &mut self.buffer)?;
         } else {
             // A run of one repeated value, written in whole bytes.
             let count = (header >> 1) as usize;
@@ -142,7 +161,8 @@ impl<'a> Hybrid<'a> {
             for (i, &b) in slice.iter().enumerate() {
                 value |= (b as u32) << (8 * i);
             }
-            self.buffer.extend(std::iter::repeat_n(value, count));
+            self.run = value;
+            self.run_left = count;
         }
         Ok(())
     }
@@ -165,27 +185,47 @@ pub(super) fn delta_binary_packed(data: &[u8], want: usize) -> Result<(Vec<i64>,
         ));
     }
     let per_miniblock = block_size / miniblocks;
+    // Every block lists one width byte per miniblock, and a page holds no more
+    // values than its header gives: two bounds on what the header may claim.
+    if miniblocks > data.len() - at {
+        return Err(truncated());
+    }
+    if total > want.max(1) {
+        return Err(Error::new(
+            "a delta-encoded Parquet page holds more values than its page says",
+        ));
+    }
 
-    let mut out = Vec::with_capacity(total.min(want.max(1)));
+    let mut out = crate::alloc::sized(total.max(1), "the values of a delta-encoded page")?;
     out.push(first);
     let mut value = first;
     let mut widths = vec![0u8; miniblocks];
-    let mut scratch: Vec<u32> = Vec::with_capacity(per_miniblock);
+    let mut scratch: Vec<u32> = Vec::new();
 
     while out.len() < total {
         let min_delta = zigzag(varint(data, &mut at)?);
-        let header = data.get(at..at + miniblocks).ok_or_else(truncated)?;
+        let header = data
+            .get(at..at.saturating_add(miniblocks))
+            .ok_or_else(truncated)?;
         widths.copy_from_slice(header);
         at += miniblocks;
         for &width in &widths {
             if out.len() >= total {
                 break;
             }
-            let bytes = per_miniblock * width as usize / 8;
-            let slice = data.get(at..at + bytes).ok_or_else(truncated)?;
+            let bytes = per_miniblock
+                .checked_mul(width as usize)
+                .ok_or_else(truncated)?
+                / 8;
+            let slice = data
+                .get(at..at.saturating_add(bytes))
+                .ok_or_else(truncated)?;
             at += bytes;
             scratch.clear();
-            unpack(slice, 0, width, per_miniblock, &mut scratch)?;
+            // Only the values still wanted: a zero-width miniblock takes no
+            // bytes however many values it claims.
+            let need = per_miniblock.min(total - out.len());
+            unpack(slice, 0, width, need, &mut scratch)?;
             for &d in &scratch {
                 if out.len() >= total {
                     break;

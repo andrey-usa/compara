@@ -268,6 +268,8 @@ fn fused_report_runs_the_agreement_check_and_matches() {
         "account_id,txn_id",
         "--json",
         "fused.json",
+        "-o",
+        "fused.html",
         "--no-compress",
     ];
     let (code, out, err) = run(&fx.0, &args, false);

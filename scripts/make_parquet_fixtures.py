@@ -21,6 +21,7 @@ Regenerate with:
 """
 import csv
 import datetime as dt
+import decimal
 import json
 import os
 import sys
@@ -57,6 +58,66 @@ def sides():
     # A row only in A.
     for column in a:
         a[column].append("K-9999" if column == "id" else "only-in-a")
+    return a, b
+
+
+def word_sides():
+    """Two versions of a table of word-sized columns.
+
+    B changes some value in every column on its own rows, nulls some and fills
+    others (a null against a 0 among them), writes -0.0 where A has 0.0 and NaN
+    where A has NaN (both the same value as text), and has one row A lacks,
+    lacks one A has, and repeats a key.
+    """
+    rows = 400
+    nan, inf = float("nan"), float("inf")
+    base = dt.datetime(2026, 1, 1)
+    a = {
+        "id": [10_000_000_000 + i for i in range(rows)],
+        "name": [None if i % 37 == 0 else f"n{i % 50}" for i in range(rows)],
+        "flag": [None if i % 23 == 0 else i % 3 == 0 for i in range(rows)],
+        "small": [(i * 7919) % 2001 - 1000 for i in range(rows)],
+        "level": [i % 5 for i in range(rows)],
+        "count": [None if i % 11 == 0 else i * 1_000_003 - 2**40 for i in range(rows)],
+        "wide": [(i * 2_654_435_761) % 2**32 for i in range(rows)],
+        "ratio": [[0.0, nan, inf, -inf, None][i] if i < 5 else (i - 200) / 8 for i in range(rows)],
+        "single": [[0.0, nan][i] if i < 2 else (i % 40) / 4 for i in range(rows)],
+        "day": [dt.date(1969, 12, 1) + dt.timedelta(days=i * 13) for i in range(rows)],
+        "at_ms": [base + dt.timedelta(milliseconds=i * 1_001) for i in range(rows)],
+        "at_us": [None if i % 17 == 0 else base + dt.timedelta(microseconds=i * 999_999)
+                  for i in range(rows)],
+        "at_ns": [base + dt.timedelta(seconds=i * 61) for i in range(rows)],
+        "clock": [dt.time(i % 24, i % 60, i % 60, (i * 1000) % 1_000_000) for i in range(rows)],
+        "money": [None if i % 19 == 0 else decimal.Decimal(i * 1001 - 200_000) / 100
+                  for i in range(rows)],
+    }
+    b = {k: list(v) for k, v in a.items()}
+    b["ratio"][0], b["single"][0] = -0.0, -0.0  # the same value as 0.0
+    b["ratio"][1], b["single"][1] = nan, nan     # NaN reads as NaN either way
+    changes = {
+        "name": lambda i, v: None if i % 41 == 0 else v,
+        "flag": lambda i, v: (not v) if v is not None and i % 29 == 0 else v,
+        "small": lambda i, v: v + 1 if i % 31 == 0 else v,
+        # A null against a zero, both ways round: equal words, unequal cells.
+        "level": lambda i, v: None if i % 89 == 0 else (v + 1) % 5 if i % 43 == 0 else v,
+        "count": lambda i, v: 0 if v is None and i % 22 == 0 else v,
+        "wide": lambda i, v: (v + 2**31) % 2**32 if i % 47 == 0 else v,
+        "ratio": lambda i, v: v + 0.25 if i > 4 and i % 13 == 0 else v,
+        "single": lambda i, v: v + 0.5 if i > 1 and i % 53 == 0 else v,
+        "day": lambda i, v: v + dt.timedelta(days=1) if i % 59 == 0 else v,
+        "at_ms": lambda i, v: v + dt.timedelta(milliseconds=1) if i % 61 == 0 else v,
+        "at_us": lambda i, v: None if i % 67 == 0 else v,
+        "at_ns": lambda i, v: v + dt.timedelta(microseconds=1) if i % 71 == 0 else v,
+        "clock": lambda i, v: dt.time(v.hour, v.minute, v.second) if i % 73 == 0 else v,
+        "money": lambda i, v: v + decimal.Decimal("0.01") if v is not None and i % 79 == 0 else v,
+    }
+    for column, change in changes.items():
+        b[column] = [change(i, v) for i, v in enumerate(b[column])]
+    # A row only in B, a key B repeats, and a row only in A.
+    for column in b:
+        b[column].append(99_999_999_999 if column == "id" else b[column][7])
+        b[column].append(b[column][3])
+        del b[column][5]
     return a, b
 
 
@@ -197,6 +258,33 @@ def main(argv):
 
     write_csv(record(os.path.join(out_dir, "typed.csv")),
               {name: [as_text(name, v) for v in values] for name, values in typed.items()})
+
+    # A pair stored as words: every word-sized type the columnar path keeps as
+    # one integer per row, with nulls, both zeros, NaN and infinities, and drift
+    # between the sides, so a test can hold its answer to the row-by-row one.
+    wa, wb = word_sides()
+    schema = pa.schema([
+        ("id", pa.int64()), ("name", pa.string()), ("flag", pa.bool_()),
+        ("small", pa.int32()), ("level", pa.int32()), ("count", pa.int64()),
+        ("wide", pa.uint32()), ("ratio", pa.float64()), ("single", pa.float32()),
+        ("day", pa.date32()), ("at_ms", pa.timestamp("ms")),
+        ("at_us", pa.timestamp("us", tz="UTC")), ("at_ns", pa.timestamp("ns")),
+        ("clock", pa.time64("us")), ("money", pa.decimal128(12, 2)),
+    ])
+    words_a, words_b = pa.table(wa, schema=schema), pa.table(wb, schema=schema)
+    # Dictionary pages and snappy, as DuckDB and pyarrow write by default; and
+    # plain uncompressed pages, with the decimals stored as integers, as DuckDB
+    # writes a DECIMAL of up to eighteen digits.
+    write("words_a.parquet", words_a, compression="snappy", row_group_size=150)
+    write("words_b.parquet", words_b, compression="snappy", row_group_size=150)
+    write("words_a_plain.parquet", words_a, compression="none", use_dictionary=False,
+          store_decimal_as_integer=True)
+    write("words_b_plain.parquet", words_b, compression="none", use_dictionary=False,
+          store_decimal_as_integer=True)
+    # The same B with one column stored wider, which the columnar path does not
+    # compare word for word with A's.
+    write("words_b_wider.parquet", words_b.cast(schema.set(3, pa.field("small", pa.int64()))),
+          compression="snappy")
 
     for path in written:
         print(f"{path}  {os.path.getsize(path):,} bytes")
