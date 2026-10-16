@@ -4,9 +4,10 @@
 //! bargain: it reads exactly what this job needs and refuses the rest by name.
 //! `BYTE_ARRAY` columns and the word-sized types (BOOLEAN, INT32, INT64, FLOAT,
 //! DOUBLE, a decimal in up to eight fixed bytes), PLAIN and dictionary
-//! encodings, uncompressed and snappy, v1 data pages. That covers what DuckDB,
-//! polars and this project's own generator write for string and numeric
-//! columns, and it is the shape the comparison actually meets.
+//! encodings, uncompressed, snappy, gzip, zstd and LZ4 pages, v1 data pages.
+//! That covers what DuckDB, polars, pyarrow and this project's own generator
+//! write for string and numeric columns by default, and it is the shape the
+//! comparison actually meets.
 //!
 //! Two things it does that a general reader would not.
 //!
@@ -23,6 +24,7 @@
 //! operation instead of a string compare per row.
 
 use crate::alloc;
+use crate::engine::turbo::codec::{Codec, decompress};
 use crate::error::{Error, Result};
 
 fn fail<T>(what: &str, path: &str) -> Result<T> {
@@ -50,7 +52,6 @@ const ENC_PLAIN_DICTIONARY: i64 = 2;
 const ENC_RLE: i64 = 3;
 const ENC_RLE_DICTIONARY: i64 = 8;
 const CODEC_UNCOMPRESSED: i64 = 0;
-const CODEC_SNAPPY: i64 = 1;
 const PAGE_DATA: i64 = 0;
 const PAGE_INDEX: i64 = 1;
 const PAGE_DICTIONARY: i64 = 2;
@@ -522,6 +523,7 @@ fn read_file_meta(data: &[u8], path: &str) -> Result<FileMeta> {
 #[derive(Default)]
 struct PageHead {
     ty: i64,
+    uncompressed: i64,
     compressed: i64,
     num_values: i32,
     encoding: i64,
@@ -542,6 +544,7 @@ fn read_page_head(data: &[u8], at: usize, path: &str) -> Result<PageHead> {
         }
         match id {
             1 => out.ty = t.zigzag()?,
+            2 => out.uncompressed = t.zigzag()?,
             3 => out.compressed = t.zigzag()?,
             5 | 7 => {
                 let (mut hid, mut hlast) = (0i16, 0i16);
@@ -567,8 +570,52 @@ fn read_page_head(data: &[u8], at: usize, path: &str) -> Result<PageHead> {
 }
 
 // ---------------------------------------------------------------------------
-// Snappy
+// Compression
 // ---------------------------------------------------------------------------
+
+/// A column chunk's codec. One this reader does not decode is refused as
+/// unsupported, which hands the pair to `turbo`: its reader names the codec it
+/// cannot decode either, or reads the file.
+///
+/// Snappy alone used to be read here, and every other codec went to `turbo`,
+/// which reads row by row. Polars writes zstd unless told otherwise, so a 2M-row
+/// pair of its files took 1.14 s at two threads, and 0.39 s once read here --
+/// what the same pair written with snappy takes.
+fn codec_of(id: i64, path: &str) -> Result<Codec> {
+    match i32::try_from(id).ok().map(Codec::from_id) {
+        Some(Ok(codec)) => Ok(codec),
+        _ => unsupported("this parquet codec is not read here", path),
+    }
+}
+
+/// Appends a compressed page to `out`, expanded. Snappy is decoded in place by
+/// [`snappy_append`]; gzip, zstd and LZ4 go through the `turbo` reader's
+/// decoders, which hold a page to the size its header gives.
+fn expand_append(
+    codec: Codec,
+    stored: &[u8],
+    expected: i64,
+    out: &mut Vec<u8>,
+    path: &str,
+) -> Result<()> {
+    if codec == Codec::Snappy {
+        if !snappy_append(stored, out)? {
+            return fail(
+                "a snappy page in the parquet file will not decompress",
+                path,
+            );
+        }
+        return Ok(());
+    }
+    let Ok(expected) = usize::try_from(expected) else {
+        return fail("a parquet page has a negative size", path);
+    };
+    let page =
+        decompress(codec, stored, expected).map_err(|e| Error::new(format!("{e}: {path}")))?;
+    alloc::room(out, page.len(), "the uncompressed column")?;
+    out.extend_from_slice(&page);
+    Ok(())
+}
 
 /// Snappy raw block format: a varint of the uncompressed length, then a stream
 /// of literal and copy elements.
@@ -946,7 +993,7 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
     let mut index: Vec<i32> = Vec::new();
     let mut values: Vec<Slice> = Vec::new();
 
-    let mut codec: i64 = -1;
+    let mut codec: Option<Codec> = None;
     let mut uncompressed = 0i64;
     for rg in &fm.groups {
         if which >= rg.columns.len() {
@@ -976,20 +1023,18 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
         if c.ty != TYPE_BYTE_ARRAY {
             return unsupported("only BYTE_ARRAY parquet columns are read here", path);
         }
-        if c.codec != CODEC_UNCOMPRESSED && c.codec != CODEC_SNAPPY {
-            return unsupported("only uncompressed and snappy parquet are read here", path);
-        }
+        let chunk_codec = codec_of(c.codec, path)?;
         // Every chunk has to agree about compression, because a slice is an
         // offset with no room to say what it is an offset *into*. Uncompressed
         // pages are read in place and their offsets are into the mapping;
         // compressed ones are expanded into `owned` and their offsets are into
         // that. One column, one base.
-        if codec < 0 {
-            codec = c.codec;
-            if codec == CODEC_SNAPPY {
+        if codec.is_none() {
+            codec = Some(chunk_codec);
+            if chunk_codec != Codec::None {
                 alloc::grow(&mut owned, uncompressed as usize, "the uncompressed column")?;
             }
-        } else if codec != c.codec {
+        } else if codec != Some(chunk_codec) {
             return fail(
                 "a parquet column changes compression between row groups",
                 path,
@@ -1019,14 +1064,15 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
 
             // Where the page's bytes live, and what a slice into them counts
             // from. `in_owned` is the whole of the distinction.
-            let (page_from, page_len, page_base, in_owned) = if c.codec == CODEC_SNAPPY {
+            let (page_from, page_len, page_base, in_owned) = if chunk_codec != Codec::None {
                 let was = owned.len();
-                if !snappy_append(&data[h.after..h.after + body_len], &mut owned)? {
-                    return fail(
-                        "a snappy page in the parquet file will not decompress",
-                        path,
-                    );
-                }
+                expand_append(
+                    chunk_codec,
+                    &data[h.after..h.after + body_len],
+                    h.uncompressed,
+                    &mut owned,
+                    path,
+                )?;
                 (was, owned.len() - was, was as u64, true)
             } else {
                 (h.after, body_len, h.after as u64, false)
@@ -1230,9 +1276,7 @@ fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) -> 
         if c.ty != ty {
             return fail("a parquet column changes type between row groups", path);
         }
-        if c.codec != CODEC_UNCOMPRESSED && c.codec != CODEC_SNAPPY {
-            return unsupported("only uncompressed and snappy parquet are read here", path);
-        }
+        let chunk_codec = codec_of(c.codec, path)?;
         dict.clear();
         let mut at = if c.dictionary_page_offset > 0 {
             c.dictionary_page_offset as usize
@@ -1251,14 +1295,9 @@ fn read_words(data: &[u8], fm: &FileMeta, which: usize, ty: i64, path: &str) -> 
                 return fail("a parquet page has a negative number of values", path);
             }
             let stored = &data[h.after..h.after + h.compressed as usize];
-            let body: &[u8] = if c.codec == CODEC_SNAPPY {
+            let body: &[u8] = if chunk_codec != Codec::None {
                 page.clear();
-                if !snappy_append(stored, &mut page)? {
-                    return fail(
-                        "a snappy page in the parquet file will not decompress",
-                        path,
-                    );
-                }
+                expand_append(chunk_codec, stored, h.uncompressed, &mut page, path)?;
                 &page
             } else {
                 stored

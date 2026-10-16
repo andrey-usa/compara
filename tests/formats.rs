@@ -64,9 +64,34 @@ fn every_encoding_of_a_parquet_file_reads_the_same_way() {
         "a_delta_v2.parquet",
         "a_dict_row_groups.parquet",
         "a.ndjson",
+        "a.tsv",
     ] {
         let got = answer(&run(&fixture(name), &b, &mut options(&["id"])));
         assert_eq!(got, expected, "{name} did not read as the CSV does");
+    }
+}
+
+/// Gzip, zstd and LZ4 pages are read on the columnar path, with the row
+/// reader's answer, as snappy and uncompressed ones always were. Until they
+/// were, any of them sent the pair row by row, and zstd is what polars writes
+/// unless told otherwise. Version-2 pages still go row by row.
+#[test]
+fn every_codec_a_writer_picks_by_default_takes_the_columnar_path() {
+    let b = fixture("b_dict_snappy.parquet");
+    for (name, path) in [
+        ("a_dict_snappy.parquet", "parquet"),
+        ("a_plain_none.parquet", "parquet"),
+        ("a_dict_gzip.parquet", "parquet"),
+        ("a_plain_zstd.parquet", "parquet"),
+        ("a_plain_lz4.parquet", "parquet"),
+        ("a_delta_v2.parquet", "turbo"),
+    ] {
+        let mut columnar = options(&["id"]);
+        columnar.engine = "auto".to_string();
+        let got = run(&fixture(name), &b, &mut columnar);
+        assert_eq!(got.meta.engine, path, "{name}");
+        let want = run(&fixture(name), &b, &mut options(&["id"]));
+        assert_eq!(whole(&got), whole(&want), "{name}");
     }
 }
 
@@ -82,6 +107,10 @@ fn the_two_sides_need_not_be_in_the_same_format() {
     for (a, b) in [
         ("a.ndjson", "b.csv"),
         ("a.csv", "b.ndjson"),
+        ("a.tsv", "b.tsv"),
+        ("a.tsv", "b.csv"),
+        ("a.csv", "b.tsv"),
+        ("a.tsv", "b_dict_snappy.parquet"),
         ("a_dict_snappy.parquet", "b.csv"),
         ("a.csv", "b_dict_snappy.parquet"),
         ("a.ndjson", "b_dict_snappy.parquet"),
@@ -90,6 +119,34 @@ fn the_two_sides_need_not_be_in_the_same_format() {
         let got = answer(&run(&fixture(a), &fixture(b), &mut options(&["id"])));
         assert_eq!(got, expected, "{a} against {b}");
     }
+}
+
+/// A tab-separated file is a CSV file with another separator, and every engine
+/// reads it as one: the whole answer -- counts, column statistics, every
+/// changed, added, removed and duplicated row -- and the export files are the
+/// CSV pair's, byte for byte.
+#[test]
+fn tsv_reads_as_csv_on_every_engine() {
+    let dir = std::env::temp_dir().join(format!("compara-tsv-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    for engine in ["turbo", "sortmerge", "native"] {
+        let read = |ext: &str| {
+            let to = dir.join(format!("{engine}-{ext}"));
+            let mut opt = options(&["id"]);
+            opt.engine = engine.to_string();
+            opt.export_dir = Some(to.to_string_lossy().into_owned());
+            let got = run(
+                &fixture(&format!("a.{ext}")),
+                &fixture(&format!("b.{ext}")),
+                &mut opt,
+            );
+            (whole(&got), exported(&to))
+        };
+        let (csv, tsv) = (read("csv"), read("tsv"));
+        assert_eq!(tsv.0, csv.0, "{engine}: the answer");
+        assert_eq!(tsv.1, csv.1, "{engine}: the export");
+    }
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// A typed Parquet column has to become the text a CSV of the same data holds,
@@ -331,6 +388,7 @@ fn a_parquet_pair_of_word_columns_is_compared_without_making_rows() {
     for (a, b) in [
         ("words_a.parquet", "words_b.parquet"),
         ("words_a_plain.parquet", "words_b_plain.parquet"),
+        ("words_a_zstd.parquet", "words_b_zstd.parquet"),
     ] {
         for (label, tweak) in tweaks {
             let got = columnar(a, b, tweak);
@@ -394,6 +452,208 @@ fn a_parquet_pair_keeps_to_a_stated_memory_budget() {
     let got = run(&a, &b, &mut enough);
     assert_eq!(got.meta.engine, "parquet");
     assert_eq!(whole(&got), want);
+}
+
+/// The three files `--export-dir` writes, as they read back.
+fn exported(dir: &Path) -> [String; 3] {
+    ["added.csv", "removed.csv", "changed.csv"].map(|name| {
+        fs::read_to_string(dir.join(name))
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.join(name).display()))
+    })
+}
+
+/// Writes a Parquet pair from rows of text: dictionary pages, or with `plain`
+/// plain ones.
+fn parquet_pair(
+    dir: &Path,
+    stem: &str,
+    names: &[&str],
+    a: &[Vec<&str>],
+    b: &[Vec<&str>],
+    plain: bool,
+) -> (PathBuf, PathBuf) {
+    use compara::gendata::parquet::{Compression, Writer};
+    let write = |path: &Path, rows: &[Vec<&str>]| {
+        let mut w = Writer::create(path, names, Compression::None, 1 << 20).expect("a writer");
+        if plain {
+            w = w.with_dictionary_limit(0);
+        }
+        for row in rows {
+            w.write_row(row.iter().copied()).expect("a row");
+        }
+        w.finish().expect("the footer");
+    };
+    let (pa, pb) = (
+        dir.join(format!("{stem}_a.parquet")),
+        dir.join(format!("{stem}_b.parquet")),
+    );
+    write(&pa, a);
+    write(&pb, b);
+    (pa, pb)
+}
+
+/// Values no generator writes on its own: a separator, quotes, a line break
+/// and a carriage return inside a value, empty and padded values, letters in
+/// both cases and outside ASCII, a key that is empty in one of its columns and
+/// one empty in both, and a repeated key.
+fn awkward_parquet(dir: &Path, plain: bool) -> (PathBuf, PathBuf) {
+    let a: Vec<Vec<&str>> = vec![
+        vec!["1", "x", "a,b", "say \"hi\""],
+        vec!["2", "x", "line\nbreak", "  padded "],
+        vec!["3", "", "MiXeD", "ünïcödé"],
+        vec!["4", "y", "1.0", ""],
+        vec!["5", "y", "gone", "r\rr"],
+        vec!["2", "x", "a repeat", "is not compared"],
+    ];
+    let b: Vec<Vec<&str>> = vec![
+        vec!["", "", "an empty key", "sorts last"],
+        vec!["6", "z", "new", "comma, \"quote\""],
+        vec!["4", "y", "1", ""],
+        vec!["3", "", "mixed", "ünïcödé"],
+        vec!["2", "x", "line\nbreak", " padded "],
+        vec!["1", "x", "a;b", "say \"hi\""],
+    ];
+    let stem = if plain {
+        "awkward_plain"
+    } else {
+        "awkward_dict"
+    };
+    parquet_pair(dir, stem, &["k1", "k2", "v", "w"], &a, &b, plain)
+}
+
+/// `--export-dir` on two Parquet files is written by the columnar path rather
+/// than refused, and the files are the row reader's, byte for byte -- every
+/// row, in key order, quoted the same way -- under each option that changes
+/// how a value reads or compares. Asking for an export does not change the
+/// report either.
+#[test]
+fn a_parquet_pair_exports_what_the_row_reader_exports() {
+    type Tweak = fn(&mut Options);
+    let tweaks: [(&str, Tweak); 6] = [
+        ("defaults", |_| {}),
+        ("--trim", |o| o.trim = true),
+        ("--ignore-case", |o| o.ignore_case = true),
+        ("--empty-is-null", |o| o.empty_is_null = true),
+        ("--tolerance 0.3", |o| o.tolerance = 0.3),
+        ("--max-rows 1", |o| o.max_rows = 1),
+    ];
+    let dir = std::env::temp_dir().join(format!("compara-pq-export-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("a scratch directory");
+    let mut pairs: Vec<(PathBuf, PathBuf, &[&str])> = vec![
+        (
+            fixture("words_a.parquet"),
+            fixture("words_b.parquet"),
+            &["id"],
+        ),
+        (
+            fixture("words_a_plain.parquet"),
+            fixture("words_b_plain.parquet"),
+            &["id"],
+        ),
+        (
+            fixture("a_dict_snappy.parquet"),
+            fixture("b_dict_snappy.parquet"),
+            &["id"],
+        ),
+    ];
+    for plain in [false, true] {
+        let (a, b) = awkward_parquet(&dir, plain);
+        pairs.push((a, b, &["k1", "k2"]));
+    }
+    let (columnar_dir, rows_dir) = (dir.join("columnar"), dir.join("rows"));
+    for (a, b, key) in &pairs {
+        for (label, tweak) in tweaks {
+            let what = format!("{} against {}, {label}", a.display(), b.display());
+            let mut opt = options(key);
+            opt.engine = "auto".to_string();
+            tweak(&mut opt);
+            let report = run(a, b, &mut opt.clone());
+            opt.export_dir = Some(columnar_dir.to_string_lossy().into_owned());
+            let got = run(a, b, &mut opt);
+            assert_eq!(got.meta.engine, "parquet", "{what}: not the columnar path");
+            assert_eq!(
+                whole(&got),
+                whole(&report),
+                "{what}: the export changed the report"
+            );
+
+            let mut rows = options(key);
+            tweak(&mut rows);
+            rows.export_dir = Some(rows_dir.to_string_lossy().into_owned());
+            run(a, b, &mut rows);
+            assert_eq!(exported(&columnar_dir), exported(&rows_dir), "{what}");
+        }
+    }
+
+    // What the awkward pair's agreement is about: the values come out quoted
+    // where they have to be, and the key that is empty in both columns sorts
+    // after every key that is not.
+    let (a, b) = awkward_parquet(&dir, true);
+    let mut opt = options(&["k1", "k2"]);
+    opt.engine = "auto".to_string();
+    opt.export_dir = Some(columnar_dir.to_string_lossy().into_owned());
+    run(&a, &b, &mut opt);
+    let [added, removed, changed] = exported(&columnar_dir);
+    assert_eq!(
+        added,
+        "k1,k2,v,w\n6,z,new,\"comma, \"\"quote\"\"\"\n,,an empty key,sorts last\n"
+    );
+    assert_eq!(removed, "k1,k2,v,w\n5,y,gone,\"r\rr\"\n");
+    assert!(
+        changed.contains("\"a,b\",a;b,\"say \"\"hi\"\"\",\"say \"\"hi\"\"\""),
+        "{changed}"
+    );
+    assert!(
+        changed.contains("\"line\nbreak\",\"line\nbreak\",  padded , padded "),
+        "{changed}"
+    );
+    assert!(
+        changed.contains("3,,MiXeD,mixed,ünïcödé,ünïcödé"),
+        "{changed}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An export of more rows than one encoded block, on several lanes: the blocks
+/// are written in order whatever order they finish in, and the rows -- stored
+/// out of key order, every one of them changed -- come out sorted.
+#[test]
+fn a_large_parquet_export_is_written_in_key_order() {
+    let dir = std::env::temp_dir().join(format!("compara-pq-export-big-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("a scratch directory");
+    let n = 20_000;
+    let keys: Vec<String> = (0..n).map(|i| format!("K-{:05}", (i * 7919) % n)).collect();
+    let vals: Vec<(String, String)> = (0..n).map(|i| (format!("a{i}"), format!("b{i}"))).collect();
+    let a: Vec<Vec<&str>> = (0..n)
+        .map(|i| vec![keys[i].as_str(), vals[i].0.as_str(), "same"])
+        .collect();
+    let b: Vec<Vec<&str>> = (0..n)
+        .rev()
+        .map(|i| vec![keys[i].as_str(), vals[i].1.as_str(), "same"])
+        .collect();
+    let (pa, pb) = parquet_pair(&dir, "big", &["id", "v", "w"], &a, &b, false);
+
+    let rows_dir = dir.join("rows");
+    let mut rows = options(&["id"]);
+    rows.export_dir = Some(rows_dir.to_string_lossy().into_owned());
+    run(&pa, &pb, &mut rows);
+    let want = exported(&rows_dir);
+    assert_eq!(want[2].lines().count(), n + 1, "every row is changed");
+    assert!(want[2].lines().nth(1).unwrap().starts_with("K-00000,"));
+
+    for threads in [1, 2, 3] {
+        let to = dir.join(format!("columnar-{threads}"));
+        let mut opt = options(&["id"]);
+        opt.engine = "auto".to_string();
+        opt.threads = Some(threads);
+        opt.export_dir = Some(to.to_string_lossy().into_owned());
+        let got = run(&pa, &pb, &mut opt);
+        assert_eq!(got.meta.engine, "parquet");
+        assert_eq!(exported(&to), want, "{threads} threads");
+    }
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// A UTF-8 byte order mark (what Excel and many Windows tools write first) is

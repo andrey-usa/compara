@@ -26,7 +26,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_compara");
 struct Fixture(PathBuf);
 
 impl Fixture {
-    /// One pair in all three formats, from this crate's own generator.
+    /// One pair in every format, from this crate's own generator.
     fn new(rows: i64) -> Fixture {
         let dir = std::env::temp_dir().join(format!(
             "compara-inspect-{}-{}",
@@ -36,6 +36,7 @@ impl Fixture {
         std::fs::create_dir_all(&dir).expect("a temp directory");
         for (format, ext) in [
             (Format::Csv, "csv"),
+            (Format::Tsv, "tsv"),
             (Format::Ndjson, "ndjson"),
             (Format::Parquet, "parquet"),
         ] {
@@ -77,10 +78,10 @@ fn run(args: &[&str], file: &Path) -> (i32, String, String) {
 }
 
 #[test]
-fn columns_agree_across_the_three_formats() {
+fn columns_agree_across_the_formats() {
     let f = Fixture::new(2_000);
     let mut seen: Vec<(String, Vec<String>)> = Vec::new();
-    for ext in ["csv", "ndjson", "parquet"] {
+    for ext in ["csv", "tsv", "ndjson", "parquet"] {
         let (code, stdout, stderr) = run(&["columns"], &f.path(&format!("a.{ext}")));
         assert_eq!(code, 0, "{ext}: {stderr}");
         let names: Vec<String> = stdout.lines().map(|l| l.to_string()).collect();
@@ -133,7 +134,7 @@ fn head_previews_the_same_rows_from_every_format() {
     let f = Fixture::new(2_000);
     let csv = run(&["head", "-n", "5", "--csv"], &f.path("a.csv"));
     assert_eq!(csv.0, 0, "{}", csv.2);
-    for ext in ["ndjson", "parquet"] {
+    for ext in ["tsv", "ndjson", "parquet"] {
         let other = run(&["head", "-n", "5", "--csv"], &f.path(&format!("a.{ext}")));
         assert_eq!(other.0, 0, "{ext}: {}", other.2);
         assert_eq!(

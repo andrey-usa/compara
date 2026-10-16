@@ -1,7 +1,7 @@
 //! Writes a deterministic pair of files for benchmarking and CI.
 //!
 //! The recipe lives in [`compara::gendata`]; this is only the command line. The
-//! same rows go out as CSV, as newline-delimited JSON or as Parquet, so a format
+//! same rows go out as CSV, TSV, newline-delimited JSON or Parquet, so a format
 //! benchmark compares readers rather than converters.
 
 use std::path::PathBuf;
@@ -27,7 +27,7 @@ usage: compara-gen-data [options]
   -o, --out-dir DIR     where the pair is written, created if missing (default data)
       --prefix P        filename stem (default: the --rows text, so 50m_a.csv)
       --seed N          the recipe's seed; the same seed writes the same bytes (default 7)
-  -f, --format F        csv | ndjson | parquet (default csv)
+  -f, --format F        csv | tsv | ndjson | parquet (default csv)
       --compression C   none | zstd, Parquet only (default none)
       --row-group-size N  rows per Parquet row group (default 1000000)
       --dict-limit N    distinct values a Parquet column chunk may hold before

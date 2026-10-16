@@ -75,7 +75,7 @@ src/contract.rs           the result contract
 src/options.rs            runtime parameters and engine names
 src/engine.rs             compare() entry point and the engine registry
 src/engine/turbo.rs       the byte-level engine: threading, the index, the join
-src/engine/turbo/         field packing and SWAR scan, CSV/JSON readers, the Parquet reader
+src/engine/turbo/         field packing, SWAR and AVX2 scans, CSV/JSON readers, the Parquet reader
 src/engine/pqdiff.rs      the columnar path for a Parquet pair
 src/engine/sortmerge.rs   external sort and merge join
 src/engine/native.rs      csv-crate parse, in-memory join

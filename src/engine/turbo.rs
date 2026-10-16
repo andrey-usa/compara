@@ -33,7 +33,7 @@
 //! Hashing and equality always read the same bytes by the same route — the
 //! property whose absence produced two silently wrong answers in the Java port.
 
-mod codec;
+pub(crate) mod codec;
 mod encoding;
 mod field;
 pub(super) mod parquet;
@@ -2710,12 +2710,13 @@ fn join_tail(
     // "only" is up to two hundred thousand rows over twenty columns, which was
     // the last serial second of every run that renders a report.
     //
-    // Nothing is kept when the caller asked for no rows. The picks were still
-    // collected -- they are how each part reports what it dropped, and the
-    // totals above are computed from that -- but none of them becomes a string.
+    // Nothing is kept when the caller asked for no rows and no export. The
+    // picks were still collected -- they are how each part reports what it
+    // dropped, and the totals above are computed from that -- but none of
+    // them becomes a string.
     phases.mark("  merge parts (serial)");
     const NONE: &[Pick] = &[];
-    let (keep_removed, keep_added, keep_changed) = if opt.row_lists {
+    let (keep_removed, keep_added, keep_changed) = if opt.row_lists || exporting {
         (
             removed.held.as_slice(),
             added.held.as_slice(),

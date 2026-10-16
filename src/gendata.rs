@@ -37,10 +37,13 @@ use crate::error::{Error, Result};
 pub use parquet::Compression;
 
 /// Which format the payload is written in. The values are identical in all
-/// three; only the container changes.
+/// four; only the container changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Csv,
+    /// CSV with a tab between fields. No value contains a comma or a tab, so
+    /// the rows are the CSV rows with the separator swapped.
+    Tsv,
     Ndjson,
     Parquet,
 }
@@ -49,6 +52,7 @@ impl Format {
     pub fn extension(self) -> &'static str {
         match self {
             Format::Csv => "csv",
+            Format::Tsv => "tsv",
             Format::Ndjson => "ndjson",
             Format::Parquet => "parquet",
         }
@@ -57,10 +61,11 @@ impl Format {
     pub fn parse(name: &str) -> Result<Format> {
         match name.trim().to_ascii_lowercase().as_str() {
             "csv" => Ok(Format::Csv),
+            "tsv" => Ok(Format::Tsv),
             "ndjson" | "json" => Ok(Format::Ndjson),
             "parquet" => Ok(Format::Parquet),
             other => Err(Error::new(format!(
-                "unknown format: {other}. Choose one of csv, ndjson, parquet"
+                "unknown format: {other}. Choose one of csv, tsv, ndjson, parquet"
             ))),
         }
     }
@@ -193,10 +198,10 @@ impl Row {
         (0..self.ends.len()).map(|i| self.cell(i))
     }
 
-    fn write_csv(&self, out: &mut Vec<u8>) {
+    fn write_delimited(&self, delimiter: u8, out: &mut Vec<u8>) {
         for i in 0..self.ends.len() {
             if i > 0 {
-                out.push(b',');
+                out.push(delimiter);
             }
             out.extend_from_slice(self.cell(i).as_bytes());
         }
@@ -329,11 +334,12 @@ fn row(out: &mut Row, i: i64, b_side: bool, seed: i64, days: &[String]) {
 
 /// Where one side's rows are written, in whichever format was asked for.
 enum Sink {
-    /// CSV or newline-delimited JSON: text, buffered a megabyte at a time.
+    /// CSV, TSV or newline-delimited JSON: text, buffered a megabyte at a time.
     Text {
         file: BufWriter<File>,
         buf: Vec<u8>,
-        json: bool,
+        /// The field separator, or `None` for JSON.
+        delimiter: Option<u8>,
     },
     Parquet(parquet::Writer),
 }
@@ -368,16 +374,21 @@ impl Sink {
                 parquet::Writer::create(path, &COLUMNS, layout.compression, layout.row_group_rows)?
                     .with_dictionary_limit(layout.dictionary_limit),
             ),
-            Format::Csv | Format::Ndjson => {
+            Format::Csv | Format::Tsv | Format::Ndjson => {
                 let mut file = BufWriter::with_capacity(1 << 20, File::create(path)?);
+                let delimiter = match format {
+                    Format::Csv => Some(b','),
+                    Format::Tsv => Some(b'\t'),
+                    _ => None,
+                };
                 // JSON carries its names on every record, so it has no header.
-                if format == Format::Csv {
-                    writeln!(file, "{}", COLUMNS.join(","))?;
+                if let Some(d) = delimiter {
+                    writeln!(file, "{}", COLUMNS.join(&(d as char).to_string()))?;
                 }
                 Sink::Text {
                     file,
                     buf: Vec::with_capacity(1 << 20),
-                    json: format == Format::Ndjson,
+                    delimiter,
                 }
             }
         })
@@ -385,12 +396,15 @@ impl Sink {
 
     fn row(&mut self, row: &Row) -> Result<()> {
         match self {
-            Sink::Text { file, buf, json } => {
+            Sink::Text {
+                file,
+                buf,
+                delimiter,
+            } => {
                 buf.clear();
-                if *json {
-                    row.write_json(buf);
-                } else {
-                    row.write_csv(buf);
+                match delimiter {
+                    Some(d) => row.write_delimited(*d, buf),
+                    None => row.write_json(buf),
                 }
                 file.write_all(buf)?;
                 Ok(())

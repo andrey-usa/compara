@@ -387,15 +387,16 @@ fn the_report_names_the_path_that_ran() {
     assert_eq!(by_default.counts, asked_for.counts);
 }
 
-/// A codec the columnar path does not read is not a refusal: this binary has a
-/// second Parquet reader, and the router falls through to it.
+/// zstd, which polars writes unless told otherwise, is read on the columnar
+/// path, and reads as the same rows written uncompressed.
 ///
-/// Reported from the field -- an NYC TLC trip-data file, zstd, was turned away
-/// with "only uncompressed and snappy parquet are read here" by a build that
-/// reads zstd perfectly well through `turbo`, and `--engine turbo` did not help
-/// because the Parquet-pair branch ran before the engine was consulted.
+/// It used to fall through to `turbo`, which was itself the fix for an NYC TLC
+/// trip-data file, zstd, turned away with "only uncompressed and snappy
+/// parquet are read here" by a build that read zstd perfectly well through
+/// `turbo`. What still falls through, version-2 pages, is held to that in
+/// tests/formats.rs.
 #[test]
-fn a_zstd_pair_falls_through_to_the_reader_that_handles_it() {
+fn a_zstd_pair_is_read_on_the_columnar_path() {
     use compara::gendata::{Compression, Format, generate_as};
 
     let dir = std::env::temp_dir().join(format!(
@@ -428,10 +429,13 @@ fn a_zstd_pair_falls_through_to_the_reader_that_handles_it() {
 
     let mut opt = options(&["account_id", "txn_id"], |_| {});
     let compressed = compare(&zstd("a"), &zstd("b"), &mut opt).expect("zstd is read, not refused");
-    assert_eq!(compressed.meta.engine, "turbo", "the fall-through path");
+    assert_eq!(
+        compressed.meta.engine, "parquet",
+        "zstd on the columnar path"
+    );
 
     // The same rows written twice, once each way. Reading them has to give the
-    // same answer, or the fall-through is reading something else.
+    // same answer, or one of the two is reading something else.
     let mut opt = options(&["account_id", "txn_id"], |_| {});
     let uncompressed = compare(&plain("a"), &plain("b"), &mut opt).expect("plain is read");
     assert_eq!(

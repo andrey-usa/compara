@@ -117,10 +117,10 @@ fn run(
                 .map(|r| (r, Engine::Turbo.label().to_string()))
                 .map_err(|e| Error::new(format!("the turbo engine failed: {e}")));
         }
-        // The columnar path reads a narrow slice of Parquet on purpose -- plain
-        // or snappy, BYTE_ARRAY, v1 pages -- and everything outside it used to
-        // come back as a flat refusal, from a binary carrying a second reader
-        // that handles zstd, gzip, lz4, other column types and v2 pages. A real
+        // The columnar path reads a narrow slice of Parquet on purpose -- PLAIN
+        // and dictionary v1 pages of byte arrays and word-sized types -- and
+        // everything outside it used to come back as a flat refusal, from a
+        // binary carrying a second reader that handles more. A real
         // file (NYC TLC trip data, zstd) was turned away by it, and naming
         // `--engine turbo` did not help because this branch ran first. So a
         // refusal on capability grounds -- and only that, never a corrupt file

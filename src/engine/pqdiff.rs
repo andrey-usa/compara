@@ -23,16 +23,18 @@
 //! A column of numbers, dates or booleans is held as one word per row, in a
 //! canonical form (see [`parquet::Words`]), so that "did this cell change" is a
 //! `u64` compare there too, and a cell is written out as text only when the
-//! report shows it -- by the `turbo` reader's own rule, so the two paths cannot
-//! disagree about how a value reads.
+//! report shows it or `--export-dir` lists it -- by the `turbo` reader's own
+//! rule, so the two paths cannot disagree about how a value reads.
 //!
 //! The result is the same `EngineResult`, and therefore the same JSON, as
 //! comparing the same data as CSV.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -49,7 +51,7 @@ use crate::parallel;
 use crate::parquet;
 use crate::phases::Phases;
 use crate::rowstore::Joined;
-use crate::sections::assemble;
+use crate::sections::{create_export_dir, export_file, export_headers, sections};
 
 /// True when both paths are Parquet, so the caller knows to come here.
 pub fn is_parquet(path: &Path) -> bool {
@@ -684,6 +686,249 @@ impl Capped {
 }
 
 // ---------------------------------------------------------------------------
+// The export: every listed row, as text
+// ---------------------------------------------------------------------------
+
+/// One column's cells for `--export-dir`, in the order its file lists them:
+/// their text in one buffer and an end offset each. The row path holds an
+/// exported cell as a `Val`, a heap string per cell; at sixty thousand changed
+/// rows of eighteen columns, both sides, that is two million of them.
+#[derive(Default)]
+struct Cells {
+    text: Vec<u8>,
+    /// Where each cell ends. The top bit marks an absent cell, which writes as
+    /// the same empty field as `""` and differs from it only in key order,
+    /// where an absent value sorts last.
+    ends: Vec<u64>,
+}
+
+const ABSENT_CELL: u64 = 1 << 63;
+const EXPORTED: &str = "the exported cells of one column";
+
+impl Cells {
+    fn with_room(n: usize) -> Result<Self> {
+        Ok(Cells {
+            text: Vec::new(),
+            ends: alloc::sized(n, EXPORTED)?,
+        })
+    }
+
+    fn push(&mut self, c: Look<'_>, opt: &Options) -> Result<()> {
+        let present = render(c, opt, &mut self.text)?;
+        let end = self.text.len() as u64;
+        alloc::push(
+            &mut self.ends,
+            if present { end } else { end | ABSENT_CELL },
+            EXPORTED,
+        )
+    }
+
+    fn get(&self, i: usize) -> Option<&[u8]> {
+        let end = self.ends[i];
+        if end & ABSENT_CELL != 0 {
+            return None;
+        }
+        let start = match i {
+            0 => 0,
+            _ => self.ends[i - 1] & !ABSENT_CELL,
+        };
+        Some(&self.text[start as usize..end as usize])
+    }
+
+    fn field(&self, i: usize) -> &[u8] {
+        self.get(i).unwrap_or_default()
+    }
+
+    /// The same cells, cell `order[i]` as cell `i`.
+    fn permuted(&self, order: &[u32]) -> Result<Cells> {
+        let mut out = Cells {
+            text: alloc::sized(self.text.len(), EXPORTED)?,
+            ends: alloc::sized(order.len(), EXPORTED)?,
+        };
+        for &at in order {
+            let at = at as usize;
+            let end = self.ends[at];
+            let start = match at {
+                0 => 0,
+                _ => self.ends[at - 1] & !ABSENT_CELL,
+            };
+            out.text
+                .extend_from_slice(&self.text[start as usize..(end & !ABSENT_CELL) as usize]);
+            out.ends.push(out.text.len() as u64 | (end & ABSENT_CELL));
+        }
+        Ok(out)
+    }
+}
+
+/// One compared column's cells of the changed pairs: A's, then B's.
+type Sides = (Cells, Cells);
+
+/// Appends a cell as the text its [`value_of`] reads as, without the string,
+/// and says whether it is present.
+fn render(c: Look<'_>, opt: &Options, out: &mut Vec<u8>) -> Result<bool> {
+    if c.null || c.bytes.is_empty() {
+        return Ok(false);
+    }
+    if needs_normalising(opt) {
+        let Some(v) = value_of(c, opt) else {
+            return Ok(false);
+        };
+        alloc::room(out, v.len(), EXPORTED)?;
+        out.extend_from_slice(v.as_bytes());
+        return Ok(true);
+    }
+    match c.kind {
+        Some(kind) => {
+            // Every word writes out in fewer than forty-eight bytes.
+            alloc::room(out, 48, EXPORTED)?;
+            kind.write(u64::from_le_bytes(c.bytes.try_into().unwrap()), out);
+        }
+        // As `text_of` reads it: the bytes, unless they are not UTF-8.
+        None => {
+            let text = String::from_utf8_lossy(c.bytes);
+            alloc::room(out, text.len(), EXPORTED)?;
+            out.extend_from_slice(text.as_bytes());
+        }
+    }
+    Ok(true)
+}
+
+/// A column's cells at `rows`, in that order.
+fn cells_at(
+    col: &Col<'_>,
+    rows: impl ExactSizeIterator<Item = usize>,
+    opt: &Options,
+) -> Result<Cells> {
+    let mut cells = Cells::with_room(rows.len())?;
+    for r in rows {
+        cells.push(col.at(r), opt)?;
+    }
+    Ok(cells)
+}
+
+/// The rows one export file lists, in key order.
+///
+/// A column's cells are read in the order the rows were found, which is the
+/// order of the file they come from, and put into key order afterwards. Reading them in key
+/// order instead jumps through the whole column once per cell, and at three
+/// hundred thousand changed rows of five million that second pass took twice
+/// as long as the first; reordering a column's few megabytes of written-out
+/// text while they are still in cache costs a fraction of it.
+struct Listed {
+    /// Rows of one side, or for the changed file the matched pairs, in the
+    /// order they were found.
+    found: Vec<usize>,
+    /// The file's row `i` is the one found at `order[i]`.
+    order: Vec<u32>,
+    /// The key cells, in the file's order.
+    keys: Vec<Cells>,
+}
+
+impl Listed {
+    /// Sorted the way [`compare_keys`] sorts every engine's export: by each key
+    /// column's text, an absent value last. Text compares as its UTF-8 bytes,
+    /// which is how `String` orders, and the cells were made valid UTF-8 when
+    /// they were written out.
+    fn new(
+        found: Vec<usize>,
+        key_side: &KeySide<'_>,
+        row_of: impl Fn(usize) -> usize,
+        opt: &Options,
+    ) -> Result<Self> {
+        let mut keys = Vec::with_capacity(key_side.col.len());
+        for col in &key_side.col {
+            keys.push(cells_at(col, found.iter().map(|&id| row_of(id)), opt)?);
+        }
+        let mut order: Vec<u32> = alloc::sized(found.len(), "the export's row order")?;
+        order.extend(0..found.len() as u32);
+        order.sort_by(|&x, &y| {
+            for k in &keys {
+                match (k.get(x as usize), k.get(y as usize)) {
+                    (None, None) => continue,
+                    (None, Some(_)) => return Ordering::Greater,
+                    (Some(_), None) => return Ordering::Less,
+                    (Some(a), Some(b)) => match a.cmp(b) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    },
+                }
+            }
+            Ordering::Equal
+        });
+        let keys = keys
+            .iter()
+            .map(|k| k.permuted(&order))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Listed { found, order, keys })
+    }
+
+    /// A column's cells at these rows, in the file's order; `row_of` turns
+    /// what was found into a row of the column's file.
+    fn cells(
+        &self,
+        col: &Col<'_>,
+        row_of: impl Fn(usize) -> usize,
+        opt: &Options,
+    ) -> Result<Cells> {
+        cells_at(col, self.found.iter().map(|&id| row_of(id)), opt)?.permuted(&self.order)
+    }
+
+    /// Writes the file: each row's key, then `cols` in turn.
+    ///
+    /// Quoting a field means scanning it, and at sixty thousand rows of
+    /// thirty-eight fields that was a serial eighty milliseconds, as long as
+    /// the second column pass. So rows are encoded in blocks on every lane, by
+    /// the same writer with the same settings the header went through, and
+    /// the blocks are written in order a wave at a time, which bounds what is
+    /// held to one block per lane.
+    fn write(&self, path: &Path, header: &[String], cols: &[&Cells], threads: usize) -> Result<()> {
+        const ROWS: usize = 8192;
+        let mut w = export_file(path, header)?;
+        w.flush()?;
+        let mut file = w
+            .into_inner()
+            .map_err(|e| Error::new(format!("cannot write {}: {e}", path.display())))?;
+        let encode = |block: usize| -> Result<Vec<u8>> {
+            let lo = block * ROWS;
+            let hi = (lo + ROWS).min(self.order.len());
+            let mut enc = csv::Writer::from_writer(Vec::new());
+            let mut record: Vec<&[u8]> = Vec::with_capacity(header.len());
+            for i in lo..hi {
+                record.clear();
+                record.extend(self.keys.iter().map(|k| k.field(i)));
+                record.extend(cols.iter().map(|c| c.field(i)));
+                enc.write_record(&record)?;
+            }
+            enc.into_inner()
+                .map_err(|e| Error::new(format!("cannot write {}: {e}", path.display())))
+        };
+        let blocks = self.order.len().div_ceil(ROWS);
+        let wave = threads.max(1);
+        let mut first = 0;
+        while first < blocks {
+            let last = (first + wave).min(blocks);
+            let encoded: Vec<Result<Vec<u8>>> = std::thread::scope(|scope| {
+                let rest: Vec<_> = (first + 1..last)
+                    .map(|b| parallel::spawn_at(scope, &encode, b))
+                    .collect();
+                let mut all = vec![encode(first)];
+                all.extend(
+                    rest.into_iter()
+                        .map(|h| h.join().unwrap_or_else(|_| Err(panicked()))),
+                );
+                all
+            });
+            for block in encoded {
+                file.write_all(&block?)
+                    .map_err(|e| Error::new(format!("cannot write {}: {e}", path.display())))?;
+            }
+            first = last;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // What one compared column produced
 // ---------------------------------------------------------------------------
 
@@ -701,6 +946,10 @@ struct ColOut {
     held: Vec<(usize, Val, Val)>,
     added_vals: Vec<Val>,
     removed_vals: Vec<Val>,
+    /// With `--export-dir`, every added and removed row's cell, in the order
+    /// the files list them.
+    export_added: Cells,
+    export_removed: Cells,
 }
 
 const BLOCK: usize = 4096;
@@ -797,13 +1046,6 @@ fn map(path: &Path) -> Result<Mmap> {
 }
 
 pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResult> {
-    if opt.export_dir.is_some() {
-        return Err(Error::new(
-            "--export-dir is not supported on the parquet path: it needs every compared value of \
-             every changed row, and this path holds one column at a time on purpose",
-        ));
-    }
-
     let mut phases = Phases::new("");
     let a_map = map(a_path)?;
     let b_map = map(b_path)?;
@@ -816,6 +1058,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let key_size = opt.key.len();
     let nc = resolved.compared.len();
     let cap = opt.max_rows;
+    let exporting = opt.export_dir.is_some();
 
     let slot_of = |names: &[String], n: &str| names.iter().position(|c| c == n).unwrap();
 
@@ -1036,6 +1279,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         pb: Vec<i32>,
         held: Vec<i32>,
         total: i64,
+        /// Every unmatched row, not only the first `cap + 1`, for the export.
+        all: Vec<i32>,
     }
     let split = |keys_here: usize| {
         if keys_here < (1 << 14) {
@@ -1056,7 +1301,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     // `pqdiff.cpp` since #106. This path never asked. On a 2M Parquet pair it
     // is the whole of the join's gap against the C port: 0.108s against 0.047s
     // for the same answer.
-    let b_ways = if opt.row_lists {
+    let b_ways = if opt.row_lists || exporting {
         split(bi.firsts.len())
     } else {
         0
@@ -1086,6 +1331,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 out.total += 1;
                 if out.held.len() <= cap {
                     out.held.push(row);
+                }
+                if exporting {
+                    alloc::push(&mut out.all, row, "the removed rows")?;
                 }
                 continue;
             }
@@ -1119,6 +1367,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             if out.held.len() <= cap {
                 out.held.push(row);
             }
+            if exporting {
+                alloc::push(&mut out.all, row, "the added rows")?;
+            }
         }
         Ok(out)
     };
@@ -1144,16 +1395,20 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     phases.mark("match sweep (par)");
 
     let mut added = Capped::default();
+    let mut added_found: Vec<usize> = Vec::new();
     for p in &b_parts {
         for &row in &p.held {
             added.push(row, cap);
         }
         added.total += p.total - p.held.len() as i64;
+        alloc::room(&mut added_found, p.all.len(), "the added rows")?;
+        added_found.extend(p.all.iter().map(|&r| r as usize));
     }
 
     let mut pair_a: Vec<i32> = Vec::new();
     let mut pair_b: Vec<i32> = Vec::new();
     let mut removed = Capped::default();
+    let mut removed_found: Vec<usize> = Vec::new();
     {
         let total: usize = a_parts.iter().map(|p| p.pa.len()).sum();
         alloc::grow(&mut pair_a, total, "one matched pair per key, A side")?;
@@ -1165,6 +1420,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 removed.push(row, cap);
             }
             removed.total += p.total - p.held.len() as i64;
+            alloc::room(&mut removed_found, p.all.len(), "the removed rows")?;
+            removed_found.extend(p.all.iter().map(|&r| r as usize));
         }
     }
     drop(a_parts);
@@ -1173,9 +1430,21 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     // Derived rather than counted when B was not walked. `held` stays empty,
     // which is what `row_lists` being false means: the count is exact either
     // way, and nothing will print the sample.
-    if !opt.row_lists {
+    if b_ways == 0 {
         added.total = bi.unique() - pair_a.len() as i64;
     }
+
+    // The added and removed rows an export lists are known from the join, so
+    // their cells are written out by the column pass below while each column
+    // is in memory for its comparison anyway.
+    let export_lists = if exporting {
+        Some((
+            Listed::new(added_found, &b_keys, |r| r, opt)?,
+            Listed::new(removed_found, &a_keys, |r| r, opt)?,
+        ))
+    } else {
+        None
+    };
 
     let npairs = pair_a.len();
     let words = npairs.div_ceil(64);
@@ -1193,6 +1462,24 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let compared = &resolved.compared;
     let (pa, pb) = (&pair_a, &pair_b);
     let (added_held, removed_held) = (&added.held, &removed.held);
+    let read_pair = |c: usize| -> Result<(Col<'_>, Col<'_>)> {
+        let a_col = Col::new(
+            parquet::read_column(&a_map, slot_of(&a_meta.names, &compared[c]), &a_name)?,
+            &a_map,
+            a_kind(&compared[c]),
+        );
+        let b_col = Col::new(
+            parquet::read_column(&b_map, slot_of(&b_meta.names, &compared[c]), &b_name)?,
+            &b_map,
+            b_kind(&compared[c]),
+        );
+        if a_col.rows() != a_keys.rows || b_col.rows() != b_keys.rows {
+            return Err(Error::new(
+                "parquet columns disagree about how many rows the file has",
+            ));
+        }
+        Ok((a_col, b_col))
+    };
 
     let work = || -> Result<Vec<(usize, ColOut)>> {
         let mut mine = Vec::new();
@@ -1205,21 +1492,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 bits: alloc::filled(0u64, words, "one bit per pair in the column")?,
                 ..ColOut::default()
             };
-            let a_col = Col::new(
-                parquet::read_column(&a_map, slot_of(&a_meta.names, &compared[c]), &a_name)?,
-                &a_map,
-                a_kind(&compared[c]),
-            );
-            let b_col = Col::new(
-                parquet::read_column(&b_map, slot_of(&b_meta.names, &compared[c]), &b_name)?,
-                &b_map,
-                b_kind(&compared[c]),
-            );
-            if a_col.rows() != a_keys.rows || b_col.rows() != b_keys.rows {
-                return Err(Error::new(
-                    "parquet columns disagree about how many rows the file has",
-                ));
-            }
+            let (a_col, b_col) = read_pair(c)?;
 
             let mut hits: Vec<usize> = Vec::new();
             // The fast path: both sides dictionary encoded, so the two
@@ -1346,6 +1619,10 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 .iter()
                 .map(|&r| value_of(a_col.at(r as usize), opt))
                 .collect();
+            if let Some((added_list, removed_list)) = &export_lists {
+                out.export_added = added_list.cells(&b_col, |r| r, opt)?;
+                out.export_removed = removed_list.cells(&a_col, |r| r, opt)?;
+            }
             mine.push((c, out));
         }
     };
@@ -1396,6 +1673,72 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             keep.push(w * 64 + bit);
             bits &= bits - 1;
         }
+    }
+
+    // --- the export -------------------------------------------------------
+    if let Some((added_list, removed_list)) = &export_lists {
+        // Which pairs changed is known only now, after every column, so their
+        // cells take a second pass: each column is read again, on as many
+        // lanes as the first pass had, and written out at those pairs alone.
+        // Holding every column from the first pass instead would cost eight
+        // bytes a row per column per file for the whole run, the memory this
+        // path exists not to spend.
+        let mut changed_found: Vec<usize> =
+            alloc::sized(changed_total as usize, "the changed pairs")?;
+        for (w, &word) in any.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                changed_found.push(w * 64 + bits.trailing_zeros() as usize);
+                bits &= bits - 1;
+            }
+        }
+        let changed_list = Listed::new(changed_found, &a_keys, |p| pair_a[p] as usize, opt)?;
+        let mut sides: Vec<Sides> = (0..nc).map(|_| Default::default()).collect();
+        if !changed_list.found.is_empty() {
+            let next = AtomicUsize::new(0);
+            let again = || -> Result<Vec<(usize, Sides)>> {
+                let mut mine = Vec::new();
+                loop {
+                    let c = next.fetch_add(1, AtomicOrdering::Relaxed);
+                    if c >= nc {
+                        return Ok(mine);
+                    }
+                    let (a_col, b_col) = read_pair(c)?;
+                    let a = changed_list.cells(&a_col, |p| pa[p] as usize, opt)?;
+                    let b = changed_list.cells(&b_col, |p| pb[p] as usize, opt)?;
+                    mine.push((c, (a, b)));
+                }
+            };
+            let gathered: Vec<Result<Vec<(usize, Sides)>>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..lanes).map(|_| parallel::spawn(scope, &again)).collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
+                    .collect()
+            });
+            for got in gathered {
+                for (c, pair) in got? {
+                    sides[c] = pair;
+                }
+            }
+        }
+        phases.mark("export cells (par)");
+
+        let dir = Path::new(opt.export_dir.as_deref().unwrap_or_default());
+        create_export_dir(dir)?;
+        let (plain, both) = export_headers(opt, compared);
+        let added_cols: Vec<&Cells> = cols.iter().map(|c| &c.export_added).collect();
+        added_list.write(&dir.join("added.csv"), &plain, &added_cols, threads)?;
+        let removed_cols: Vec<&Cells> = cols.iter().map(|c| &c.export_removed).collect();
+        removed_list.write(&dir.join("removed.csv"), &plain, &removed_cols, threads)?;
+        let changed_cols: Vec<&Cells> = sides.iter().flat_map(|(a, b)| [a, b]).collect();
+        changed_list.write(&dir.join("changed.csv"), &both, &changed_cols, threads)?;
+        phases.mark("export write");
+    }
+    drop(export_lists);
+    for c in &mut cols {
+        c.export_added = Cells::default();
+        c.export_removed = Cells::default();
     }
 
     // --- the report -------------------------------------------------------
@@ -1538,7 +1881,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     };
     phases.mark("assemble");
     let meta = resolved.meta(&opt.key, a_meta.names.len(), b_meta.names.len());
-    assemble(meta, joined, dup_a, dup_b, opt, &resolved.compared)
+    Ok(sections(
+        meta,
+        joined,
+        dup_a,
+        dup_b,
+        opt,
+        &resolved.compared,
+    ))
 }
 
 #[cfg(test)]

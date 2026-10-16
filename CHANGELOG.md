@@ -6,6 +6,40 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-16
+
+### Added
+
+- `compara-gen-data --format tsv` writes the CSV rows tab-separated, so a TSV
+  pair can be benchmarked against the same rows in CSV. On a 1M-row pair TSV
+  is within 5% of CSV on every engine (`turbo` 0.15 s against 0.14 s,
+  `native` 1.33 s against 1.28 s, `sortmerge` 2.07 s against 1.98 s, four
+  threads) and gives the same answer and export files, which
+  `tests/formats.rs` now holds every engine to.
+
+### Changed
+
+- On x86-64 the CSV, TSV and NDJSON readers scan with AVX2 when the CPU has
+  it, asked at run time, so the release binaries and `cargo install` get the
+  vector scan that before needed a build made with `-C target-cpu=x86-64-v3`.
+  On a 2M-row pair, four threads, CSV counts in 0.24 s against 0.28 s (paired
+  1.16x), TSV 1.19x, NDJSON 1.02x, level with the x86-64-v3 build on all three;
+  answers and export files are the same, byte for byte. A CPU without AVX2,
+  and aarch64, scan eight bytes at a time as before.
+- `--export-dir` on two Parquet files runs on the columnar path. Before, it
+  stopped with "--export-dir is not supported on the parquet path" unless
+  `--engine turbo` was given, which reads the files row by row: on a 1M-row
+  pair with 60,000 changed rows that took 1.48 s and 766 MB, now 0.31 s and
+  363 MB; at 5M rows 11.3 s and 3.8 GB, now 1.8 s and 1.7 GB. The files are
+  the same, byte for byte.
+- `--export-dir` without `-o` no longer gathers the report's rows, which
+  nothing then reads.
+- Two Parquet files compressed with gzip, zstd or LZ4 are compared on the
+  columnar path, as snappy and uncompressed ones were. Before, any of them
+  sent the pair through the row-by-row reader, and zstd is what polars writes
+  by default: a 2M-row pair it wrote took 1.14 s at two threads, now 0.39 s,
+  what the same pair written with snappy takes.
+
 ## [0.5.1] - 2026-10-14
 
 ### Changed

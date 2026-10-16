@@ -14,8 +14,8 @@ Parquet a warehouse emits, a migration's source against its target.
 
 > Faster software for a better planet — less energy, less compute, more time for life.
 
-- Reads **CSV, newline-delimited JSON and Parquet**, and the two sides need not
-  be in the same format.
+- Reads **CSV (and TSV), newline-delimited JSON and Parquet**, and the two sides
+  need not be in the same format.
 - Ten million rows × 20 columns in about a second on four cores
   ([numbers below](#speed)).
 - One static binary; the report is a single HTML file with nothing to host.
@@ -130,7 +130,7 @@ magic number, a leading `{`, or a CSV header.
 
 | Format | How it is read |
 |---|---|
-| CSV | mapped, scanned eight bytes at a time; a field is an offset and a length; a UTF-8 byte order mark is skipped |
+| CSV | mapped, scanned eight bytes at a time; a field is an offset and a length; a UTF-8 byte order mark is skipped; the separator (comma, semicolon, tab or pipe) is read from the header line unless `--delimiter` names it, so a TSV file is read the same way and gives the same answer and export as the same rows in CSV |
 | newline-delimited JSON | the same, addressed by key rather than by column number; `\uXXXX` is decoded, so an escaped and a literal character compare equal |
 | Parquet | pages decoded into an arena; dictionary-encoded columns point at the dictionary entry, so a repeated value costs eight bytes a row |
 
@@ -150,10 +150,15 @@ Two Parquet files take a columnar path instead, which never builds a row: it
 joins on the key columns, then compares one column at a time, string columns
 by dictionary id or bytes and booleans, integers, floats, dates, times,
 timestamps and decimals of up to eight bytes as one word per value. A cell is
-rendered by the rule above only when the report shows it. A column the two
-files store as different types, or with a codec or encoding outside PLAIN,
-dictionary, snappy and v1 pages, goes the row-by-row way instead, with the
-same answer.
+rendered by the rule above only when the report shows it or `--export-dir`
+lists it. Added and removed rows are known from the join, so their cells are
+written out during that pass; which rows changed is known only after the last
+column, so an export reads the compared columns once more and writes out just
+those rows. It costs that second pass and the text it writes, rather than
+holding every column of both files at once. A column the two files store as
+different types, or with an encoding or page outside PLAIN, dictionary and v1
+pages (or LZO or Brotli compression), goes the row-by-row way instead, with
+the same answer.
 
 ## Contributing
 

@@ -340,8 +340,9 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
             "--no-compress is about the HTML report; add -o <path> to write one",
         ));
     }
-    // The rows a report embeds are also the rows an export writes.
-    opt.row_lists = report.is_some() || opt.export_dir.is_some();
+    // Only the report embeds rows. An export is every row, which each engine
+    // keeps for it whether or not this is set.
+    opt.row_lists = report.is_some();
 
     let result = compare(a_path, b_path, &mut opt)?;
 

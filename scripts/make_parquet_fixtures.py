@@ -9,7 +9,7 @@ compared. Those are all *writer* choices, which is why these are written by
 pyarrow rather than by this project -- a reader tested only against files its own
 writer produced tests nothing.
 
-The same 300-row table is written as CSV and as newline-delimited JSON too, so a
+The same 300-row table is written as CSV, TSV and newline-delimited JSON too, so a
 test can assert the thing that actually matters: the comparison returns the same
 counts whichever format each side arrives in.
 
@@ -154,9 +154,9 @@ def shortest(value):
     return f"{sign}{tail}e{'+' if n > 0 else '-'}{abs(n - 1)}"
 
 
-def write_csv(path, table):
+def write_csv(path, table, delimiter=","):
     with open(path, "w", newline="") as fh:
-        out = csv.writer(fh, lineterminator="\n")
+        out = csv.writer(fh, delimiter=delimiter, lineterminator="\n")
         out.writerow(table.keys())
         for row in zip(*table.values()):
             out.writerow(["" if v is None else v for v in row])
@@ -184,6 +184,8 @@ def main(argv):
 
     write_csv(record(os.path.join(out_dir, "a.csv")), a)
     write_csv(record(os.path.join(out_dir, "b.csv")), b)
+    write_csv(record(os.path.join(out_dir, "a.tsv")), a, delimiter="\t")
+    write_csv(record(os.path.join(out_dir, "b.tsv")), b, delimiter="\t")
     write_ndjson(record(os.path.join(out_dir, "a.ndjson")), a)
     write_ndjson(record(os.path.join(out_dir, "b.ndjson")), b)
 
@@ -281,6 +283,9 @@ def main(argv):
           store_decimal_as_integer=True)
     write("words_b_plain.parquet", words_b, compression="none", use_dictionary=False,
           store_decimal_as_integer=True)
+    # And zstd with dictionary pages, which is what polars writes by default.
+    write("words_a_zstd.parquet", words_a, compression="zstd", row_group_size=150)
+    write("words_b_zstd.parquet", words_b, compression="zstd", row_group_size=150)
     # The same B with one column stored wider, which the columnar path does not
     # compare word for word with A's.
     write("words_b_wider.parquet", words_b.cast(schema.set(3, pa.field("small", pa.int64()))),

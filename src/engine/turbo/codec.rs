@@ -7,7 +7,8 @@
 //!
 //! Every one of these writes into a buffer sized from the page header, so a
 //! corrupt length is a refusal rather than an allocation the size of the number
-//! that happened to be in the file.
+//! that happened to be in the file. The columnar reader (`crate::parquet`)
+//! decodes its gzip, zstd and LZ4 pages through here too.
 
 use std::io::Read;
 
@@ -15,7 +16,7 @@ use crate::error::{Error, Result};
 
 /// Parquet's compression codec ids, from its Thrift schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Codec {
+pub(crate) enum Codec {
     None,
     Snappy,
     Gzip,
@@ -24,7 +25,7 @@ pub(super) enum Codec {
 }
 
 impl Codec {
-    pub(super) fn from_id(id: i32) -> Result<Codec> {
+    pub(crate) fn from_id(id: i32) -> Result<Codec> {
         Ok(match id {
             0 => Codec::None,
             1 => Codec::Snappy,
@@ -54,7 +55,7 @@ fn truncated() -> Error {
 }
 
 /// Decompresses one page into `out`, which is sized from the page header.
-pub(super) fn decompress(codec: Codec, input: &[u8], expected: usize) -> Result<Vec<u8>> {
+pub(crate) fn decompress(codec: Codec, input: &[u8], expected: usize) -> Result<Vec<u8>> {
     let out = match codec {
         Codec::None => input.to_vec(),
         Codec::Snappy => snappy(input, expected)?,
