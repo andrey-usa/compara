@@ -490,23 +490,21 @@ fn row_end(ix: &RowIndex, row: i32, size: usize) -> usize {
     }
 }
 
-/// From this many rows the key index is built on every thread
-/// (`RowIndex::insert_parallel`); below it the serial insertion takes well
-/// under a second and is left alone. `COMPARA_PARALLEL_INSERT=1` (set and not
-/// "0") takes the parallel insertion at any size, for the tests.
-const PARALLEL_INSERT_ROWS: usize = 1 << 20;
-
 /// The fewest slots a region of a parallel insertion is given.
 const MIN_REGION: usize = 64;
 
-fn parallel_insert(rows: usize, threads: usize) -> bool {
+/// Whether the key index is built on every thread (`RowIndex::insert_parallel`).
+/// Serial insertion measured faster than parallel (0.948x wall, -14% CPU at
+/// 4 threads on 10M rows, CI A/B median of 7), so it is the default;
+/// `COMPARA_PARALLEL_INSERT` set and not "0" opts back into the parallel
+/// insertion.
+fn parallel_insert(threads: usize) -> bool {
     if threads < 2 {
         return false;
     }
-    let forced = std::env::var("COMPARA_PARALLEL_INSERT")
+    std::env::var("COMPARA_PARALLEL_INSERT")
         .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
-    forced || rows >= PARALLEL_INSERT_ROWS
+        .unwrap_or(false)
 }
 
 /// One region's outcome in a parallel insertion: repeated keys' counts and
@@ -713,8 +711,8 @@ impl RowIndex {
     /// row depends on nothing but where it starts, while the table depends on the
     /// order rows arrive — first occurrence of a key wins, and the duplicate
     /// counts follow from that. Handing rows to threads as they come would make
-    /// the answer depend on thread scheduling; past `PARALLEL_INSERT_ROWS` the
-    /// insertion is split by key instead (`insert_parallel`), each thread taking
+    /// the answer depend on thread scheduling; when the parallel insertion is
+    /// opted into, the insertion is split by key instead (`insert_parallel`), each thread taking
     /// every row of its own keys in file order, which leaves the answer the
     /// serial one.
     fn build(
@@ -835,7 +833,7 @@ impl RowIndex {
         // key arrays too -- or every page the insertion touched would first
         // have to be taken back from that reading. Called before them, B's
         // insertion at 150M rows took 11.1s where it takes 5.9s alone.
-        let parallel = parallel_insert(total, threads);
+        let parallel = parallel_insert(threads);
         let arrays = if parallel {
             Some((
                 alloc::filled(0i32, total, "one row per distinct key")?,
