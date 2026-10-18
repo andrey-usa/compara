@@ -48,8 +48,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 use text::{
-    RowParser, Runs, csv_header, detect_delimiter, guard_span, json_header, json_rows_match,
-    shared_tail, sniff_dialect,
+    RowParser, Runs, csv_header, detect_delimiter, guard_span, json_header, json_is_array,
+    json_rows_match, shared_tail, sniff_dialect,
 };
 
 use crate::alloc;
@@ -1832,24 +1832,54 @@ fn chunk_bounds(
     let mut bounds = vec![from];
     for (i, &start) in nominal.iter().enumerate() {
         let mut in_quotes = quotes[i] % 2 == 1;
-        let mut at = start;
-        while at < end {
-            match data[at] {
-                b'"' if quoted => in_quotes = !in_quotes,
-                b'\n' if !in_quotes => {
-                    at += 1;
-                    break;
+        let at = if dialect == Dialect::Json {
+            json_row_start(data, start, end)
+        } else {
+            let mut at = start;
+            while at < end {
+                match data[at] {
+                    b'"' if quoted => in_quotes = !in_quotes,
+                    b'\n' if !in_quotes => {
+                        at += 1;
+                        break;
+                    }
+                    _ => {}
                 }
-                _ => {}
+                at += 1;
             }
-            at += 1;
-        }
+            at
+        };
         if at > *bounds.last().expect("a first bound") && at < end {
             bounds.push(at);
         }
     }
     bounds.push(end);
     bounds
+}
+
+/// The first JSON row start at or after `at`: the next line whose first byte
+/// that is not JSON space opens an object. ndjson rows are one to a line, but
+/// a pretty-printed top-level array spreads one object over several lines, so
+/// only the line that opens the object is a real row start -- anything else,
+/// the array's own brackets and the object's inner lines, belongs to the
+/// chunk already reading it. A compact array has no newlines at all and so
+/// reads as one chunk.
+fn json_row_start(data: &[u8], mut at: usize, end: usize) -> usize {
+    while at < end {
+        let stop = next_of1(data, at, end, b'\n');
+        if stop >= end {
+            return end;
+        }
+        let mut first = stop + 1;
+        while first < end && matches!(data[first], b' ' | b'\t' | b'\r') {
+            first += 1;
+        }
+        if first < end && data[first] == b'{' {
+            return first;
+        }
+        at = stop + 1;
+    }
+    end
 }
 
 // ---------------------------------------------------------------------------
@@ -3589,11 +3619,13 @@ impl Input {
             } => {
                 let has = |n: &String| header.iter().any(|c| c == n);
                 let json = slab.dialect() == Dialect::Json;
+                let array = json && json_is_array(slab.data());
                 let build = |names: &[&String]| -> RowParser {
                     if json {
                         RowParser::json(
                             names.iter().map(|n| has(n).then(|| (*n).clone())).collect(),
                             key_size,
+                            array,
                         )
                     } else {
                         RowParser::csv(
@@ -3827,7 +3859,11 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
         } => {
             let json = slab.dialect() == Dialect::Json;
             let parser = if json {
-                RowParser::json(header.iter().cloned().map(Some).collect(), 0)
+                RowParser::json(
+                    header.iter().cloned().map(Some).collect(),
+                    0,
+                    json_is_array(slab.data()),
+                )
             } else {
                 RowParser::csv(delimiter, (0..width).map(Some).collect())
             };
