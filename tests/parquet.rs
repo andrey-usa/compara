@@ -270,6 +270,47 @@ fn one_thread_reads_every_key_column() {
     );
 }
 
+/// More threads than columns: each column's row groups are split into runs,
+/// each read on a thread of its own, with both sides of a column at once. The
+/// report is still the CSV's -- on many small groups, compressed and not, and
+/// on a column that is dictionary encoded in some groups and plain in others,
+/// so that runs meet in both forms.
+#[test]
+fn row_groups_read_in_runs() {
+    for flags in [
+        &[
+            "--format",
+            "parquet",
+            "--compression",
+            "none",
+            "--row-group-size",
+            "512",
+        ][..],
+        &[
+            "--format",
+            "parquet",
+            "--compression",
+            "zstd",
+            "--row-group-size",
+            "700",
+        ][..],
+        &[
+            "--format",
+            "parquet",
+            "--compression",
+            "none",
+            "--dict-limit",
+            "175",
+            "--row-group-size",
+            "300",
+        ][..],
+    ] {
+        same_report("20k", flags, ".parquet", &["account_id", "txn_id"], |o| {
+            o.threads = Some(16);
+        });
+    }
+}
+
 #[test]
 fn with_trim() {
     same_report("20k", PLAIN, ".parquet", &["account_id", "txn_id"], |o| {

@@ -210,7 +210,80 @@ fn skip_json_string<S: Scan>(scan: S, data: &[u8], mut at: usize, end: usize) ->
     }
 }
 
-/// Skips a nested object or array, which is not a cell value.
+/// The column of a top-level array's first object: how far its `{` sits from
+/// the start of its line, when nothing but spaces precede it there. A
+/// pretty-printer indents every row of the array alike and anything nested in
+/// a row further, so a line opening an object at this column is most likely a
+/// row. `None` when the array is not laid out a row per line (`[{` on one line).
+pub(super) fn json_row_indent(data: &[u8]) -> Option<usize> {
+    let mut pos = usize::from(data.starts_with(b"\xEF\xBB\xBF")) * 3;
+    while pos < data.len() && json_space(data[pos]) {
+        pos += 1;
+    }
+    if pos >= data.len() || data[pos] != b'[' {
+        return None;
+    }
+    pos += 1;
+    while pos < data.len() && json_space(data[pos]) {
+        pos += 1;
+    }
+    if pos >= data.len() || data[pos] != b'{' {
+        return None;
+    }
+    let line = data[..pos].iter().rposition(|&b| b == b'\n')? + 1;
+    data[line..pos]
+        .iter()
+        .all(|&b| b == b' ' || b == b'\t')
+        .then_some(pos - line)
+}
+
+/// Where the rows of a top-level JSON array start, one for each of `splits`:
+/// the first object at or past the split that opens at the array's own depth,
+/// or nothing when no row starts past it. Increasing and distinct.
+///
+/// A pretty-printed array puts nested objects on lines of their own too, so the
+/// line a split lands on cannot tell a row from an object inside one; only the
+/// depth can, and only a walk from the start knows the depth. Braces alone
+/// keep it, as in [`end_of_array_row`]: an array nested in a row sits inside the
+/// row's braces. One pass on one thread, as far as the last split.
+pub(super) fn json_array_row_starts(data: &[u8], from: usize, splits: &[usize]) -> Vec<usize> {
+    let end = data.len();
+    let mut starts: Vec<usize> = Vec::with_capacity(splits.len());
+    let mut next = 0usize;
+    let mut depth = 0usize;
+    let mut at = from;
+    while next < splits.len() && at < end {
+        let b = next_of3_with(Swar, data, at, end, b'"', b'{', b'}');
+        if b >= end {
+            break;
+        }
+        match data[b] {
+            b'"' => {
+                at = skip_json_string(Swar, data, b, end).0;
+                continue;
+            }
+            b'{' => {
+                if depth == 0 && b >= splits[next] {
+                    if starts.last().is_none_or(|&s| b > s) {
+                        starts.push(b);
+                    }
+                    while next < splits.len() && splits[next] <= b {
+                        next += 1;
+                    }
+                }
+                depth += 1;
+            }
+            // A stray brace in a malformed file does not take the depth below
+            // the array's.
+            _ => depth = depth.saturating_sub(1),
+        }
+        at = b + 1;
+    }
+    starts
+}
+
+/// Past a nested object or array: the byte after its closing bracket, or `end`
+/// where it does not close.
 fn skip_json_nested<S: Scan>(scan: S, data: &[u8], mut pos: usize, end: usize) -> usize {
     let mut depth = 0i32;
     while pos < end {
@@ -1042,9 +1115,13 @@ impl RowParser {
                 pos = close;
                 Some(pack(from as u64, (to - from) as u64, escaped))
             } else if data[pos] == b'{' || data[pos] == b'[' {
-                // Not a cell value. Left absent rather than guessed at.
+                // An object or array is a cell of its JSON text, as written:
+                // two that differ anywhere differ. Left absent, as it once
+                // was, two different objects read as the same missing value
+                // and the change went unreported.
+                let from = pos;
                 pos = skip_json_nested(scan, data, pos, end);
-                None
+                Some(pack(from as u64, (pos - from) as u64, false))
             } else {
                 // A number, true, false or null: it runs to the next comma,
                 // brace or space.
@@ -1525,6 +1602,35 @@ mod tests {
     }
 
     #[test]
+    fn a_split_of_an_array_starts_at_a_row_not_a_nested_object() {
+        // Row 0 holds a nested object on a line of its own, and a string with
+        // braces and an escaped quote; row 1 opens on the line after.
+        let text = "[\n  {\n    \"k\": \"{ \\\" }\",\n    \"m\": {\n      \"x\": 1\n    }\n  },\n  {\n    \"k\": \"b\"\n  }\n]\n";
+        let data = text.as_bytes();
+        let nested = text.find("{\n      \"x\"").expect("the nested object");
+        let row1 = text.rfind("  {\n    \"k\": \"b\"").expect("row 1") + 2;
+        // A split before row 0 starts there; anywhere in row 0, the nested
+        // object's line included, at row 1; one past row 1, nowhere.
+        assert_eq!(json_array_row_starts(data, 0, &[3]), [4]);
+        for split in [5, nested - 1, nested, nested + 1, row1] {
+            assert_eq!(
+                json_array_row_starts(data, 0, &[split]),
+                [row1],
+                "split {split}"
+            );
+        }
+        assert!(json_array_row_starts(data, 0, &[row1 + 1]).is_empty());
+        // Two splits on the same row give it once.
+        assert_eq!(
+            json_array_row_starts(data, 0, &[nested, nested + 2]),
+            [row1]
+        );
+        assert_eq!(json_row_indent(data), Some(2));
+        assert_eq!(json_row_indent(b"[{\"k\":1}]"), None);
+        assert_eq!(json_row_indent(b"{\"k\":1}\n"), None);
+    }
+
+    #[test]
     fn an_array_with_nested_values_and_escaped_braces_reads_alike() {
         // Nested values are not cells, exactly as in ndjson, and braces inside
         // a string are not the object's end.
@@ -1578,8 +1684,8 @@ mod tests {
     }
 
     #[test]
-    fn null_a_nested_value_and_a_missing_key_are_all_absent() {
-        let text = "{\"k\":\"1\",\"v\":null,\"w\":{\"deep\":1},\"x\":[1,2]}\n";
+    fn null_and_a_missing_key_are_absent_and_a_nested_value_is_its_text() {
+        let text = "{\"k\":\"1\",\"v\":null,\"w\":{\"deep\":[1,\"]}\"]},\"x\":[1, 2],\"y\":3}\n";
         let slab = json_slab(text);
         let parser = RowParser::json(
             vec![
@@ -1588,14 +1694,19 @@ mod tests {
                 Some("w".into()),
                 Some("x".into()),
                 Some("missing".into()),
+                Some("y".into()),
             ],
             0,
             false,
         );
-        let mut out = vec![0; 5];
+        let mut out = vec![0; 6];
         let next = parser.parse(slab.data(), 0, text.len(), &mut out);
         assert_eq!(slab.raw(out[0]), b"1");
-        assert_eq!(out[1..], [ABSENT; 4]);
+        assert_eq!([out[1], out[4]], [ABSENT; 2]);
+        // A bracket inside a string does not close the object.
+        assert_eq!(slab.raw(out[2]), b"{\"deep\":[1,\"]}\"]}");
+        assert_eq!(slab.raw(out[3]), b"[1, 2]");
+        assert_eq!(slab.raw(out[5]), b"3");
         assert_eq!(next, text.len());
     }
 

@@ -732,3 +732,53 @@ fn a_csv_only_engine_named_for_parquet_or_json_is_refused() {
         }
     }
 }
+
+/// A nested object or array is a cell of its JSON text, in newline-delimited
+/// JSON and in a top-level array alike. Before, it was read as absent, so two
+/// different objects compared as the same missing value and the change went
+/// unreported. The text is compared as written: the same object with another
+/// key order or spacing is a change, which is what the README says.
+#[test]
+fn a_nested_json_value_is_compared_as_its_text() {
+    let dir = std::env::temp_dir().join(format!("compara-nested-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("a temp dir");
+    let a = dir.join("a.ndjson");
+    let b = dir.join("b.ndjson");
+    let b_array = dir.join("b.json");
+    fs::write(
+        &a,
+        concat!(
+            "{\"id\":\"1\",\"meta\":{\"a\":1,\"b\":[1,2]},\"tags\":[],\"v\":\"x\"}\n",
+            "{\"id\":\"2\",\"meta\":{\"a\":2},\"tags\":[\"p\",\"q\"],\"v\":\"y\"}\n",
+            "{\"id\":\"3\",\"meta\":{\"a\":3,\"b\":\"}\"},\"v\":\"z\"}\n",
+            "{\"id\":\"4\",\"meta\":{\"a\":4,\"b\":5},\"v\":\"w\"}\n",
+        ),
+    )
+    .unwrap();
+    let rows = [
+        // changed: one element of a nested array
+        "{\"id\":\"1\",\"meta\":{\"a\":1,\"b\":[1,3]},\"tags\":[],\"v\":\"x\"}",
+        // unchanged, nested object and array alike
+        "{\"id\":\"2\",\"meta\":{\"a\":2},\"tags\":[\"p\",\"q\"],\"v\":\"y\"}",
+        // unchanged: a brace inside a string is text, not structure
+        "{\"id\":\"3\",\"meta\":{\"a\":3,\"b\":\"}\"},\"v\":\"z\"}",
+        // changed: the same object, keys in another order
+        "{\"id\":\"4\",\"meta\":{\"b\":5,\"a\":4},\"v\":\"w\"}",
+    ];
+    fs::write(&b, rows.join("\n") + "\n").unwrap();
+    fs::write(&b_array, format!("[\n  {}\n]\n", rows.join(",\n  "))).unwrap();
+
+    for other in [&b, &b_array] {
+        let result = run(&a, other, &mut options(&["id"]));
+        assert_eq!(result.counts.matched, 4, "{}", answer(&result));
+        assert_eq!(result.counts.changed, 2, "{}", answer(&result));
+        let meta = result.columns.iter().find(|c| c.name == "meta").unwrap();
+        assert_eq!(meta.changed, 2, "{}", answer(&result));
+        let tags = result.columns.iter().find(|c| c.name == "tags").unwrap();
+        assert_eq!(tags.changed, 0, "{}", answer(&result));
+        let shown = whole(&result);
+        assert!(shown.contains(r#"{\"a\":1,\"b\":[1,2]}"#), "{shown}");
+        assert!(shown.contains(r#"{\"a\":1,\"b\":[1,3]}"#), "{shown}");
+    }
+    fs::remove_dir_all(&dir).ok();
+}
