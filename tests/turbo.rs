@@ -547,6 +547,65 @@ fn json_fixture(a_body: &str, b_body: &str) -> Fixture {
     Fixture { dir, a, b }
 }
 
+/// A pretty-printed top-level JSON array, `indent` spaces a level, of rows
+/// with an object and an array of objects nested in them: every nested `{`
+/// opens a line of its own, as a row's does. `odd` gives row `i` a different
+/// nested value when it is a multiple of 1,000.
+fn nested_array(rows: usize, indent: usize, odd: bool) -> String {
+    let pad = |level: usize| " ".repeat(level * indent);
+    let mut s = String::from("[\n");
+    for i in 0..rows {
+        let c = if odd && i % 1000 == 0 { 9 } else { i % 3 };
+        s.push_str(&format!(
+            "{p1}{{\n{p2}\"id\": {i},\n{p2}\"meta\": {{\n{p3}\"a\": {a},\n{p3}\"b\": [\n\
+             {p4}1,\n{p4}{{\n{p5}\"c\": {c}\n{p4}}}\n{p3}]\n{p2}}},\n{p2}\"v\": {v}\n{p1}}}{sep}\n",
+            p1 = pad(1),
+            p2 = pad(2),
+            p3 = pad(3),
+            p4 = pad(4),
+            p5 = pad(5),
+            a = i % 7,
+            v = i * 3,
+            sep = if i + 1 < rows { "," } else { "" },
+        ));
+    }
+    s.push_str("]\n");
+    s
+}
+
+/// A split of a pretty-printed JSON array must land on a row, not on an object
+/// nested in one. Guessed at the next line opening an object, a chunk could
+/// start inside a row, and the rows it then misread were dropped: 200,000 rows
+/// counted as 100,718 at four threads, with nothing said. Indented, the rows'
+/// own column tells them apart; with no indentation every object opens at
+/// column 0, the guess is wrong, and the check behind it has to catch that.
+#[test]
+fn chunk_boundaries_land_between_rows_of_a_pretty_json_array() {
+    for indent in [2usize, 0] {
+        let rows = 120_000;
+        let a = nested_array(rows, indent, false);
+        let b = nested_array(rows, indent, true);
+        assert!(
+            a.len() > 8 << 20,
+            "fixture must exceed the chunking threshold, got {} bytes",
+            a.len()
+        );
+        let f = json_fixture(&a, &b);
+        for threads in [1usize, 2, 3, 4, 8] {
+            let mut opt = Options::with_key(["id"]);
+            opt.threads = Some(threads);
+            let r = compare(&f.a, &f.b, &mut opt).expect("compare");
+            let c = &r.counts;
+            assert_eq!(
+                (c.a_rows, c.b_rows, c.changed, c.added, c.removed),
+                (rows as i64, rows as i64, 120, 0, 0),
+                "indent {indent}, threads {threads}: {}",
+                serde_json::json!(r.counts)
+            );
+        }
+    }
+}
+
 /// `changed` for one pair, at every thread count, so a proof that fires on one
 /// chunking and not another shows up.
 fn changed_json(a_body: &str, b_body: &str) -> i64 {

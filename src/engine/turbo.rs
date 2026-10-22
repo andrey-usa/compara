@@ -48,8 +48,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 use text::{
-    RowParser, Runs, csv_header, detect_delimiter, guard_span, json_header, json_is_array,
-    json_rows_match, shared_tail, sniff_dialect,
+    RowParser, Runs, csv_header, detect_delimiter, guard_span, json_array_row_starts, json_header,
+    json_is_array, json_row_indent, json_rows_match, shared_tail, sniff_dialect,
 };
 
 use crate::alloc;
@@ -1588,6 +1588,13 @@ where
 /// run again on counted bounds, which is exactly what it did before. A chunk
 /// that started on a wrong guess parsed garbage, so its rows *and its errors*
 /// are discarded unread.
+///
+/// A top-level JSON array is checked the same way. Pretty-printed, it spreads
+/// a row over lines, and a line that opens an object may open one nested in a
+/// row; a chunk started there read half rows and dropped the rest, so a
+/// 200k-row array counted as 100,718 at four threads. Its counted bounds come
+/// from a walk that keeps the depth. Newline-delimited JSON needs no check: a
+/// newline cannot sit inside a JSON value, so every line is a row.
 #[allow(clippy::too_many_arguments)]
 fn sweep_text(
     side: &Side,
@@ -1604,7 +1611,7 @@ fn sweep_text(
         return Ok((Vec::new(), Vec::new()));
     }
     let dialect = side.slab.dialect();
-    if dialect == Dialect::Csv {
+    if dialect == Dialect::Csv || (dialect == Dialect::Json && json_is_array(data)) {
         let bounds = chunk_bounds(data, from, threads, dialect, false);
         let parts = bounds.len() - 1;
         let mut swept = sweep_chunks(side, keys, whole, &bounds, key_size, opt, sink).into_iter();
@@ -1778,8 +1785,11 @@ fn sweep_columnar(
 /// position is inside a field. Counting them is a scan for one byte, far cheaper
 /// than parsing, and it splits across the same threads.
 ///
-/// JSON needs none of that: a raw newline inside a string is not valid JSON, so
-/// every newline ends a record.
+/// Newline-delimited JSON needs none of that: a raw newline inside a string is
+/// not valid JSON, so every newline ends a record. A pretty-printed top-level
+/// array does: its rows span lines, and objects nested in them open lines too.
+/// The guess is the next line that opens an object at the column the first row
+/// opened at; counted, it is the next object at the array's own depth.
 fn chunk_bounds(
     data: &[u8],
     from: usize,
@@ -1797,6 +1807,18 @@ fn chunk_bounds(
     let nominal: Vec<usize> = (1..threads)
         .map(|i| from + (end - from) * i / threads)
         .collect();
+    let array = dialect == Dialect::Json && json_is_array(data);
+    if array && counted {
+        let mut bounds = vec![from];
+        bounds.extend(
+            json_array_row_starts(data, from, &nominal)
+                .into_iter()
+                .filter(|&at| at > from && at < end),
+        );
+        bounds.push(end);
+        return bounds;
+    }
+    let indent = if array { json_row_indent(data) } else { None };
 
     // Quotes before each split point, counted once per byte rather than once per
     // byte per split point.
@@ -1833,7 +1855,7 @@ fn chunk_bounds(
     for (i, &start) in nominal.iter().enumerate() {
         let mut in_quotes = quotes[i] % 2 == 1;
         let at = if dialect == Dialect::Json {
-            json_row_start(data, start, end)
+            json_row_start(data, start, end, indent)
         } else {
             let mut at = start;
             while at < end {
@@ -1857,14 +1879,16 @@ fn chunk_bounds(
     bounds
 }
 
-/// The first JSON row start at or after `at`: the next line whose first byte
-/// that is not JSON space opens an object. ndjson rows are one to a line, but
-/// a pretty-printed top-level array spreads one object over several lines, so
-/// only the line that opens the object is a real row start -- anything else,
-/// the array's own brackets and the object's inner lines, belongs to the
-/// chunk already reading it. A compact array has no newlines at all and so
-/// reads as one chunk.
-fn json_row_start(data: &[u8], mut at: usize, end: usize) -> usize {
+/// The first JSON row start at or after `at`, as a guess: the next line whose
+/// first byte that is not JSON space opens an object, at column `indent` when
+/// that is known. ndjson rows are one to a line, but a pretty-printed top-level
+/// array spreads one object over several lines, so only the line that opens
+/// the object is a row start -- anything else, the array's own brackets and the
+/// object's inner lines, belongs to the chunk already reading it. An object
+/// nested in a row opens a line too, further in; at the rows' own column it
+/// can still fool the guess, and `sweep_text` checks it. A compact array has no
+/// newlines at all and so reads as one chunk.
+fn json_row_start(data: &[u8], mut at: usize, end: usize, indent: Option<usize>) -> usize {
     while at < end {
         let stop = next_of1(data, at, end, b'\n');
         if stop >= end {
@@ -1874,7 +1898,10 @@ fn json_row_start(data: &[u8], mut at: usize, end: usize) -> usize {
         while first < end && matches!(data[first], b' ' | b'\t' | b'\r') {
             first += 1;
         }
-        if first < end && data[first] == b'{' {
+        if first < end
+            && data[first] == b'{'
+            && indent.is_none_or(|column| first - (stop + 1) == column)
+        {
             return first;
         }
         at = stop + 1;

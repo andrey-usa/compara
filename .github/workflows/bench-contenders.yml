@@ -4,7 +4,6 @@ name: bench-contenders
 # Contenders (all installed fresh, latest versions, each run):
 #   compara          — this repo, release build
 #   duckdb           — SQL FULL OUTER JOIN + per-column diff (the fast alternative)
-#   pandas           — DataFrame.merge on the key (what people actually reach for)
 #
 # Task: two 10M-row x 20-col CSVs, composite key (account_id,txn_id),
 # --ignore updated_at. Each contender reports unchanged / changed / added /
@@ -48,8 +47,8 @@ jobs:
 
       - name: Install contenders (latest)
         run: |
-          pip install --upgrade duckdb pandas
-          python3 -c "import duckdb, pandas; print('duckdb', duckdb.__version__, '| pandas', pandas.__version__)"
+          pip install --upgrade duckdb
+          python3 -c "import duckdb; print('duckdb', duckdb.__version__)"
 
       - name: Generate 10M-row pair (Rust)
         run: |
@@ -110,27 +109,8 @@ jobs:
               con.close()
               return dt, dict(zip(("matched", "changed", "added", "removed"), row))
 
-          def run_pandas():
-              import pandas as pd
-              t0 = time.perf_counter()
-              a = pd.read_csv(A, dtype=str, keep_default_na=False).drop_duplicates(KEY)
-              b = pd.read_csv(B, dtype=str, keep_default_na=False).drop_duplicates(KEY)
-              m = a.merge(b, on=KEY, how="outer",
-                          indicator=True, suffixes=("_a", "_b"))
-              added = int((m["_merge"] == "right_only").sum())
-              removed = int((m["_merge"] == "left_only").sum())
-              both = m[m["_merge"] == "both"]
-              diff = (both[[c + "_a" for c in CMP]].values !=
-                      both[[c + "_b" for c in CMP]].values).any(axis=1)
-              changed = int(diff.sum())
-              matched = int((~diff).sum())
-              dt = time.perf_counter() - t0
-              return dt, {"matched": matched, "changed": changed,
-                          "added": added, "removed": removed}
-
           results = {}
-          for name, fn in (("compara", run_compara), ("duckdb", run_duckdb),
-                           ("pandas", run_pandas)):
+          for name, fn in (("compara", run_compara), ("duckdb", run_duckdb)):
               walls, counts = [], None
               for _ in range(3):
                   dt, c = fn()
@@ -169,7 +149,7 @@ jobs:
               w = r[n]["wall_best"]
               lines.append(f"| {n} | {w:.2f} s | {w/base:.2f}x |")
           lines += ["",
-                    "**Versions:** latest at run time (`pip install --upgrade duckdb pandas`; "
+                    "**Versions:** latest at run time (`pip install --upgrade duckdb`; "
                     "compara built from this ref).",
                     f"**Counts:** {r['compara']['counts']}"]
           out = "\n".join(lines)

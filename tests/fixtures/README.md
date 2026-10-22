@@ -47,6 +47,7 @@ CSV, as newline-delimited JSON, or as any of the Parquet encodings a writer migh
 | `words_a.parquet`, `words_b.parquet` | a pair of numbers, dates, times and booleans, with nulls, both zeros, NaN and infinities, on dictionary pages: the columnar path compares these a word per value and must give the row-by-row answer |
 | `words_a_plain.parquet`, `words_b_plain.parquet` | the same pair on plain uncompressed pages, with the decimals stored as integers, as DuckDB writes them |
 | `words_b_wider.parquet` | B with one column stored as INT64, which the columnar path does not compare word for word with A's INT32 |
+| `rg_snappy.parquet`, `rg_zstd.parquet`, `rg_none.parquet` | four row groups, a string column dictionary encoded in two of them and plain in the other two, nulls in most columns: a column read in runs of row groups on several threads must read as it does in one pass. Written by DuckDB (`scripts/make_row_group_fixtures.sql`) |
 
 They are written by pyarrow (`scripts/make_parquet_fixtures.py`), not by this project: a reader
 tested only against files its own writer produced tests nothing. `typed.csv` is the stated
