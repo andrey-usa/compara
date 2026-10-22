@@ -46,6 +46,7 @@ jobs:
       tag: ${{ steps.p.outputs.tag }}
       ref: ${{ steps.p.outputs.ref }}
       publish: ${{ steps.p.outputs.publish }}
+      prerelease: ${{ steps.p.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -73,10 +74,14 @@ jobs:
             have=$(git show "$ref:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
             [ "v$have" = "$tag" ] || fail "$tag does not match Cargo.toml version $have at $ref; bump Cargo.toml first"
           fi
+          case "$tag" in
+            *-*) prerelease=true ;;  # v0.5.3-alpha.1, -beta.1, -rc.1: no tap/bucket updates
+            *) prerelease=false ;;
+          esac
           {
-            echo "tag=$tag"; echo "ref=$ref"; echo "publish=$publish"
+            echo "tag=$tag"; echo "ref=$ref"; echo "publish=$publish"; echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice title=release plan::${tag:-dry run} from $ref (publish=$publish)"
+          echo "::notice title=release plan::${tag:-dry run} from $ref (publish=$publish, prerelease=$prerelease)"
 
   build:
     needs: plan
@@ -178,12 +183,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.plan.outputs.tag }}
           REF: ${{ needs.plan.outputs.ref }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
         run: |
           ls -la dist
           if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # Creates the tag on the planned commit when it doesn't exist yet.
             case "$REF" in refs/*) target="$GITHUB_SHA" ;; *) target="$REF" ;; esac
-            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --target "$target"
+            flags="--title \"$TAG\" --generate-notes --target \"$target\""
+            [ "$PRERELEASE" = true ] && flags="$flags --prerelease"
+            eval gh release create \"$TAG\" -R \"$GITHUB_REPOSITORY\" $flags
           fi
           gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*
           echo "::notice title=release::$TAG published with $(ls dist | wc -l) files: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
@@ -321,7 +329,7 @@ jobs:
 
   taps:
     needs: [plan, publish, packages]
-    if: needs.plan.outputs.publish == 'true' && (vars.HOMEBREW_TAP != '' || vars.SCOOP_BUCKET != '')
+    if: needs.plan.outputs.publish == 'true' && needs.plan.outputs.prerelease != 'true' && (vars.HOMEBREW_TAP != '' || vars.SCOOP_BUCKET != '')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8

@@ -14,8 +14,8 @@ Parquet a warehouse emits, a migration's source against its target.
 
 > Faster software for a better planet — less energy, less compute, more time for life.
 
-- Reads **CSV (and TSV), newline-delimited JSON and Parquet**, and the two sides
-  need not be in the same format.
+- Reads **CSV, TSV, JSON (newline-delimited or one array of objects) and
+  Parquet**, and the two sides need not be in the same format.
 - Ten million rows × 20 columns in about a second on four cores
   ([numbers below](#speed)).
 - One static binary; the report is a single HTML file with nothing to host.
@@ -98,9 +98,15 @@ five. Each cell is wall time · CPU time · memory above the mapped input.
 | ndjson | 8,487 MB | 2.79 s · 10.4 s · 592 MB |
 | Parquet | 2,074 MB | 1.41 s · 4.7 s · 1,342 MB |
 
+Two Parquet files against DuckDB and Polars, on the same kind of runner
+(CI run 39468615515: a 5M-row pair written by pyarrow, counts only, median
+of three): compara 1.26 s at one thread and 0.56 s at four, DuckDB 6.73 s and
+3.13 s, Polars 4.98 s and 2.73 s. With the changed, added and removed rows
+written out, compara 0.72 s at four threads, DuckDB 4.00 s, Polars 2.74 s.
+
 Contender benchmarks rerun weekly
 ([`bench-contenders.yml`](.github/workflows/bench-contenders.yml)) against the
-latest DuckDB and pandas.
+latest DuckDB.
 
 ## Engines
 
@@ -126,13 +132,22 @@ a space, a zero fraction or none, `Z` or nothing).
 ### Input formats
 
 `turbo` decides what a file is by its content rather than its name: a Parquet
-magic number, a leading `{`, or a CSV header.
+magic number, a leading `{` or `[`, or a CSV header.
 
 | Format | How it is read |
 |---|---|
-| CSV | mapped, scanned eight bytes at a time; a field is an offset and a length; a UTF-8 byte order mark is skipped; the separator (comma, semicolon, tab or pipe) is read from the header line unless `--delimiter` names it, so a TSV file is read the same way and gives the same answer and export as the same rows in CSV |
-| newline-delimited JSON | the same, addressed by key rather than by column number; `\uXXXX` is decoded, so an escaped and a literal character compare equal |
+| CSV | mapped, scanned eight bytes at a time; a field is an offset and a length; a UTF-8 byte order mark is skipped; the separator (comma, semicolon, tab or pipe) is read from the header line unless `--delimiter` names it |
+| TSV | the CSV reader with a tab for the separator, found in the header line like any other; the same rows as TSV and as CSV give the same answer and the same export |
+| JSON | one object per line (NDJSON), or one top-level array of objects; the columns are the keys of the first object, and a value is found by its key rather than its position; `\uXXXX` is decoded, so an escaped and a literal character compare equal; `null` and a missing key are both absent |
 | Parquet | pages decoded into an arena; dictionary-encoded columns point at the dictionary entry, so a repeated value costs eight bytes a row |
+
+**Nested JSON.** A value that is an object or an array is compared as its
+JSON text, as written: any difference inside it is a change to that column,
+and the report and export show the text. The same object written with its
+keys in another order, or with other spacing, is a change too, so JSON
+compares best flat, one scalar per key. For two files written by different
+tools, flatten nested values into top-level keys first (`jq`, or the writer's
+own option), and each nested field becomes a column compared on its own.
 
 The Parquet reader is written here rather than taken from a crate, to keep that
 representation instead of converting to Arrow arrays. It reads PLAIN,

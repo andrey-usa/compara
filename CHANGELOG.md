@@ -6,6 +6,64 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-10-22
+
+Two Parquet files compared up to 2.5 times faster, JSON files that are one
+top-level array, and two silent wrong answers on JSON input fixed.
+
+### Added
+
+- A JSON file can be one top-level array of objects, compact or
+  pretty-printed, as well as one object per line: the rows are the array's
+  objects and the columns the keys of the first one. Newline-delimited JSON
+  reads as fast as before.
+
+### Fixed
+
+- A JSON value that is an object or an array was read as absent, so two
+  different nested values compared as the same missing value and the change
+  went unreported (0.5.2 and earlier). It is now compared as its JSON text,
+  as written, and the report and export show that text. The README says what
+  that means for key order and spacing, and when to flatten first.
+- A pretty-printed top-level JSON array whose rows hold objects on lines of
+  their own lost rows when read on several threads: a split guessed at the
+  next line opening an object could land inside a row, and the rows read
+  from there were dropped without a word (200,000 rows counted as 100,718
+  at four threads). Splits are now checked as CSV splits are, and redone on
+  bounds that follow the array's depth when a guess was wrong; the guess
+  itself takes the column the first row opens at. Top-level arrays were new
+  in 0.5.3-alpha.1; 0.5.2 did not read them.
+
+### Changed
+
+- Two Parquet files compare faster on the columnar path. Snappy pages are
+  expanded with whole-word copies; a column's row groups are read in runs on
+  threads of their own, both sides at once, so a file with fewer columns
+  than cores no longer leaves cores idle; a slot of the key index holds its
+  row, so a match costs one cache miss less, the cells a probe compares are
+  prefetched, and integer, date and other word keys are hashed a column at a
+  time; the compared columns go largest first and each is compared on
+  several threads; the footer is parsed once per file. In CI (run
+  39468615515, a 4-core runner, a 5M-row pair written by pyarrow, counts
+  only) the comparison took 1.26 s at one thread, 0.79 s at two and 0.56 s
+  at four, against 2.34 s, 1.53 s and 1.40 s for 0.5.3-alpha.1; DuckDB took
+  6.73 s, 3.94 s and 3.13 s and Polars 4.98 s, 3.32 s and 2.73 s on the same
+  runner. With the changed rows written out: 1.29 s, 1.09 s and 0.72 s,
+  against 2.43 s, 2.19 s and 1.90 s. Answers are the same; a footer the
+  row-group runs cannot trust is read in one pass, as before.
+- `--export-dir` on two Parquet files keeps the decoded compared columns for
+  the export when the memory budget has room for them, instead of reading
+  each column a second time.
+- The key index is built on one thread unless `COMPARA_PARALLEL_INSERT` is
+  set: the parallel build, taken from 1M rows on, measured slower.
+- Each occupied slot of the key index is ranked with one POPCNT per key where
+  the CPU has it, chosen at run time.
+- `COMPARA_PHASES=1` also prints each compared Parquet column's read and
+  compare times.
+- The README lists TSV and JSON as input formats of their own, with how each
+  is read: TSV through the CSV reader, JSON as one object per line or one
+  top-level array of objects, its columns the keys of the first object.
+
 ## [0.5.2] - 2026-10-16
 
 ### Added
@@ -133,5 +191,7 @@ First release as a standalone project.
 - The data generator and the benchmark harness are `compara-gen-data` and
   `compara-bench` (the latter behind the `bench` feature).
 
+[0.5.3]: https://github.com/andrey-usa/compara/releases/tag/v0.5.3
+[0.5.2]: https://github.com/andrey-usa/compara/releases/tag/v0.5.2
 [0.5.1]: https://github.com/andrey-usa/compara/releases/tag/v0.5.1
 [0.5.0]: https://github.com/andrey-usa/compara/releases/tag/v0.5.0
