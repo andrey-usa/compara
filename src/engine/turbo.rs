@@ -49,7 +49,8 @@ use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 use text::{
     RowParser, Runs, csv_header, detect_delimiter, guard_span, json_array_row_starts, json_header,
-    json_is_array, json_row_indent, json_rows_match, shared_tail, sniff_dialect,
+    json_is_array, json_row_indent, json_rows_match, json_rows_match_at, shared_tail,
+    sniff_dialect,
 };
 
 use crate::alloc;
@@ -420,6 +421,29 @@ fn rows_to_positions_with(part: &mut [u32], pos_mask: u32, words: &[u64], before
             *word = (*word & !pos_mask) | (position as u32 + 1);
         }
     }
+}
+
+/// [`key_hash`] for the common case, read straight off the mapped bytes: no
+/// normalising option and no test hook, which the sweep asks once rather than
+/// once a row. The same number by the same steps; `None` for an escaped key,
+/// which goes through `key_hash` and its decoder.
+#[inline(always)]
+fn key_hash_plain(data: &[u8], keys: &[Field]) -> Option<u64> {
+    const PRIME: u64 = 0x100_0000_01b3;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &f in keys {
+        if !field::is_real(f) || field::len_of(f) == 0 {
+            h = (h ^ 0x9e37_79b9_7f4a_7c15).wrapping_mul(PRIME);
+            continue;
+        }
+        if field::is_escaped(f) {
+            return None;
+        }
+        let (at, len) = (field::offset_of(f), field::len_of(f));
+        h = hash_bytes(data.get(at..at + len)?, h);
+        h = (h ^ len as u64).wrapping_mul(PRIME);
+    }
+    Some(h)
 }
 
 fn key_hash(slab: &Slab, fields: &[Field], key_size: usize, opt: &Options) -> u64 {
@@ -853,6 +877,7 @@ impl RowIndex {
         }
         idx.first_row = alloc::sized(total, "one row per distinct key")?;
         idx.occurrences = alloc::sized(total, "one count per distinct key")?;
+        idx.rows = total as i64;
         let mut probe = vec![ABSENT; side.width];
         let mut mine = vec![ABSENT; side.width];
         for row in 0..total {
@@ -866,7 +891,10 @@ impl RowIndex {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// Indexes row `row`, which is already in `row_at` and `row_hash`.
+    /// Indexes row `row`, which is already in `row_at` and `row_hash`. The
+    /// caller counts the rows (`self.rows`): this runs once a row, serially,
+    /// and is inlined into its loop.
+    #[inline(always)]
     fn insert(
         &mut self,
         side: &Side,
@@ -876,16 +904,20 @@ impl RowIndex {
         probe: &mut [Field],
         mine: &mut [Field],
     ) -> Result<()> {
-        self.rows += 1;
         let at = self.row_at[row as usize];
         let hash = self.row_hash[row as usize];
 
         let mut slot = self.slot(hash);
         let mut mine_parsed = false;
         loop {
-            let word = self.table[slot];
+            debug_assert!(slot < self.table.len());
+            // Safety: `slot` and `next` mask into the table, whose length is
+            // a power of two at least `mask + 1`.
+            let word = unsafe { *self.table.get_unchecked(slot) };
             if word == EMPTY_SLOT {
-                self.table[slot] = self.slot_for(hash, self.first_row.len());
+                let fresh = self.slot_for(hash, self.first_row.len());
+                // Safety: as above.
+                unsafe { *self.table.get_unchecked_mut(slot) = fresh };
                 self.first_row.push(row);
                 self.occurrences.push(1);
                 // Two thirds, which is what `build` sizes the table for. Half was
@@ -1665,6 +1697,8 @@ fn sweep_chunks(
 ) -> Vec<Result<(Chunk, usize, Option<Part>)>> {
     let data = side.slab.data();
     let parts = bounds.len() - 1;
+    // Asked once for the file rather than once a row (see `key_hash_plain`).
+    let plain_keys = !needs_normalising(opt) && narrow_hash().is_none();
     in_parallel(parts, |i| {
         let (begin, stop) = (bounds[i], bounds[i + 1]);
         let mut chunk = Chunk {
@@ -1710,7 +1744,11 @@ fn sweep_chunks(
                      use --engine native"
                 )));
             }
-            chunk.push(pos as u64, key_hash(&side.slab, &fields, key_size, opt))?;
+            let hash = match plain_keys.then(|| key_hash_plain(data, &fields[..key_size])) {
+                Some(Some(h)) => h,
+                _ => key_hash(&side.slab, &fields, key_size, opt),
+            };
+            chunk.push(pos as u64, hash)?;
             // The row before this one ends where this one starts, and its
             // pages are still hot: the fused join takes it now, rather than
             // re-reading it after the sweep.
@@ -2203,7 +2241,10 @@ impl Part {
 /// rows the counted sweep marks again.
 fn mark_seen(seen: &[AtomicU64], row: i32) {
     let bit = row as usize;
-    seen[bit >> 6].fetch_or(1 << (bit & 63), Ordering::Relaxed);
+    // An empty bitmap is a join that keeps no rows: see `join`.
+    if let Some(word) = seen.get(bit >> 6) {
+        word.fetch_or(1 << (bit & 63), Ordering::Relaxed);
+    }
 }
 
 /// Joins one row of A's against B's index: the join's inner loop as a function,
@@ -2269,6 +2310,42 @@ fn join_row(
             }
         } else {
             Fast::Skipped
+        }
+    } else if ctx.json_proof {
+        // JSON: the proof over A's whole row, before A is parsed at all. The
+        // row through its last wanted value is what the parse below would
+        // offer, and finding that end is a parse of every member; the whole
+        // row holds the same values and the walk skips the untracked ones that
+        // differ -- the `updated_at` that differs on every row -- the same
+        // way. The candidate is the first row of B whose hash matches; a
+        // different key under the same hash fails on the key's bytes.
+        let data = ctx.a.slab.data();
+        let (Some(pa), Some(_)) = (ctx.a.parser(), ctx.b.parser()) else {
+            unreachable!("a JSON pair has two text parsers")
+        };
+        match ctx.bi.lookup(
+            ctx.b,
+            &ctx.a.slab,
+            None,
+            hash,
+            ctx.key_size,
+            ctx.opt,
+            None,
+            &mut scratch.fb,
+        ) {
+            Some((mate, _)) => {
+                let bd = ctx.b.slab.data();
+                let b_lo = ctx.bi.row_at[mate as usize] as usize;
+                let b_hi = row_end(ctx.bi, mate, bd.len());
+                if json_rows_match_at(pa, data, from, end, bd, b_lo, b_hi) {
+                    Fast::Proved(mate)
+                } else {
+                    // Not proved is not disproved: the parse below decides,
+                    // with the narrower proof it can offer.
+                    Fast::Skipped
+                }
+            }
+            None => Fast::Missed,
         }
     } else if let Some((delimiter, commas)) = ctx.guard {
         let data = ctx.a.slab.data();
@@ -2639,6 +2716,13 @@ fn join(
     threads: usize,
 ) -> Result<Joined> {
     let (ctx, seen) = join_setup(a, b, bi, opt, compared.len(), exporting);
+    // With no rows to list, the bitmap only counts B's unmatched keys, and
+    // that count is B's keys less the matched ones: a key of A matches at most
+    // one key of B, and no two keys of A the same one. So nothing is marked.
+    // Marking was a locked read-modify-write per matched row into lines every
+    // thread shares, and the join stopped scaling on it: 0.92 s at one thread,
+    // 0.41 s at four, on a 2M-row NDJSON pair.
+    let seen = if ctx.keep_picks { seen } else { Vec::new() };
 
     let a_keys = ai.first_row.len();
     let a_ways = ways_for(a_keys);
@@ -2722,7 +2806,7 @@ fn join_tail(
     };
 
     let b_keys = bi.first_row.len();
-    let b_ways = ways_for(b_keys);
+    let b_ways = if seen.is_empty() { 0 } else { ways_for(b_keys) };
 
     let b_range = |p: usize| -> Capped {
         let mut added = Capped::new(cap, exporting, keep_picks);
@@ -2761,6 +2845,9 @@ fn join_tail(
             added.push(*pick);
         }
         added.total += chunk.total - chunk.held.len() as i64;
+    }
+    if seen.is_empty() {
+        added.total = b_keys as i64 - parts.iter().map(|p| p.matched).sum::<i64>();
     }
 
     phases.mark("  join chunks (par)");
@@ -3900,6 +3987,18 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
             let mut fields = vec![ABSENT; width];
             let mut out = Vec::with_capacity(want);
             while at < end && out.len() < want {
+                // A line with nothing on it is not a row, here as in a comparison.
+                match data[at] {
+                    b'\n' => {
+                        at += 1;
+                        continue;
+                    }
+                    b'\r' if at + 1 < end && data[at + 1] == b'\n' => {
+                        at += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
                 at = parser.parse(data, at, end, &mut fields);
                 out.push(render_row(&slab, &fields));
                 fields.iter_mut().for_each(|f| *f = ABSENT);

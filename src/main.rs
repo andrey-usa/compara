@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use compara::error::{Error, Result};
+
+#[global_allocator]
+static ALLOCATOR: compara::hugepages::HugePages = compara::hugepages::HugePages;
+use compara::source::{Source, Want};
 use compara::{Options, compare, parse_list, profiles, render};
 
 const USAGE: &str = "\
@@ -25,6 +29,16 @@ commands:
   columns FILE    Print one file's column names, one per line
   head FILE       Print the first rows of one file (default 10)
   version         Print the version (also --version)
+  env             Print what this process sees: CPUs, memory and its limits, the
+                  temporary directory, and whether URLs can be read
+
+A, B and FILE are paths, `-` for standard input, or with cloud support s3://,
+gs://, az:// and https:// URLs. Gzip and zstd files are read as what they hold.
+A directory, a quoted glob ('out/date=*/*.parquet', `**` for any depth) or an
+object storage prefix (s3://bucket/orders/) is its files read as one table, in
+path order; names starting with `.` or `_` in a directory are passed over, and
+Hive partition directories (date=2026-10-01/) are columns. A Delta table is read
+at its latest version, or at TABLE@vN (s3://lake/orders@v41).
 
 columns and head read CSV, newline-delimited JSON and Parquet, and neither reads
 more of the file than it has to: `columns` on Parquet reads the footer, and
@@ -54,13 +68,18 @@ compare options:
                           joined in one pass instead of two, and how many columns of
                           two Parquet files are read at once; Parquet that needs
                           more than SIZE one column at a time is refused
-      --export-dir DIR    Write full changed/added/removed CSVs here
-  -o, --out PATH          Write the HTML report here (no report without it)
-      --json PATH         Write a JSON summary (counts + column stats) here
+      --export-dir DIR    Write full changed/added/removed CSVs here (a directory, or a
+                          URL prefix such as s3://bucket/run-42/)
+  -o, --out PATH          Write the HTML report here, a path or a URL (no report without it)
+      --json PATH         Write a JSON summary (counts + column stats) here, a path or a
+                          URL; `-` prints it, and the counts line goes to stderr
       --no-compress       Report: embed plain JSON instead of gzip (older browsers)
       --summary           Print the counts and write nothing, and refuse any flag that would
                           (the default without -o, --json or --export-dir)
       --fail-on-dups      Exit 3 when either file has duplicate keys
+      --exit-zero         Exit 0 when the tables differ: for a scheduled job whose
+                          output is the report, where a difference is not a failure
+                          (a Kubernetes Job, an Airflow task)
 
 Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (with --fail-on-dups).
 ";
@@ -120,9 +139,30 @@ fn quiet_panics() {
     }));
 }
 
+/// A closed pipe ends the process quietly, as it ends `cat`: `compara head
+/// big.csv | head -1` is not an error. Rust ignores SIGPIPE, so a write to a
+/// closed pipe would fail -- and `println!` would panic -- instead.
+fn default_sigpipe() {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
+        }
+        const SIGPIPE: std::ffi::c_int = 13;
+        const SIG_DFL: usize = 0;
+        // SAFETY: restores the default disposition of one signal.
+        unsafe {
+            signal(SIGPIPE, SIG_DFL);
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    default_sigpipe();
     quiet_panics();
     compara::alloc::hold_reserve();
+    // Inside a container, out of memory is a refusal, not an OOM kill.
+    compara::memory::contain();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let status = run(&args);
     report_peak_rss();
@@ -157,6 +197,10 @@ fn run(args: &[String]) -> u8 {
                 2
             }
         },
+        "env" => {
+            print_env();
+            0
+        }
         "head" => match cmd_head(&args[1..]) {
             Ok(status) => status,
             Err(e) => {
@@ -180,12 +224,13 @@ struct Args {
 
 /// The options that take no value. Anything else consumes the token after it,
 /// which is how a file path can appear before, between or after the options.
-const FLAGS: [&str; 9] = [
+const FLAGS: [&str; 10] = [
     "trim",
     "ignore-case",
     "empty-is-null",
     "no-compress",
     "fail-on-dups",
+    "exit-zero",
     "summary",
     // `head --csv`. A value-taking flag left out of this list does not fail
     // quietly -- it eats the token after it -- but it does fail confusingly:
@@ -261,8 +306,18 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
             "compare needs two files: compara compare A.csv B.csv --key ...",
         ));
     }
-    let a_path = Path::new(&args.positional[0]);
-    let b_path = Path::new(&args.positional[1]);
+    if args.positional.len() > 2 {
+        return Err(Error::new(format!(
+            "compare takes two inputs, A and B, and was given {}; a glob the shell expanded \
+             gives one per file -- quote it ('data/*.parquet') and compara reads its files as \
+             one table, or name the directory",
+            args.positional.len()
+        )));
+    }
+    let (a_spec, b_spec) = (args.positional[0].as_str(), args.positional[1].as_str());
+    if a_spec == "-" && b_spec == "-" {
+        return Err(Error::new("only one side can be read from standard input"));
+    }
 
     let mut opt = Options::default();
     if let Some(name) = args.get("profile", Some("p")) {
@@ -311,8 +366,17 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     if let Some(v) = args.get("engine", None) {
         opt.engine = v.to_string();
     }
+    // An export to object storage is written here first and copied there
+    // after; the engines write to a directory.
+    let mut export_to: Option<(String, compara::source::TempDir)> = None;
     if let Some(v) = args.get("export-dir", None) {
-        opt.export_dir = Some(v.to_string());
+        if compara::source::is_remote(v) {
+            let dir = compara::source::TempDir::new("export")?;
+            opt.export_dir = Some(dir.path().to_string_lossy().into_owned());
+            export_to = Some((v.to_string(), dir));
+        } else {
+            opt.export_dir = Some(v.to_string());
+        }
     }
     if opt.key.is_empty() {
         return Err(Error::new("--key (or a profile with key) is required"));
@@ -344,22 +408,75 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     // keeps for it whether or not this is set.
     opt.row_lists = report.is_some();
 
-    let result = compare(a_path, b_path, &mut opt)?;
+    // Both sides are fetched at once: a download is network-bound, and the
+    // two do not share anything until the engine runs.
+    let want = Want::for_options(&opt);
+    let (a, b) = std::thread::scope(|scope| {
+        // A thread wants a stack, and under a small memory limit there may be
+        // none to give: then B is read after A, on this one.
+        let b = std::thread::Builder::new()
+            .spawn_scoped(scope, || Source::open(b_spec, &want))
+            .ok();
+        let a = Source::open(a_spec, &want);
+        let b = match b {
+            Some(h) => h
+                .join()
+                .unwrap_or_else(|_| Err(Error::new("reading B panicked"))),
+            None => Source::open(b_spec, &want),
+        };
+        (a, b)
+    });
+    let (a, b) = (a?, b?);
+    for (side, source) in [("A", &a), ("B", &b)] {
+        for step in source.steps() {
+            eprintln!("{side} {}: {step}", source.spec());
+        }
+    }
 
-    let mut written: Option<PathBuf> = None;
+    let mut result = compare(a.path(), b.path(), &mut opt)?;
+    for (meta, source) in [(&mut result.meta.a, &a), (&mut result.meta.b, &b)] {
+        if source.path() != Path::new(source.spec()) {
+            meta.name = source.name();
+            meta.path = source.spec().to_string();
+            meta.size = source.stored_size();
+        }
+    }
+
+    let mut written: Option<(String, u64)> = None;
     if let Some(out_path) = report {
         let html = render(&result, !args.flag("no-compress"))?;
-        fs::write(&out_path, html)
-            .map_err(|e| Error::new(format!("cannot write {}: {e}", out_path.display())))?;
-        written = Some(out_path);
+        let dest = out_path.to_string_lossy().into_owned();
+        written = Some((dest.clone(), html.len() as u64));
+        write_output(&dest, html.as_bytes())?;
     }
+    // `--json -` is the summary on standard output, for a pipe or a CI step;
+    // the counts line goes to standard error so the output stays one document.
+    let json_to_stdout = args.get("json", None) == Some("-");
     if let Some(path) = args.get("json", None) {
         let summary = serde_json::to_string_pretty(&result.summary())?;
-        fs::write(path, summary).map_err(|e| Error::new(format!("cannot write {path}: {e}")))?;
+        if json_to_stdout {
+            println!("{summary}");
+        } else {
+            write_output(path, summary.as_bytes())?;
+        }
+    }
+    if let Some((dest, dir)) = &export_to {
+        let mut names: Vec<_> = fs::read_dir(dir.path())?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        names.sort();
+        for path in names {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let to = format!("{}/{name}", dest.trim_end_matches('/'));
+            compara::source::upload(&path, &to)?;
+        }
     }
 
     let c = &result.counts;
-    println!(
+    let line = format!(
         "A {} rows | B {} rows | matched {} (changed {}) | added {} | removed {} | \
          dup keys A {} B {} | {} {}s",
         comma(c.a_rows),
@@ -373,27 +490,102 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
         result.meta.engine,
         result.meta.seconds
     );
-    if let Some((out_path, meta)) = written
+    let report_line = written
         .as_ref()
-        .and_then(|p| fs::metadata(p).ok().map(|m| (p, m)))
-    {
-        println!(
-            "Report: {} ({:.0} KB)",
-            out_path.display(),
-            meta.len() as f64 / 1024.0
-        );
+        .map(|(dest, bytes)| format!("Report: {dest} ({:.0} KB)", *bytes as f64 / 1024.0));
+    for text in std::iter::once(line).chain(report_line) {
+        if json_to_stdout {
+            eprintln!("{text}");
+        } else {
+            println!("{text}");
+        }
     }
 
     if args.flag("fail-on-dups") && (c.a_dup_keys > 0 || c.b_dup_keys > 0) {
         return Ok(3);
     }
-    let code = if result.identical() { 0 } else { 1 };
+    let code = if result.identical() || args.flag("exit-zero") {
+        0
+    } else {
+        1
+    };
     // The process ends when this returns, and the kernel takes its memory back
     // in one step. Dropping the result first freed the report's rows a string
     // at a time -- several hundred thousand of them at the default row cap,
     // 45ms of a 1.7s run on a 4M-row pair -- for nothing anyone can observe.
     std::mem::forget(result);
     Ok(code)
+}
+
+/// Writes an output where it was asked for: a local path, or an object
+/// storage or HTTP URL, by way of a temporary file.
+fn write_output(dest: &str, bytes: &[u8]) -> Result<()> {
+    if compara::source::is_remote(dest) {
+        let dir = compara::source::TempDir::new("out")?;
+        let local = dir.path().join("output");
+        fs::write(&local, bytes)?;
+        compara::source::upload(&local, dest)?;
+        return Ok(());
+    }
+    fs::write(dest, bytes).map_err(|e| Error::new(format!("cannot write {dest}: {e}")))
+}
+
+/// `compara env`: what this process sees of the machine, for whoever is
+/// working out why a container run behaved as it did.
+fn print_env() {
+    let mb = |b: u64| format!("{} MB", b >> 20);
+    println!("compara {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "cloud inputs: {}",
+        if cfg!(feature = "cloud") {
+            "s3://, gs://, az://, http(s):// (credentials from the environment)"
+        } else {
+            "no (built without the `cloud` feature)"
+        }
+    );
+    for (scheme, source) in compara::source::credential_sources() {
+        println!("  {scheme}:// credentials: {source}");
+    }
+    println!(
+        "cpus: {}",
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    );
+    match compara::memory::probe() {
+        Some(m) => println!(
+            "memory: {} limit, {} available",
+            mb(m.limit),
+            mb(m.available)
+        ),
+        None => println!("memory: unknown"),
+    }
+    match compara::memory::container_limit() {
+        Some(l) => println!("container memory limit: {}", mb(l)),
+        None => println!("container memory limit: none"),
+    }
+    match compara::memory::contained() {
+        Some(c) => println!(
+            "heap limit: {} (from the container's; out of memory is refused, not killed)",
+            mb(c)
+        ),
+        None => println!("heap limit: none set"),
+    }
+    if let Ok(v) = std::env::var("COMPARA_MEMORY") {
+        println!("COMPARA_MEMORY: {v}");
+    }
+    let tmp = std::env::temp_dir();
+    let writable = compara::source::temp_dir_writable();
+    let free = compara::source::free_space(&tmp)
+        .map(|b| format!(", {} free", compara::source::human(b)))
+        .unwrap_or_default();
+    println!(
+        "temp dir: {} ({}{free})",
+        tmp.display(),
+        if writable {
+            "writable"
+        } else {
+            "NOT writable: set TMPDIR"
+        }
+    );
 }
 
 /// Groups a count with thousands separators, matching the other implementations.
@@ -453,7 +645,8 @@ fn cmd_columns(argv: &[String]) -> Result<u8> {
     let mut opt = Options::default();
     apply_read_options(&args, &mut opt);
 
-    let shape = compara::engine::turbo::shape(Path::new(first), &opt)?;
+    let source = Source::open(first, &Want::footer_only())?;
+    let shape = compara::engine::turbo::shape(source.path(), &opt)?;
     for name in &shape.columns {
         println!("{name}");
     }
@@ -494,7 +687,8 @@ fn cmd_head(argv: &[String]) -> Result<u8> {
     let mut opt = Options::default();
     apply_read_options(&args, &mut opt);
 
-    let (columns, rows) = compara::engine::turbo::head(Path::new(first), want, &opt)?;
+    let source = Source::open(first, &Want::all())?;
+    let (columns, rows) = compara::engine::turbo::head(source.path(), want, &opt)?;
     if args.flag("csv") {
         println!("{}", csv_line(&columns));
         for row in &rows {

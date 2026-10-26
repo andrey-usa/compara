@@ -60,7 +60,7 @@ fn refuse(what: &str, bytes: usize) -> Error {
     if let Ok(mut reserve) = RESERVE.lock() {
         *reserve = Vec::new();
     }
-    Error::new(format!(
+    Error::out_of_memory(format!(
         "out of memory: {what} needs {}",
         human_bytes(bytes)
     ))

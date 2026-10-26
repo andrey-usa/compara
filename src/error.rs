@@ -18,6 +18,11 @@ pub struct Error {
     /// it, with `--engine turbo` ignored on that path. [`crate::engine`] reads
     /// this flag to route around that.
     unsupported: bool,
+    /// Set when an allocation was refused: the comparison needed more memory
+    /// than it could have. Inside a container that is the limit it was given
+    /// (see `crate::memory::contain`), and `auto` answers a CSV pair that hit
+    /// it with the engine that spills to disk instead.
+    out_of_memory: bool,
 }
 
 impl Error {
@@ -25,6 +30,7 @@ impl Error {
         Error {
             message: message.into(),
             unsupported: false,
+            out_of_memory: false,
         }
     }
 
@@ -33,12 +39,43 @@ impl Error {
         Error {
             message: message.into(),
             unsupported: true,
+            out_of_memory: false,
+        }
+    }
+
+    /// An allocation the comparison could not have. See [`Error::out_of_memory`].
+    pub fn out_of_memory(message: impl Into<String>) -> Self {
+        Error {
+            message: message.into(),
+            unsupported: false,
+            out_of_memory: true,
         }
     }
 
     /// Whether this is a reader declining rather than a file being wrong.
     pub fn is_unsupported(&self) -> bool {
         self.unsupported
+    }
+
+    /// Whether the comparison ran out of the memory it was allowed.
+    pub fn is_out_of_memory(&self) -> bool {
+        self.out_of_memory
+    }
+
+    /// The same error with `prefix` before its message, and its kind kept.
+    pub fn context(self, prefix: impl fmt::Display) -> Self {
+        Error {
+            message: format!("{prefix}{}", self.message),
+            ..self
+        }
+    }
+
+    /// The same error with `suffix` after its message, and its kind kept.
+    pub fn context_after(self, suffix: impl fmt::Display) -> Self {
+        Error {
+            message: format!("{}{suffix}", self.message),
+            ..self
+        }
     }
 }
 

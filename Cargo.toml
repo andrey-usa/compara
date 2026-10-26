@@ -1,6 +1,6 @@
 [package]
 name = "compara"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.90"
 description = "Compare two tables (CSV, NDJSON, Parquet) on a composite key: counts, per-column statistics and a self-contained HTML report."
@@ -31,8 +31,13 @@ path = "src/bin/bench.rs"
 required-features = ["bench"]
 
 [features]
+default = ["cloud"]
 # The benchmark harness: `cargo run --release --features bench --bin compara-bench`.
 bench = []
+# s3://, gs://, az:// and https:// inputs, read through Apache Arrow's
+# object_store with each cloud's own credential chain. Off, the binary reads
+# local files only and carries no network or TLS code.
+cloud = ["dep:object_store", "dep:tokio", "dep:futures", "dep:bytes", "dep:url", "dep:reqwest"]
 
 [dependencies]
 # Engine: native, over the csv crate.
@@ -49,6 +54,18 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.151"
 flate2 = "1.1.10"
 base64 = "0.23.1"
+# Cloud inputs (feature `cloud`): object storage and HTTP, read in parallel
+# ranges. object_store is the Apache Arrow project's client, the one DataFusion,
+# Polars and delta-rs read the clouds through; tokio is its runtime, driven
+# from a blocking call here and nowhere else.
+object_store = { version = "0.14.2", default-features = false, features = ["aws", "gcp", "azure", "http"], optional = true }
+tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread"], optional = true }
+futures = { version = "0.3.34", default-features = false, features = ["std"], optional = true }
+bytes = { version = "1.12.1", optional = true }
+url = { version = "2.5.8", optional = true }
+# Plain and presigned HTTPS, whose query string object_store's HTTP store drops.
+# The same client object_store builds on, with no feature it does not already use.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "http2"], optional = true }
 # Local time with an offset for the report header; std has no calendar.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 

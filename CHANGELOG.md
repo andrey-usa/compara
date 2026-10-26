@@ -6,6 +6,136 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-26
+
+Tables compared where they are: in S3, Google Cloud Storage and Azure, on
+the web, as directories and globs of parts, and as Delta Lake tables at a
+version. A container image and a GitHub Action. Faster on every format,
+and inside a container's memory limit a refusal that says why rather than
+an OOM kill.
+
+### Added
+
+- Inputs from object storage and the web: `s3://`, `gs://`, `az://` (and
+  `adl`, `azure`, `abfs`, `abfss`), `http://` and `https://`, wherever a
+  file is accepted. Credentials come from each cloud's own environment --
+  `AWS_*` and `~/.aws` profiles (keys, session tokens, `AWS_ENDPOINT_URL`
+  for MinIO and the like, web identity for EKS, ECS task roles, instance
+  metadata), `GOOGLE_*` and application default credentials, `AZURE_*`
+  (account keys, SAS, service principals, managed and workload identity)
+  -- and a presigned or SAS URL is read as it is. Objects are read in 8 MB
+  ranges, sixteen at a time (`COMPARA_FETCH_CONCURRENCY`), into a temporary
+  file. A Parquet object is read only as far as the comparison reads it:
+  its footer and the column chunks of the key and compared columns, so
+  `--compare` on two columns of a wide table fetches those two. `columns`
+  on a remote Parquet file reads its last 64 KB. The `cloud` feature is on
+  by default; without it the binary reads local files only. Every range is
+  read from the version whose first bytes were read (`If-Match` on its
+  ETag), so an object overwritten mid-read is an error rather than a file
+  stitched from two versions; throttled and failed ranges are retried.
+  A plain HTTP server that ignores ranges sends the object whole; it is
+  written to disk as it arrives (the temporary directory's room checked
+  first), never held in memory.
+- A download that takes a while says how far it has got every ten seconds
+  on stderr, so a CI job's or a pod's log shows it moving
+  (`COMPARA_PROGRESS` sets the seconds; 0 turns it off).
+- Outputs to the same places: `-o`, `--json` and `--export-dir` take an
+  `s3://`, `gs://` or `az://` URL (or a presigned `https://` one), written
+  in one request or as a multipart upload of 16 MB parts. `--json -` prints
+  the summary on standard output, and the counts line goes to standard
+  error, so a pipeline or a CI step reads one JSON document.
+- A directory, a quoted glob (`'out/date=*/*.parquet'`, `**` for any depth)
+  or an object storage prefix (`s3://bucket/orders/`, or the same without the
+  slash when no object has that name) is a side: its files, read as one table
+  in path order. CSV and TSV parts must share a header, Parquet parts a
+  schema (names, order, types, nullability), and the error names the part
+  and the difference; compressed parts are expanded on the way. Remote parts
+  are fetched with sixteen ranges in flight across all of them, Parquet
+  parts only as far as the comparison reads them. Hive partition
+  directories (`date=2026-10-01/`) are columns of the table, as text, unless
+  the files already have them: a Parquet part gets a column chunk of one
+  dictionary value per row group, a CSV or JSON part the value in every row.
+  `.`- and `_`-prefixed names are passed over; Iceberg tables are refused.
+- Delta Lake tables, local or in object storage, at their latest version or
+  at `@vN` (`s3://lake/orders@v41`): the files the log says make that
+  version, from its last checkpoint and the commits after it, so two
+  versions of a table compare like two tables. Deletion vectors, column
+  mapping, V2 checkpoints and a log cleaned up past the version asked for
+  are refused with what to do instead; a Delta table further down a
+  directory is named rather than read as loose files.
+- Credentials as each cloud's own tools find them, laptops included: an AWS
+  profile that uses SSO, an assumed role or a `credential_process` is
+  resolved as the AWS CLI resolves it; an `az login` is used when Azure has
+  nothing else; and with no credentials at all a public bucket is read
+  unsigned rather than refused.
+- `--exit-zero`: exit 0 when the tables differ, for a scheduled job whose
+  output is the report -- a Kubernetes Job, an Airflow task -- where exit 1
+  would mark the run failed.
+- `-` for either file reads standard input.
+- Gzip and zstd files are read as what they hold, by their first bytes
+  rather than their names (`.csv.gz`, `.ndjson.zst`); bzip2, xz and zip are
+  named and refused rather than read as a CSV.
+- `compara env`: the CPUs, memory, container limit, heap limit and
+  temporary directory this process sees, with the room left in it, and
+  where each cloud's credentials would come from (keys, a profile, web
+  identity, a CLI sign-in, metadata) -- by what is set, nothing fetched. A
+  download or a table of parts that the temporary directory has no room for
+  is refused before it starts, with how much it needs and where.
+- A container image, `ghcr.io/andrey-usa/compara`: the release binary on
+  distroless for `linux/amd64` and `linux/arm64`, non-root, with build
+  provenance and an SBOM.
+- A GitHub Action (`uses: andrey-usa/compara@v0`): installs the release
+  binary, compares, writes the counts and the most-changed columns to the job
+  summary, and fails the step on differences; its outputs are the counts and
+  the JSON summary's path.
+
+### Changed
+
+- A closed pipe ends the process quietly, as it ends `cat`: `compara head
+  big.csv | head -1` used to print an internal error.
+- Faster on every format and thread count. On 2M-row pairs, 4-core GitHub
+  Actions runners, best of five (CI run 39728278163), the time against the
+  C port of the same tool: CSV 0.75x at one thread and 0.83x at four, TSV
+  0.74x and 0.81x, NDJSON 0.52x and 0.67x, Parquet 0.57x and 0.73x.
+  - Quoted CSV: the row end and the join's register count follow quotes by
+    parity, a register at a time, instead of a scan per quoted field and a
+    field walk per quoted row. On the same 2M rows with their text fields
+    quoted, 0.61x the C port's time at one thread and 0.63x at four (CI run
+    39729954571).
+  - Parquet: the join reads each key column through a form settled once per
+    column, and compares short keys by a load or two instead of `memcmp`:
+    the match sweep runs in half the instructions.
+  - Buffers of 4 MB or more are advised onto transparent huge pages, so
+    filling them takes a page fault per 2 MB rather than per 4 KB: on the
+    2M-row Parquet pair 75,651 faults become 16,889.
+  - NDJSON rows are proved equal before they are parsed, and the CSV join's
+    register count, key hash and index insert do less per row.
+- Inside a container with a memory limit, the heap is held under that limit
+  (`RLIMIT_DATA`, a sixteenth below it), so running out of memory is a
+  refusal that says what needed how much -- exit 2 -- rather than an OOM kill
+  with no message (exit 137). Under `--engine auto` a CSV pair whose indexes
+  do not fit is then compared by the `sortmerge` engine, which spills to
+  disk, with the same answer. `COMPARA_CONTAIN=0` turns this off. In a
+  container, files being written -- spilled runs, downloads, expanded gzip
+  -- are handed to the disk as they go rather than left dirty in the page
+  cache, where they count against the same limit: a 160 MB container whose
+  heap stayed under 120 MB was OOM-killed by them.
+- `sortmerge` sizes its batches from the heap it may have, and builds the
+  report's rows only when there is a report: a summary run of a 2M-row CSV
+  pair now completes in a 40 MB heap (`ulimit -d`), where it failed in
+  100 MB. Named with `--engine sortmerge` in a heap under 24 MB, it is
+  refused before it starts rather than aborted midway; under 48 MB `auto`
+  doesn't fall back to it on its own, and its refusal says that
+  `--engine sortmerge` tries it.
+- The README has a table of comparisons read from S3 against DuckDB's
+  `httpfs` (CI run 39793328982): at 10M rows a side, 2.7 times faster on a
+  Parquet pair, 2.8 on CSV, 6.0 on a table of Parquet parts, in a third to
+  a half of its memory.
+- The README's speed table is rerun on this code (CI runs 39728430053 and
+  39729034092): at ten million rows and four threads, CSV 1.20 s to 1.08 s,
+  NDJSON 2.79 s to 1.26 s, Parquet 1.41 s to 1.17 s. Its input column was
+  labelled "a side" but held both files; it says so now.
+
 ## [0.5.3] - 2026-10-22
 
 Two Parquet files compared up to 2.5 times faster, JSON files that are one
@@ -191,6 +321,7 @@ First release as a standalone project.
 - The data generator and the benchmark harness are `compara-gen-data` and
   `compara-bench` (the latter behind the `bench` feature).
 
+[0.6.0]: https://github.com/andrey-usa/compara/releases/tag/v0.6.0
 [0.5.3]: https://github.com/andrey-usa/compara/releases/tag/v0.5.3
 [0.5.2]: https://github.com/andrey-usa/compara/releases/tag/v0.5.2
 [0.5.1]: https://github.com/andrey-usa/compara/releases/tag/v0.5.1
