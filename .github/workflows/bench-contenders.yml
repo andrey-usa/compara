@@ -167,3 +167,29 @@ jobs:
         with:
           name: bench-contenders-results
           path: bench-results.json
+
+  # zstd inputs (#11): .csv.zst and zstd Parquet from two writers, against
+  # DuckDB 1.x and 2.x, every tool's counts checked against the others.
+  zstd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.13'
+
+      - name: Benchmark
+        run: |
+          python3 scripts/bench_zstd.py --rows 10m --runs 3 --baseline origin/main --work "$RUNNER_TEMP/bench" | tee /tmp/zstd-table.md
+          { echo "## bench-contenders — zstd inputs (10M rows x 20 cols)"; sed -n '/^Linux/,$p' /tmp/zstd-table.md; } >> "$GITHUB_STEP_SUMMARY"
