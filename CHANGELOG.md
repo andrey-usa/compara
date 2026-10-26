@@ -11,8 +11,19 @@ All notable changes to this project are documented here. The format follows
 - Delta-encoded Parquet integers whose deltas need more than 32 bits (an
   INT64 column with large jumps between rows) lost their high bits and were
   read as wrong values; they are read whole now.
+- At a tight heap limit (a container's, or `ulimit -d`) a run could abort
+  (SIGABRT) instead of refusing with exit 2: while one side's checked
+  allocation met the ceiling, the other side's thread could meet it with a
+  small one. The reserve kept for the refusal now covers that too (on ARM,
+  6 aborts in 4,800 runs at 4 MB before, none after).
 
 ### Security
+
+- A Parquet page that claims more values, or more uncompressed bytes, than
+  its stored bytes can hold by the decompression-bomb rule (past 1 GB, more
+  than 1000 times) is refused before anything is sized from it
+  (`COMPARA_MAX_EXPANSION`). Found by fuzzing: a 9.7 KB file had 2.8 GB
+  reserved for a page that claimed 1.47 billion values.
 
 - A Parquet page that claims a bit width wider than its values (found by
   fuzzing) is refused with a message; a debug build panicked on it and a

@@ -818,6 +818,13 @@ fn read_page_header(data: &[u8], at: usize) -> Result<PageHeader> {
         _ => Ok(false),
     })?;
     h.body_at = at + r.position();
+    if let Some(refusal) = crate::source::page_bomb(
+        h.num_values as u64,
+        h.uncompressed as u64,
+        h.compressed as u64,
+    ) {
+        return Err(Error::new(refusal));
+    }
     Ok(h)
 }
 

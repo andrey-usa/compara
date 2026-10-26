@@ -359,6 +359,29 @@ fn max_expansion() -> u64 {
         .unwrap_or(MAX_EXPANSION)
 }
 
+/// The refusal for a Parquet page that claims more than its bytes can hold
+/// by the same rule: past [`EXPANSION_FLOOR`], more than [`MAX_EXPANSION`]
+/// times what is stored. A page's value count and uncompressed size each size
+/// an allocation before the page is read, so a 9.7 KB file that claimed 1.47
+/// billion values had 2.8 GB reserved for them (found by fuzzing). Real
+/// writers put thousands to a few million values in a page.
+pub(crate) fn page_bomb(values: u64, uncompressed: u64, stored: u64) -> Option<String> {
+    let ratio = max_expansion();
+    let past = |n: u64| ratio > 0 && n > EXPANSION_FLOOR && n / stored.max(1) > ratio;
+    let what = if past(values) {
+        format!("{values} values")
+    } else if past(uncompressed) {
+        human(uncompressed)
+    } else {
+        return None;
+    };
+    Some(format!(
+        "a Parquet page claims {what} in {} stored: a decompression bomb? \
+         COMPARA_MAX_EXPANSION=<times> (0: no limit) lets it",
+        human(stored)
+    ))
+}
+
 /// A reader that counts what it has read into the cell.
 struct Counted<R>(R, std::rc::Rc<std::cell::Cell<u64>>);
 
