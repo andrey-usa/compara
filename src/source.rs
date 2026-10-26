@@ -297,13 +297,38 @@ impl Source {
                 .map_err(|e| Error::new(format!("cannot read {}: {e}", self.spec)))?,
         );
         let mut out = BufWriter::with_capacity(1 << 20, crate::memory::WriteBehind::new(file));
-        let written = match kind {
-            "gzip" => std::io::copy(&mut flate2::read::MultiGzDecoder::new(input), &mut out),
-            _ => zstd::stream::read::Decoder::with_buffer(input)
-                .and_then(|mut d| std::io::copy(&mut d, &mut out)),
+        let read = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let input = Counted(input, read.clone());
+        let bad = |e: std::io::Error| {
+            Error::new(format!("{} does not {kind}-decompress: {e}", self.spec))
+        };
+        let mut decoder: Box<dyn Read> = match kind {
+            "gzip" => Box::new(flate2::read::MultiGzDecoder::new(input)),
+            _ => Box::new(zstd::stream::read::Decoder::new(input).map_err(bad)?),
+        };
+        let ratio = max_expansion();
+        let mut buf = vec![0u8; 1 << 20];
+        let mut written = 0u64;
+        loop {
+            let k = match decoder.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(bad(e)),
+            };
+            out.write_all(&buf[..k]).map_err(bad)?;
+            written += k as u64;
+            if ratio > 0 && written > EXPANSION_FLOOR && written / read.get().max(1) > ratio {
+                return Err(Error::new(format!(
+                    "{} expands to more than {ratio} times its size ({} from {} so far): a \
+                     decompression bomb? COMPARA_MAX_EXPANSION=<times> (0: no limit) lets it",
+                    self.spec,
+                    human(written),
+                    human(read.get())
+                )));
+            }
         }
-        .and_then(|n| out.flush().map(|_| n))
-        .map_err(|e| Error::new(format!("{} does not {kind}-decompress: {e}", self.spec)))?;
+        out.flush().map_err(bad)?;
         // A downloaded or spooled compressed file is not needed once it is
         // expanded; a local one is the caller's and stays.
         if let Some(i) = self.temps.iter().position(|t| *t == self.path) {
@@ -317,6 +342,31 @@ impl Source {
             started.elapsed().as_secs_f64()
         ));
         Ok(())
+    }
+}
+
+/// Tables expand 3 to 30 times their gzip or zstd size; a decompression
+/// bomb thousands of times. Past [`EXPANSION_FLOOR`] of output, more than
+/// this many times the input read so far is refused (`COMPARA_MAX_EXPANSION`,
+/// 0 for no limit), so a small file of one repeated value still opens.
+const MAX_EXPANSION: u64 = 1000;
+const EXPANSION_FLOOR: u64 = 1 << 30;
+
+fn max_expansion() -> u64 {
+    std::env::var("COMPARA_MAX_EXPANSION")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(MAX_EXPANSION)
+}
+
+/// A reader that counts what it has read into the cell.
+struct Counted<R>(R, std::rc::Rc<std::cell::Cell<u64>>);
+
+impl<R: Read> Read for Counted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.read(buf)?;
+        self.1.set(self.1.get() + n as u64);
+        Ok(n)
     }
 }
 

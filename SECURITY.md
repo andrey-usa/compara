@@ -17,6 +17,11 @@ or report a wrong count is a bug we want to hear about.
   describe a billion equal values in a few kilobytes, so a small file is not
   a small comparison; run untrusted inputs under a memory limit (`ulimit -v`,
   a container) if that matters.
+- A gzip or zstd input that expands past 1 GB to more than 1000 times its
+  size is refused (`COMPARA_MAX_EXPANSION`), and an `http(s)://` input or
+  redirect that leads to a link-local address (a cloud metadata service) is
+  refused (`COMPARA_ALLOW_LINK_LOCAL=1`). Other private and loopback hosts
+  stay readable: they are where many tables live.
 - The HTML report shows cell values as text. It loads nothing from the
   network and runs no code from the data.
 - Exported CSVs (`--export-dir`, the report's download) keep values exactly
