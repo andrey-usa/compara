@@ -224,3 +224,18 @@ fn a_gzip_bomb_is_refused_before_it_fills_the_disk() {
     let stderr = refused(&[Path::new("head"), &file.0], &[], Duration::from_secs(60));
     assert!(stderr.contains("decompression bomb"), "{stderr}");
 }
+
+#[test]
+fn a_bit_width_wider_than_its_values_is_refused() {
+    // Found by fuzzing: a page whose packed values claim 110 bits each. The
+    // shift past 64 panicked in a debug build and, in a release one, read
+    // garbage; a delta page's widths past 32 also lost their high bits.
+    let file = fixture("hostile/bit_width_overflow.parquet");
+    refused_reading(&file);
+    let stderr = refused(
+        &[Path::new("compare"), &file, &file],
+        &["-k", "id", "--summary", "--engine", "turbo"],
+        Duration::from_secs(20),
+    );
+    assert!(stderr.contains("bits wide"), "{stderr}");
+}
