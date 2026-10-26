@@ -6,7 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Delta-encoded Parquet integers whose deltas need more than 32 bits (an
+  INT64 column with large jumps between rows) lost their high bits and were
+  read as wrong values; they are read whole now.
+
 ### Security
+
+- A Parquet page that claims a bit width wider than its values (found by
+  fuzzing) is refused with a message; a debug build panicked on it and a
+  release one read garbage.
 
 - A gzip or zstd input that expands past 1 GB to more than 1000 times its
   size is refused as a decompression bomb; it was expanded whole into

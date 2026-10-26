@@ -47,16 +47,21 @@ fn zigzag(n: u64) -> i64 {
 ///
 /// This is the layout both the hybrid and the delta encodings pack their groups
 /// in: values run through the bytes without alignment, low bits first, so a
-/// three-bit value can straddle a byte boundary and often does.
-fn unpack(
+/// three-bit value can straddle a byte boundary and often does. `width` is the
+/// file's word: wider than the values it fills (32 bits for the hybrid's, 64
+/// for a delta) is an error, not a shift past the end of a word.
+fn unpack<T: Word>(
     data: &[u8],
     bit_offset: usize,
     width: u8,
     count: usize,
-    out: &mut Vec<u32>,
+    out: &mut Vec<T>,
 ) -> Result<()> {
+    if width as usize > T::BITS {
+        return Err(too_wide(width, T::BITS));
+    }
     if width == 0 {
-        out.extend(std::iter::repeat_n(0, count));
+        out.extend(std::iter::repeat_n(T::of(0), count));
         return Ok(());
     }
     let mut bit = bit_offset;
@@ -73,9 +78,35 @@ fn unpack(
             taken += want;
             bit += want as usize;
         }
-        out.push(value as u32);
+        out.push(T::of(value));
     }
     Ok(())
+}
+
+/// What [`unpack`] fills: values of at most `BITS` bits.
+trait Word: Copy {
+    const BITS: usize;
+    fn of(v: u64) -> Self;
+}
+
+impl Word for u32 {
+    const BITS: usize = 32;
+    fn of(v: u64) -> Self {
+        v as u32
+    }
+}
+
+impl Word for u64 {
+    const BITS: usize = 64;
+    fn of(v: u64) -> Self {
+        v
+    }
+}
+
+fn too_wide(width: u8, bits: usize) -> Error {
+    Error::new(format!(
+        "a Parquet page packs its values {width} bits wide, more than the {bits} they fill"
+    ))
 }
 
 /// The RLE / bit-packed hybrid: alternating runs of one repeated value and
@@ -128,6 +159,9 @@ impl<'a> Hybrid<'a> {
     fn fill(&mut self) -> Result<()> {
         if self.at >= self.data.len() {
             return Ok(());
+        }
+        if self.width > 32 {
+            return Err(too_wide(self.width, 32));
         }
         let header = varint(self.data, &mut self.at)?;
         if header & 1 == 1 {
@@ -200,7 +234,7 @@ pub(super) fn delta_binary_packed(data: &[u8], want: usize) -> Result<(Vec<i64>,
     out.push(first);
     let mut value = first;
     let mut widths = vec![0u8; miniblocks];
-    let mut scratch: Vec<u32> = Vec::new();
+    let mut scratch: Vec<u64> = Vec::new();
 
     while out.len() < total {
         let min_delta = zigzag(varint(data, &mut at)?);
@@ -271,6 +305,25 @@ mod tests {
             hybrid.next().expect("the two values that are there");
         }
         assert!(hybrid.next().is_err());
+    }
+
+    #[test]
+    fn a_delta_wider_than_32_bits_keeps_its_high_bits() {
+        // Block of 128 in 4 miniblocks, 3 values from 0: deltas 2^40 and 0,
+        // packed 41 bits wide in the first miniblock (32 values, 164 bytes).
+        let mut page = vec![0x80, 0x01, 0x04, 0x03, 0x00, 0x00, 41, 0, 0, 0];
+        let mut packed = vec![0u8; 32 * 41 / 8];
+        packed[5] = 0x01;
+        page.extend(packed);
+        let (values, _) = delta_binary_packed(&page, 3).unwrap();
+        assert_eq!(values, vec![0, 1 << 40, 1 << 40]);
+        // Wider than a 64-bit value can be: an error, not a shift past it.
+        page[6] = 65;
+        page.resize(10 + 32 * 65 / 8, 0);
+        let err = delta_binary_packed(&page, 3).unwrap_err();
+        assert!(err.to_string().contains("65 bits wide"), "{err}");
+        let data = [0x03, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(Hybrid::new(&data, 33).next().is_err());
     }
 
     #[test]
