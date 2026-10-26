@@ -19,6 +19,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- A gzip or zstd input is expanded into memory on Linux while it fits a
+  quarter of the memory free (inside a container, a sixth of the heap
+  limit, which it then comes out of), and to `TMPDIR` past that. A 10M-row
+  `.csv.zst` pair: 10.3 to 5.8 s (median of 3, 4 cores), the same counts and
+  peak memory; on a VM whose disk writes 150 MB/s, each side took 8 to 30 s
+  to expand to a file and takes 3.5 to 4 s in memory.
 - The sortmerge engine sorts each batch by an eight-byte key prefix held
   beside the row number, reading the key text only on a tie: 1M rows 5.9 s
   -> 4.35 s on one core, 2M rows 7.7 s -> 6.7 s on two; same output.

@@ -137,6 +137,7 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
                     human(size),
                     human((size as f64 / secs.max(1e-3)) as u64)
                 )],
+                held: None,
             });
         }
     };
@@ -148,6 +149,7 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
         stored: size,
         temps: vec![path],
         steps: Vec::new(),
+        held: None,
     };
     file.set_len(size)?;
     let tail_at = size - tail.len() as u64;
@@ -392,6 +394,7 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
         stored: listed_bytes,
         temps: vec![combined.path.clone()],
         steps: Vec::new(),
+        held: None,
     };
     let label = |m: &object_store::ObjectMeta| format!("{root}{}", m.location.as_ref());
 
