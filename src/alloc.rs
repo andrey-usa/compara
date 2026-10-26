@@ -23,8 +23,9 @@
 //! distinct key, per uncompressed byte — go through the helpers here, which
 //! return [`Error`] at the allocation that would have crossed the line. A
 //! bounded allocation (a per-thread block, a header, a column name) does not
-//! need them: it cannot be the one that fails, and routing it through here
-//! would only add noise.
+//! need them: routing it through here would only add noise. It can still be
+//! the one that meets the ceiling, when another thread's checked allocation
+//! got there first; the reserve below is for that.
 //!
 //! The `what` label is not decoration. A refusal that names the structure is
 //! the answer to *how much would be enough*, which is the question anyone
@@ -32,7 +33,8 @@
 //! column` fail at very different budgets, and knowing which one hit the
 //! ceiling is the difference between a number and a diagnosis.
 
-use std::sync::Mutex;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::{Error, Result};
 
@@ -43,23 +45,65 @@ use crate::{Error, Result};
 /// problem -- it was never taken -- but the checked ones include a report row's
 /// few dozen bytes, and when one of those fails the process is at its ceiling
 /// to the byte: the message's own allocation failed after it and aborted from
-/// inside the refusal. This is released first thing in [`refuse`], which is
-/// what the message and the unwinding after it are written into.
-static RESERVE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-const RESERVE_BYTES: usize = 64 * 1024;
+/// inside the refusal.
+///
+/// Nor is the refusal the only small allocation at the ceiling. The two sides
+/// are built on two threads, and while one grows a checked vector up to the
+/// limit, the other can be making a bounded one -- a column's few dozen bytes
+/// -- that no helper here checks. Measured on an ARM runner at a 4 MB heap
+/// limit: 1 run in 1,200 aborted that way, "memory allocation of 96 bytes
+/// failed", from the other side's setup while its own sweep was refused. So
+/// the reserve is a few chunks, and [`crate::hugepages`]' allocator gives one
+/// back and tries again whenever a small allocation fails while any are left;
+/// [`refuse`] gives one back as well, for the message.
+const RESERVE_CHUNK: usize = 64 * 1024;
+static RESERVE: [AtomicPtr<u8>; 4] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 4];
+
+fn chunk() -> Layout {
+    Layout::from_size_align(RESERVE_CHUNK, 16).expect("a valid layout")
+}
 
 /// Sets aside the room a refusal is written into. `main` calls it first.
 pub fn hold_reserve() {
-    if let Ok(mut reserve) = RESERVE.lock() {
-        *reserve = Vec::with_capacity(RESERVE_BYTES);
+    for slot in &RESERVE {
+        // SAFETY: a non-zero size; the block is freed in `release_reserve`
+        // with the same layout.
+        let p = unsafe { System.alloc(chunk()) };
+        let old = slot.swap(p, Ordering::AcqRel);
+        if !old.is_null() {
+            // SAFETY: allocated above with this layout, by an earlier call.
+            unsafe { System.dealloc(old, chunk()) };
+        }
     }
+}
+
+/// Gives one chunk of the reserve back to the allocator; whether there was
+/// one. Lock-free: the global allocator calls it from inside a failed
+/// allocation, on any thread.
+pub fn release_reserve() -> bool {
+    for slot in &RESERVE {
+        let p = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !p.is_null() {
+            // SAFETY: allocated in `hold_reserve` with this layout, and the
+            // swap made this the only holder.
+            unsafe { System.dealloc(p, chunk()) };
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a failed allocation of `size` bytes is one the reserve is for:
+/// small enough that a chunk covers it. A large one fails as it would have,
+/// and the checked helpers here turn that into a refusal; spending the
+/// reserve on it would leave none for the refusal's message.
+pub fn reserve_covers(size: usize) -> bool {
+    size <= RESERVE_CHUNK
 }
 
 /// The refusal itself: what was being sized, and how big it was.
 fn refuse(what: &str, bytes: usize) -> Error {
-    if let Ok(mut reserve) = RESERVE.lock() {
-        *reserve = Vec::new();
-    }
+    release_reserve();
     Error::out_of_memory(format!(
         "out of memory: {what} needs {}",
         human_bytes(bytes)

@@ -52,13 +52,26 @@ fn advise(p: *mut u8, size: usize) {
 #[cfg(not(target_os = "linux"))]
 fn advise(_: *mut u8, _: usize) {}
 
+/// Calls `attempt` again after giving back a chunk of the reserve, while it
+/// fails, the request is one the reserve is for and any of it is left (see
+/// [`crate::alloc::release_reserve`]). A null is passed through otherwise.
+#[inline]
+fn retried(size: usize, mut attempt: impl FnMut() -> *mut u8) -> *mut u8 {
+    let mut p = attempt();
+    while p.is_null() && crate::alloc::reserve_covers(size) && crate::alloc::release_reserve() {
+        p = attempt();
+    }
+    p
+}
+
 // SAFETY: every call is forwarded to `System` with the caller's arguments, and
-// the advice afterwards neither moves nor frees the block.
+// the advice afterwards neither moves nor frees the block. A failed call is
+// made again with the same arguments, after a reserve chunk is freed.
 unsafe impl GlobalAlloc for HugePages {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded as given.
-        let p = unsafe { System.alloc(layout) };
+        let p = retried(layout.size(), || unsafe { System.alloc(layout) });
         advise(p, layout.size());
         p
     }
@@ -66,7 +79,7 @@ unsafe impl GlobalAlloc for HugePages {
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded as given.
-        let p = unsafe { System.alloc_zeroed(layout) };
+        let p = retried(layout.size(), || unsafe { System.alloc_zeroed(layout) });
         advise(p, layout.size());
         p
     }
@@ -79,8 +92,11 @@ unsafe impl GlobalAlloc for HugePages {
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: forwarded as given.
-        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        // SAFETY: forwarded as given; a failed realloc leaves `ptr` as it was,
+        // so it is valid for the next attempt.
+        let p = retried(new_size, || unsafe {
+            System.realloc(ptr, layout, new_size)
+        });
         // A block that grew past the line, or moved to a fresh mapping, has
         // not been advised yet.
         advise(p, new_size);
