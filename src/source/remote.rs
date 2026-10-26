@@ -75,6 +75,9 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
         return fetch_many(spec, want).await;
     }
     let mut reader = if scheme == "http" || scheme == "https" {
+        if let Some(why) = metadata_url(&url).filter(|_| !link_local_allowed()) {
+            return Err(Error::new(why));
+        }
         Reader::Http(http_client()?, spec.to_string())
     } else {
         store_for(spec, &url).await?
@@ -660,7 +663,7 @@ async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
             .body(body)
             .send()
             .await
-            .map_err(|e| fail(e.to_string()))?;
+            .map_err(|e| fail(said(&e)))?;
         if !response.status().is_success() {
             return Err(fail(format!("HTTP {}", response.status())));
         }
@@ -849,9 +852,9 @@ async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, Fetc
                 .await
                 .map_err(|e| {
                     if e.is_timeout() {
-                        FetchError::Transient(e.to_string())
+                        FetchError::Transient(said(&e))
                     } else {
-                        FetchError::Other(e.to_string())
+                        FetchError::Other(said(&e))
                     }
                 })?;
             let status = response.status();
@@ -1104,7 +1107,7 @@ async fn fetch_part_once(
             let response = request
                 .send()
                 .await
-                .map_err(|e| FetchError::Transient(e.to_string()))?;
+                .map_err(|e| FetchError::Transient(said(&e)))?;
             let status = response.status();
             if status == reqwest::StatusCode::PRECONDITION_FAILED {
                 return Err(FetchError::Other(changed()));
@@ -1173,10 +1176,104 @@ fn signable(url: &url::Url) -> bool {
             || host.ends_with(".r2.cloudflarestorage.com"))
 }
 
+/// Cloud metadata services (where a machine's credentials come from) answer
+/// at link-local addresses: 169.254.169.254, fe80::/10, AWS's fd00:ec2::254.
+/// An `http(s)://` table that is there, by its address, its name or a
+/// redirect, is refused unless `COMPARA_ALLOW_LINK_LOCAL=1`.
+fn metadata_address(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6 == std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+        }
+    }
+}
+
+fn link_local_allowed() -> bool {
+    std::env::var("COMPARA_ALLOW_LINK_LOCAL").is_ok_and(|v| v.trim() == "1")
+}
+
+/// The refusal for a URL whose host is a metadata address, if it is one.
+fn metadata_url(url: &url::Url) -> Option<String> {
+    let ip = match url.host()? {
+        url::Host::Ipv4(v4) => std::net::IpAddr::V4(v4),
+        url::Host::Ipv6(v6) => std::net::IpAddr::V6(v6),
+        url::Host::Domain(_) => return None,
+    };
+    metadata_address(ip).then(|| {
+        format!(
+            "{url}: a link-local address (a cloud metadata service) is not read; \
+             COMPARA_ALLOW_LINK_LOCAL=1 allows it"
+        )
+    })
+}
+
+/// Name resolution that leaves out metadata addresses (see [`metadata_address`]).
+struct NoMetadata;
+
+impl reqwest::dns::Resolve for NoMetadata {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            use std::net::ToSocketAddrs;
+            let lookup = host.clone();
+            let found = tokio::task::spawn_blocking(move || {
+                (lookup.as_str(), 0u16)
+                    .to_socket_addrs()
+                    .map(|a| a.collect::<Vec<_>>())
+            })
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })??;
+            let kept: Vec<_> = found
+                .into_iter()
+                .filter(|a| !metadata_address(a.ip()))
+                .collect();
+            if kept.is_empty() {
+                return Err(format!(
+                    "{host} is a link-local address (a cloud metadata service), which is not read; \
+                     COMPARA_ALLOW_LINK_LOCAL=1 allows it"
+                )
+                .into());
+            }
+            Ok(Box::new(kept.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// An HTTP error with what caused it (a refused redirect says why only there).
+fn said(e: &reqwest::Error) -> String {
+    let mut text = e.to_string();
+    let mut cause = std::error::Error::source(e);
+    while let Some(c) = cause {
+        let more = c.to_string();
+        if !text.contains(&more) {
+            text = format!("{text}: {more}");
+        }
+        cause = c.source();
+    }
+    text
+}
+
 fn http_client() -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(concat!("compara/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(30));
+    if !link_local_allowed() {
+        builder =
+            builder
+                .dns_resolver(Arc::new(NoMetadata))
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().len() >= 10 {
+                        return attempt.error("more than 10 redirects");
+                    }
+                    match metadata_url(attempt.url()) {
+                        Some(why) => attempt.error(why),
+                        None => attempt.follow(),
+                    }
+                }));
+    }
     if let Some(proxy) = proxy_from_env() {
         builder = builder.proxy(
             reqwest::Proxy::all(&proxy)
@@ -1596,6 +1693,34 @@ fn ini_section(text: &str, name: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_addresses_are_link_local_ones() {
+        for ip in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "fe80::1",
+            "fd00:ec2::254",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(metadata_address(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "8.8.8.8",
+            "::1",
+            "fd00::1",
+            "2001:db8::1",
+        ] {
+            assert!(!metadata_address(ip.parse().unwrap()), "{ip}");
+        }
+        let url = |u: &str| url::Url::parse(u).unwrap();
+        assert!(metadata_url(&url("http://169.254.169.254/latest/meta-data/")).is_some());
+        assert!(metadata_url(&url("http://[fd00:ec2::254]/")).is_some());
+        assert!(metadata_url(&url("https://example.com/a.csv")).is_none());
+        assert!(metadata_url(&url("http://127.0.0.1:8080/a.csv")).is_none());
+    }
 
     #[test]
     fn ranges_merge_when_close_and_stop_at_the_tail() {

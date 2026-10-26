@@ -710,3 +710,38 @@ fn public_buckets_need_no_credentials_and_profiles_run_their_process() {
         assert!(!err.contains("unsigned"), "{err}");
     }
 }
+
+/// A table at a cloud metadata address (where a machine's credentials come
+/// from) is refused: given directly, or reached by a redirect.
+#[test]
+fn metadata_addresses_are_not_read() {
+    let run = |url: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_compara"))
+            .args(["head", url])
+            .env_remove("COMPARA_ALLOW_LINK_LOCAL")
+            .output()
+            .expect("run compara");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    let (code, err) = run("http://169.254.169.254/latest/meta-data/x.csv");
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("link-local"), "{err}");
+    // A server of our own that sends every request there.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/x.csv\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    let (code, err) = run(&format!("http://127.0.0.1:{port}/redir.csv"));
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("link-local"), "{err}");
+}
