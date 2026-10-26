@@ -226,6 +226,22 @@ fn a_gzip_bomb_is_refused_before_it_fills_the_disk() {
 }
 
 #[test]
+fn a_page_that_claims_more_values_than_its_bytes_hold_is_refused() {
+    // Found by fuzzing: 9.7 KB whose data page claims 1.47 billion values in
+    // 1.5 KB. Both engines sized their per-value buffers from that count, and
+    // 2.8 GB was reserved before the page turned out to be short. Refused
+    // now as the decompression bomb it is, before anything is allocated.
+    let file = fixture("hostile/page_values_bomb.parquet");
+    refused_reading(&file);
+    let stderr = refused(
+        &[Path::new("compare"), &file, &file],
+        &["-k", "id", "--summary"],
+        Duration::from_secs(20),
+    );
+    assert!(stderr.contains("decompression bomb"), "{stderr}");
+}
+
+#[test]
 fn a_bit_width_wider_than_its_values_is_refused() {
     // Found by fuzzing: a page whose packed values claim 110 bits each. The
     // shift past 64 panicked in a debug build and, in a release one, read

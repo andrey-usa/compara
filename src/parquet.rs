@@ -1132,6 +1132,13 @@ fn read_page_head(data: &[u8], at: usize, path: &str) -> Result<PageHead> {
         }
     }
     out.after = t.at;
+    if let Some(refusal) = crate::source::page_bomb(
+        out.num_values.max(0) as u64,
+        out.uncompressed.max(0) as u64,
+        out.compressed.max(0) as u64,
+    ) {
+        return Err(Error::new(format!("{refusal}: {path}")));
+    }
     Ok(out)
 }
 
