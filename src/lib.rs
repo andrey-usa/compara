@@ -27,6 +27,7 @@ pub mod contract;
 pub mod engine;
 pub mod error;
 pub mod gendata;
+pub mod hugepages;
 pub mod memory;
 pub mod options;
 pub mod parallel;
@@ -36,6 +37,7 @@ pub mod profiles;
 pub mod report;
 pub mod rowstore;
 pub mod sections;
+pub mod source;
 
 pub use contract::{CellDiff, ColumnStat, CompareResult, Counts, Section, Val};
 pub use engine::compare;

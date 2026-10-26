@@ -46,12 +46,31 @@ const DEFAULT_BATCH_BYTES: usize = 32 << 20;
 /// spills at all, which would leave the interesting half of this module untested.
 pub const BATCH_BYTES_ENV: &str = "COMPARA_SORTMERGE_BATCH_BYTES";
 
-fn batch_bytes() -> usize {
-    std::env::var(BATCH_BYTES_ENV)
+/// The batch size: the override, or the default -- unless the process has a
+/// heap limit (`ulimit -d`, or a container's, see `memory::contain`) or a stated budget
+/// (`--memory`), when it is a sixteenth of that, so a comparison handed to
+/// this engine for want of memory fits what it was handed with. Both files
+/// are sorted at once, each with a batch being filled and one being written,
+/// and a batch can briefly hold twice its size while it grows.
+fn batch_bytes(opt: &Options) -> usize {
+    if let Some(n) = std::env::var(BATCH_BYTES_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_BATCH_BYTES)
+    {
+        return n;
+    }
+    let allowance = [
+        crate::memory::heap_limit(),
+        crate::memory::stated(opt.memory),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    match allowance {
+        Some(bytes) => ((bytes / 16) as usize).clamp(1 << 20, DEFAULT_BATCH_BYTES),
+        None => DEFAULT_BATCH_BYTES,
+    }
 }
 
 pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResult> {
@@ -212,7 +231,7 @@ fn stream_into(
         .map(|name| header.iter().position(|c| c == name))
         .collect();
     let key_size = opt.key.len();
-    let budget = batch_bytes();
+    let budget = batch_bytes(opt);
 
     // Full batches go to a thread that sorts and writes them while this one
     // reads on. The channel holds one, so at most two are in memory: the one
@@ -229,6 +248,8 @@ fn stream_into(
                     write_row(&mut w, &batch, row as usize)?;
                 }
                 w.flush()?;
+                let file = w.into_inner().map_err(|e| Error::new(e.to_string()))?;
+                crate::memory::write_out(&file);
                 spilled.push(path);
             }
             Ok(spilled)
@@ -665,9 +686,14 @@ fn merge_join(
     let mut blanked_per = vec![0i64; nc];
     let mut filled_per = vec![0i64; nc];
 
-    let mut changed = Capped::new(opt.max_rows, exporting);
-    let mut added = Capped::new(opt.max_rows, exporting);
-    let mut removed = Capped::new(opt.max_rows, exporting);
+    // The rows a report shows: only when there is a report to show them. A
+    // summary was building fifty thousand of each anyway, decoded into
+    // strings, which is most of what this engine holds in memory -- and it is
+    // the engine a comparison falls back to for want of memory.
+    let cap = if opt.row_lists { opt.max_rows } else { 0 };
+    let mut changed = Capped::new(cap, exporting);
+    let mut added = Capped::new(cap, exporting);
+    let mut removed = Capped::new(cap, exporting);
     let mut changed_a: Vec<Vec<Val>> = Vec::new();
     let mut changed_b: Vec<Vec<Val>> = Vec::new();
 
@@ -736,7 +762,7 @@ fn merge_join(
                         row.push(Cell::Diffs(cells));
                         row
                     });
-                    if exporting || changed_a.len() <= opt.max_rows {
+                    if exporting || (opt.row_lists && changed_a.len() <= opt.max_rows) {
                         changed_a.push(arow);
                         changed_b.push(br.row(0));
                     }

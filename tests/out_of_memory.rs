@@ -302,3 +302,71 @@ fn the_band_where_it_aborts_does_not_grow() {
     assert!(refused > 0, "no cap in the range was too small to serve");
     assert!(answered > 0, "no cap in the range was enough to answer");
 }
+
+/// A CSV pair whose index does not fit the heap it may have -- a container's
+/// limit, here `ulimit -d` -- is compared by the engine that spills to disk,
+/// with the answer the unlimited run gives, under `--engine auto`. Named, the
+/// in-memory engine refuses as before.
+#[test]
+fn a_csv_pair_too_big_for_the_heap_is_compared_by_spilling() {
+    let dir = std::env::temp_dir().join(format!("compara-spill-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let made = Command::new(env!("CARGO_BIN_EXE_compara-gen-data"))
+        .args(["--rows", "2m", "--out-dir"])
+        .arg(&dir)
+        .args(["--prefix", "t"])
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let (a, b) = (dir.join("t_a.csv"), dir.join("t_b.csv"));
+    let run = |limit: Option<u64>, engine: &str| {
+        let script = format!(
+            "{} exec {} compare {} {} -k account_id,txn_id -i updated_at --engine {engine}",
+            limit
+                .map(|kb| format!("ulimit -d {kb};"))
+                .unwrap_or_default(),
+            env!("CARGO_BIN_EXE_compara"),
+            a.display(),
+            b.display(),
+        );
+        Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap()
+    };
+    let counts = |o: &std::process::Output| {
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        // The counts, without the engine and its time at the end.
+        out.rsplit_once(" | ")
+            .map(|(c, _)| c.to_string())
+            .unwrap_or(out)
+    };
+    let free = run(None, "auto");
+    let tight = run(Some(100 * 1024), "auto");
+    let err = String::from_utf8_lossy(&tight.stderr);
+    assert_eq!(free.status.code(), tight.status.code(), "{err}");
+    assert_eq!(counts(&free), counts(&tight), "{err}");
+    assert!(err.contains("sortmerge"), "{err}");
+    assert!(String::from_utf8_lossy(&tight.stdout).contains("sortmerge"));
+    let named = run(Some(100 * 1024), "turbo");
+    assert_eq!(named.status.code(), Some(2), "{:?}", named);
+    assert!(String::from_utf8_lossy(&named.stderr).contains("out of memory"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A named sortmerge in a heap too small for its own buffers and threads is
+/// refused before it starts, not aborted mid-run (16 MB aborted on a runner
+/// with more threads).
+#[test]
+fn a_named_sortmerge_without_room_is_refused_up_front() {
+    let f = Fixture::new();
+    let run = run_script(16 * 1024, &f.a(), &f.b(), "--engine sortmerge");
+    assert!(!run.hung, "hung");
+    assert_eq!(run.code, Some(2), "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("the sortmerge engine needs about"),
+        "{}",
+        run.stderr
+    );
+}

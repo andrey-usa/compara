@@ -87,6 +87,269 @@ pub fn probe() -> Option<Memory> {
     Some(m)
 }
 
+/// What [`contain`] set, for whoever asks why a run was refused.
+static CONTAINED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+
+/// Inside a container -- a cgroup with a memory limit -- keeps this process's
+/// heap under that limit, so that running out of memory is an allocation the
+/// comparison refuses rather than the kernel's OOM kill.
+///
+/// The difference is what the caller sees. An OOM kill ends the process with
+/// no word at all, exit 137, and a Kubernetes Job records `OOMKilled` and
+/// retries it into the same wall. A refused allocation is a line saying what
+/// needed how much (exit 2), and under `--engine auto` a CSV pair that does
+/// not fit is compared by the engine that spills to disk instead. What turns
+/// one into the other is `RLIMIT_DATA`: since Linux 4.7 it covers the heap
+/// and private anonymous mappings -- every index and buffer here -- and not
+/// the mapped input files, which are page cache the kernel can always take
+/// back. So the limit is the cgroup's, less a margin for the stacks, the
+/// page tables and the kernel's own accounting: a sixteenth, and at least
+/// 64 MB (a quarter, under a limit too small for that).
+///
+/// Called first thing by the binary. A limit already lower is kept, and
+/// `COMPARA_CONTAIN=0` leaves everything alone. Returns the limit set.
+pub fn contain() -> Option<u64> {
+    *CONTAINED.get_or_init(|| {
+        if std::env::var("COMPARA_CONTAIN").is_ok_and(|v| v.trim() == "0") {
+            return None;
+        }
+        let limit = cgroup_limit()?;
+        // A sixteenth, and at least 64 MB -- or a quarter, in a container
+        // too small for that.
+        let margin = (limit / 16).max((64u64 << 20).min(limit / 4));
+        let cap = limit.checked_sub(margin)?;
+        rlimit::cap_data(cap)
+    })
+}
+
+/// The heap limit [`contain`] set, if it set one.
+pub fn contained() -> Option<u64> {
+    CONTAINED.get().copied().flatten()
+}
+
+/// The heap this process may have: its data limit (`ulimit -d`, or the one
+/// [`contain`] set from a container's), if it has one.
+pub fn heap_limit() -> Option<u64> {
+    rlimit::data()
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod rlimit {
+    use std::ffi::c_int;
+
+    #[repr(C)]
+    struct RLimit {
+        cur: u64,
+        max: u64,
+    }
+
+    unsafe extern "C" {
+        fn getrlimit(resource: c_int, rlim: *mut RLimit) -> c_int;
+        fn setrlimit(resource: c_int, rlim: *const RLimit) -> c_int;
+    }
+
+    const RLIMIT_DATA: c_int = 2;
+
+    /// The soft data limit, if there is one.
+    pub fn data() -> Option<u64> {
+        let mut now = RLimit { cur: 0, max: 0 };
+        // SAFETY: `now` is a valid, writable rlimit for the call to fill.
+        if unsafe { getrlimit(RLIMIT_DATA, &mut now) } != 0 {
+            return None;
+        }
+        // RLIM_INFINITY is all ones.
+        (now.cur != u64::MAX).then_some(now.cur)
+    }
+
+    /// Lowers the soft data limit to `cap`, never raising it; the limit in
+    /// force afterwards when it was lowered.
+    pub fn cap_data(cap: u64) -> Option<u64> {
+        let mut now = RLimit { cur: 0, max: 0 };
+        // SAFETY: `now` is a valid, writable rlimit for the call to fill.
+        if unsafe { getrlimit(RLIMIT_DATA, &mut now) } != 0 {
+            return None;
+        }
+        let want = cap.min(now.max);
+        if now.cur <= want {
+            return None;
+        }
+        let new = RLimit {
+            cur: want,
+            max: now.max,
+        };
+        // SAFETY: `new` is a valid rlimit; lowering a soft limit needs no
+        // privilege.
+        (unsafe { setrlimit(RLIMIT_DATA, &new) } == 0).then_some(want)
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+mod rlimit {
+    pub fn cap_data(_: u64) -> Option<u64> {
+        None
+    }
+
+    pub fn data() -> Option<u64> {
+        None
+    }
+}
+
+/// Dirty pages count against a container's memory limit until the disk has
+/// them, and a process that writes faster than the disk drains -- a sort
+/// spilling its runs, a download, a gzip expanding -- is killed for memory
+/// its heap never used: measured, a 160 MB container whose heap stayed under
+/// 120 MB was OOM-killed with 50 MB of dirty and in-flight pages beside it.
+/// So inside a container (when [`contain`] set a limit) a file being written
+/// is handed to the disk as it goes: [`write_behind`] starts the write of the
+/// stretch just written and waits for the one before, which keeps two
+/// stretches in flight however fast the writer is. Elsewhere it does nothing
+/// and the page cache does what it always does.
+pub fn write_behind(file: &std::fs::File, from: u64, len: u64, wait_for: Option<(u64, u64)>) {
+    if contained().is_none() || len == 0 {
+        return;
+    }
+    flush::start(file, from, len);
+    if let Some((at, n)) = wait_for {
+        flush::wait(file, at, n);
+    }
+}
+
+/// A file the comparison writes once and reads back later -- a spilled run --
+/// on the disk and out of the page cache, inside a container: read back, its
+/// pages are clean and come and go with the cache, rather than sitting dirty
+/// against the limit until the kernel gets to them.
+pub fn write_out(file: &std::fs::File) {
+    if contained().is_none() {
+        return;
+    }
+    flush::all_and_forget(file);
+}
+
+/// Hands memory the allocator holds but nothing uses back to the system, after
+/// an engine that ran out of it: the next engine starts from what it needs,
+/// not from what the last one left in the allocator's free lists.
+pub fn release_free() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: malloc_trim only returns free memory to the system.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
+
+/// [`write_behind`] in a `Write`: every [`WriteBehind::STRETCH`] bytes, the
+/// stretch is handed to the disk and the one before it waited for.
+pub struct WriteBehind {
+    file: std::fs::File,
+    written: u64,
+    started: u64,
+    previous: Option<(u64, u64)>,
+}
+
+impl WriteBehind {
+    const STRETCH: u64 = 16 << 20;
+
+    pub fn new(file: std::fs::File) -> Self {
+        Self::at(file, 0)
+    }
+
+    /// For a file whose position is `offset`, as one appended to is.
+    pub fn at(file: std::fs::File, offset: u64) -> Self {
+        WriteBehind {
+            file,
+            written: offset,
+            started: offset,
+            previous: None,
+        }
+    }
+
+    fn hand_over(&mut self) {
+        let len = self.written - self.started;
+        write_behind(&self.file, self.started, len, self.previous);
+        self.previous = Some((self.started, len));
+        self.started = self.written;
+    }
+}
+
+impl std::io::Write for WriteBehind {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.file.write(buf)?;
+        self.written += n as u64;
+        if self.written - self.started >= Self::STRETCH {
+            self.hand_over();
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()?;
+        if self.written > self.started {
+            self.hand_over();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod flush {
+    use std::ffi::{c_int, c_uint};
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn sync_file_range(fd: c_int, offset: i64, nbytes: i64, flags: c_uint) -> c_int;
+        fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
+    }
+
+    const WAIT_BEFORE: c_uint = 1;
+    const WRITE: c_uint = 2;
+    const WAIT_AFTER: c_uint = 4;
+    const DONTNEED: c_int = 4;
+
+    pub fn start(file: &std::fs::File, at: u64, len: u64) {
+        // SAFETY: a valid descriptor; the call only schedules writeback.
+        unsafe {
+            sync_file_range(file.as_raw_fd(), at as i64, len as i64, WRITE);
+        }
+    }
+
+    pub fn wait(file: &std::fs::File, at: u64, len: u64) {
+        // SAFETY: as above; this one waits for the writeback to finish.
+        unsafe {
+            sync_file_range(
+                file.as_raw_fd(),
+                at as i64,
+                len as i64,
+                WAIT_BEFORE | WRITE | WAIT_AFTER,
+            );
+        }
+    }
+
+    pub fn all_and_forget(file: &std::fs::File) {
+        let fd = file.as_raw_fd();
+        // SAFETY: as above; a length of 0 is "to the end of the file".
+        unsafe {
+            sync_file_range(fd, 0, 0, WAIT_BEFORE | WRITE | WAIT_AFTER);
+            posix_fadvise(fd, 0, 0, DONTNEED);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod flush {
+    pub fn start(_: &std::fs::File, _: u64, _: u64) {}
+    pub fn wait(_: &std::fs::File, _: u64, _: u64) {}
+    pub fn all_and_forget(_: &std::fs::File) {}
+}
+
+/// The memory limit of the container (cgroup) this process runs in, if any.
+pub fn container_limit() -> Option<u64> {
+    cgroup_limit()
+}
+
 /// The tightest memory limit on this process's cgroup or any cgroup above it,
 /// v2 or v1. A limit at or past 2^60 is the kernel's way of saying none.
 fn cgroup_limit() -> Option<u64> {

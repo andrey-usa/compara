@@ -115,7 +115,7 @@ fn run(
         if requested == Engine::Turbo {
             return turbo::compare(a, b, opt)
                 .map(|r| (r, Engine::Turbo.label().to_string()))
-                .map_err(|e| Error::new(format!("the turbo engine failed: {e}")));
+                .map_err(|e| e.context("the turbo engine failed: "));
         }
         // The columnar path reads a narrow slice of Parquet on purpose -- PLAIN
         // and dictionary v1 pages of byte arrays and word-sized types -- and
@@ -145,19 +145,90 @@ engine, which reads more of the format, failed too: {turbo_err}"
     if a_pq || b_pq {
         return turbo::compare(a, b, opt)
             .map(|r| (r, Engine::Turbo.label().to_string()))
-            .map_err(|e| Error::new(format!("the turbo engine failed: {e}")));
+            .map_err(|e| e.context("the turbo engine failed: "));
     }
 
+    // Below this, the sortmerge engine's own buffers and threads don't fit
+    // and the process would abort mid-run (measured: 12 MB here, 16 MB on a
+    // runner with more threads): a named sortmerge is refused up front.
+    if engine == Engine::SortMerge
+        && let Some(heap) = crate::memory::heap_limit().filter(|h| *h < SORTMERGE_MIN)
+    {
+        return Err(Error::new(format!(
+            "the sortmerge engine needs about {} of heap for its batches, run buffers and \
+             threads, and this process may use {} (a container limit or `ulimit -d`): \
+             raise it",
+            crate::source::human(SORTMERGE_MIN),
+            crate::source::human(heap)
+        )));
+    }
     let result = match engine {
         Engine::Turbo => turbo::compare(a, b, opt),
         Engine::SortMerge => sortmerge::compare(a, b, opt),
         Engine::Native => native::compare(a, b, opt),
         Engine::Auto => unreachable!("auto is resolved before this point"),
     };
-    result
-        .map(|r| (r, engine.label().to_string()))
-        .map_err(|e| Error::new(format!("the {engine} engine failed: {e}")))
+    match result {
+        // `turbo` holds its indexes in memory; a CSV pair whose indexes do not
+        // fit what this process may have -- a container's limit, or
+        // `--memory` -- is compared by the engine that sorts and spills to
+        // disk instead, at a few times the time and a bounded footprint. Only
+        // under `auto`: a named engine is the one that answers. And only with
+        // room for that engine's own buffers -- it needs some tens of
+        // megabytes whatever the input -- or it would fail where the refusal
+        // said plainly what was missing.
+        Err(e)
+            if requested == Engine::Auto
+                && engine == Engine::Turbo
+                && e.is_out_of_memory()
+                && crate::memory::heap_limit().is_none_or(|h| h >= SORTMERGE_FLOOR)
+                && sortmerge::available()
+                && !turbo::only_this_engine_reads(a)
+                && !turbo::only_this_engine_reads(b) =>
+        {
+            eprintln!(
+                "note: {e}, more than this process may use; comparing with the sortmerge \
+                 engine, which spills to disk ({})",
+                std::env::temp_dir().display()
+            );
+            crate::memory::release_free();
+            sortmerge::compare(a, b, opt)
+                .map(|r| (r, Engine::SortMerge.label().to_string()))
+                .map_err(|e| e.context("the sortmerge engine failed: "))
+        }
+        // A pair that didn't fit `turbo`, in a heap too small to hand it to
+        // `sortmerge` with room to spare: say that the engine can be named.
+        Err(e)
+            if requested == Engine::Auto
+                && engine == Engine::Turbo
+                && e.is_out_of_memory()
+                && crate::memory::heap_limit()
+                    .is_some_and(|h| (SORTMERGE_MIN..SORTMERGE_FLOOR).contains(&h))
+                && sortmerge::available() =>
+        {
+            Err(e
+                .context(format!("the {engine} engine failed: "))
+                .context_after(format!(
+                    "; below {} of heap the sortmerge engine isn't tried on its own (it may not \
+                 fit): `--engine sortmerge` tries it",
+                    crate::source::human(SORTMERGE_FLOOR)
+                )))
+        }
+        result => result
+            .map(|r| (r, engine.label().to_string()))
+            .map_err(|e| e.context(format!("the {engine} engine failed: "))),
+    }
 }
+
+/// The least heap a named sortmerge is started with; see [`SORTMERGE_FLOOR`]
+/// for the fallback's, which leaves room for larger inputs.
+const SORTMERGE_MIN: u64 = 24 << 20;
+
+/// The heap below which a CSV pair that does not fit `turbo` is refused
+/// rather than handed to `sortmerge`: about what that engine needs for its
+/// batches, run buffers and merge on a 2M-row pair (measured: 44 MB runs,
+/// 30 MB aborts), with room. An 80 MB container's heap is above it.
+const SORTMERGE_FLOOR: u64 = 48 << 20;
 
 /// Turns [`Engine::Auto`] into a concrete backend.
 ///
