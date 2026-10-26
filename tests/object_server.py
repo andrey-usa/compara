@@ -41,6 +41,12 @@ def main() -> None:
     args = ap.parse_args()
     lock = threading.Lock()
     gets = [0]
+    root_real = os.path.realpath(args.root)
+
+    def inside(*parts):
+        """A path under --root, or None for one that would leave it."""
+        full = os.path.realpath(os.path.join(root_real, *parts))
+        return full if full == root_real or full.startswith(root_real + os.sep) else None
     failed = set()
 
     class Handler(BaseHTTPRequestHandler):
@@ -83,7 +89,9 @@ def main() -> None:
             from xml.sax.saxutils import escape
             q = {k: v[0] for k, v in parse_qs(query, keep_blank_values=True).items()}
             prefix = q.get("prefix", "")
-            root = os.path.join(args.root, bucket)
+            root = inside(bucket)
+            if root is None:
+                return self.refuse(400)
             keys = []
             for d, dirs, files in os.walk(root):
                 dirs[:] = [x for x in dirs if x != ".uploads"]
@@ -197,12 +205,16 @@ def main() -> None:
             rel = unquote(parts.path).lstrip("/")
             etag = '"' + hashlib.md5(data).hexdigest() + '"'
             if "uploadId" in q:
-                d = os.path.join(args.root, ".uploads", q["uploadId"])
+                d = inside(".uploads", q["uploadId"])
+                if d is None:
+                    return self.refuse(400)
                 os.makedirs(d, exist_ok=True)
                 with open(os.path.join(d, "%08d" % int(q["partNumber"])), "wb") as f:
                     f.write(data)
             else:
-                full = os.path.join(args.root, rel)
+                full = inside(rel)
+                if full is None:
+                    return self.refuse(400)
                 os.makedirs(os.path.dirname(full), exist_ok=True)
                 with open(full, "wb") as f:
                     f.write(data)
@@ -222,8 +234,9 @@ def main() -> None:
                        f"</InitiateMultipartUploadResult>").encode()
                 return self.reply(200, xml)
             if "uploadId" in q:
-                d = os.path.join(args.root, ".uploads", q["uploadId"])
-                full = os.path.join(args.root, rel)
+                d, full = inside(".uploads", q["uploadId"]), inside(rel)
+                if d is None or full is None:
+                    return self.refuse(400)
                 os.makedirs(os.path.dirname(full), exist_ok=True)
                 with open(full, "wb") as out:
                     for name in sorted(os.listdir(d)):
