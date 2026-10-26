@@ -122,7 +122,13 @@ aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
   the last 64 KB.
 - **Everything else is read in parallel ranges** (8 MB, sixteen at a time,
   `COMPARA_FETCH_CONCURRENCY`) into a temporary file in `TMPDIR`. Gzip and
-  zstd files, local or remote, are read as what they hold.
+  zstd files, local or remote, are read as what they hold; one that expands
+  past 1 GB to more than 1000 times its size is refused as a decompression
+  bomb (`COMPARA_MAX_EXPANSION=<times>`, 0 for no limit).
+- **Link-local addresses are not read**: an `http(s)://` table at
+  169.254.0.0/16, fe80::/10 or fd00:ec2::254 (where cloud machines get
+  their credentials), by address, by name or by a redirect, is refused;
+  `COMPARA_ALLOW_LINK_LOCAL=1` allows it. Redirects stop after 10.
 - **A table of many files is one side**: a directory, a quoted glob, or an
   object storage prefix is its files read as one table, in path order --
   Spark and Hive output (`date=2026-10-01/part-00000.snappy.parquet`), a

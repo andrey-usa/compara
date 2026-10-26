@@ -204,3 +204,23 @@ fn a_zstd_page_cannot_expand_past_its_header() {
         "the whole bomb was decompressed: {stderr}"
     );
 }
+
+#[test]
+fn a_gzip_bomb_is_refused_before_it_fills_the_disk() {
+    // 18 gzip members of 64 MiB of zeros each: 1.1 MiB that expands to 1.1 GiB,
+    // a thousand times and more. It was expanded whole before reading.
+    use std::io::Write;
+    let mut member = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    let zeros = vec![0u8; 1 << 20];
+    for _ in 0..64 {
+        member.write_all(&zeros).unwrap();
+    }
+    let member = member.finish().unwrap();
+    let mut bomb = Vec::new();
+    for _ in 0..18 {
+        bomb.extend_from_slice(&member);
+    }
+    let file = Scratch::new("bomb.csv.gz", &bomb);
+    let stderr = refused(&[Path::new("head"), &file.0], &[], Duration::from_secs(60));
+    assert!(stderr.contains("decompression bomb"), "{stderr}");
+}

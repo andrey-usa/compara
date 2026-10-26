@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- A gzip or zstd input that expands past 1 GB to more than 1000 times its
+  size is refused as a decompression bomb; it was expanded whole into
+  `TMPDIR` first (`COMPARA_MAX_EXPANSION=<times>`, 0 for no limit).
+- `http(s)://` inputs and their redirects no longer reach link-local
+  addresses (cloud metadata services: 169.254.169.254, fe80::/10,
+  fd00:ec2::254), by address or by name (`COMPARA_ALLOW_LINK_LOCAL=1`
+  allows it); redirects stop after 10, and a refused one says why.
+
 ## [0.6.0] - 2026-10-26
 
 Tables compared where they are: in S3, Google Cloud Storage and Azure, on
