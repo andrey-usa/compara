@@ -295,7 +295,7 @@ fn fused_later_duplicates_subtract_exactly() {
         "later-duplicate subtraction is off"
     );
     assert!(
-        counts(&fout).contains("dup keys A 500"),
+        counts(&fout).contains("duplicate keys A 500"),
         "the fixture lost its duplicates: {}",
         counts(&fout)
     );

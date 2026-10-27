@@ -99,6 +99,7 @@ el.remove();
 
 const M=D.meta,C=D.counts,K=M.key,NK=K.length,CMP=M.compared;
 const fmt=n=>n.toLocaleString();
+const pl=(n,w)=>fmt(n)+' '+w+(n==1?'':'s');
 const esc=s=>s==null?'':String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const cellv=v=>v==null?'<span class="nil">empty</span>':esc(v);
 const dupRows=[...D.dup_a.rows.map(r=>['A',...r]),...D.dup_b.rows.map(r=>['B',...r])];
@@ -115,23 +116,23 @@ const total=C.unchanged+C.changed+C.added+C.removed||1;
 const pct=n=>(100*n/total).toFixed(2)+'%';
 const app=document.getElementById('app');app.className='';
 app.innerHTML=`
-<header><h1>${esc(M.a.name)}<em>→</em>${esc(M.b.name)}</h1>
-<p class="sub">Compared on ${K.map(esc).join(' + ')} across ${fmt(CMP.length)} column${CMP.length==1?'':'s'}. ${esc(M.engine)}, ${M.seconds}s, ${esc(M.generated.replace('T',' ').slice(0,16))}.</p></header>
+<header><h1>${esc(M.a.name)} <em>→</em> ${esc(M.b.name)}</h1>
+<p class="sub">Compared on ${K.map(esc).join(' + ')}, ${pl(CMP.length,'column')}, engine ${esc(M.engine)}, ${M.seconds} s, ${esc(M.generated.replace('T',' ').slice(0,16))}.</p></header>
 <section class="recon" aria-label="Reconciliation">
  <div class="bar"><i class="u" style="width:${pct(C.unchanged)}" title="Unchanged"></i><i class="c" style="width:${pct(C.changed)}" title="Changed"></i><i class="r" style="width:${pct(C.removed)}" title="Removed"></i><i class="a" style="width:${pct(C.added)}" title="Added"></i></div>
  <div class="legend">
-  <button class="u" data-go="columns"><b>${fmt(C.unchanged)}</b><span>unchanged</span></button>
-  <button class="c" data-go="changed"><b>${fmt(C.changed)}</b><span>changed</span></button>
-  <button class="r" data-go="removed"><b>${fmt(C.removed)}</b><span>removed, only in A</span></button>
-  <button class="a" data-go="added"><b>${fmt(C.added)}</b><span>added, only in B</span></button>
+  <button class="u" data-go="columns"><b>${fmt(C.unchanged)}</b> <span>unchanged</span></button>
+  <button class="c" data-go="changed"><b>${fmt(C.changed)}</b> <span>changed</span></button>
+  <button class="r" data-go="removed"><b>${fmt(C.removed)}</b> <span>removed, only in A</span></button>
+  <button class="a" data-go="added"><b>${fmt(C.added)}</b> <span>added, only in B</span></button>
  </div>
  <div class="files">
-  <span><b>A</b> ${esc(M.a.name)}: ${fmt(C.a_rows)} rows, ${fmt(C.a_keys)} keys${C.a_dup_keys?`, <span class="warn">${fmt(C.a_dup_keys)} duplicated (${fmt(C.a_dup_rows)} rows)</span>`:''}</span>
-  <span><b>B</b> ${esc(M.b.name)}: ${fmt(C.b_rows)} rows, ${fmt(C.b_keys)} keys${C.b_dup_keys?`, <span class="warn">${fmt(C.b_dup_keys)} duplicated (${fmt(C.b_dup_rows)} rows)</span>`:''}</span>
+  <span><b>A</b> ${esc(M.a.name)}: ${pl(C.a_rows,'row')}, ${pl(C.a_keys,'key')}${C.a_dup_keys?`, <span class="warn">${fmt(C.a_dup_keys)} duplicated (${pl(C.a_dup_rows,'row')})</span>`:''}</span>
+  <span><b>B</b> ${esc(M.b.name)}: ${pl(C.b_rows,'row')}, ${pl(C.b_keys,'key')}${C.b_dup_keys?`, <span class="warn">${fmt(C.b_dup_keys)} duplicated (${pl(C.b_dup_rows,'row')})</span>`:''}</span>
   ${M.only_in_a.length||M.only_in_b.length?`<span class="warn">Columns not compared: ${M.only_in_a.length?`only in A: ${M.only_in_a.map(esc).join(', ')}`:''}${M.only_in_a.length&&M.only_in_b.length?'; ':''}${M.only_in_b.length?`only in B: ${M.only_in_b.map(esc).join(', ')}`:''}</span>`:''}
  </div>
 </section>
-<nav class="tabs" role="tablist">${TABS.map((t,i)=>`<button role="tab" data-tab="${t.id}" title="Press ${i+1}">${t.label}<small>${fmt(t.n)}</small></button>`).join('')}</nav>
+<nav class="tabs" role="tablist">${TABS.map((t,i)=>`<button role="tab" data-tab="${t.id}" title="Press ${i+1}">${t.label} <small>${fmt(t.n)}</small></button>`).join('')}</nav>
 <div class="tools"><input id="q" type="search" placeholder="Filter rows (press / to focus)" aria-label="Filter rows"><button class="act" id="dl">Download shown rows as CSV</button><span class="n" id="cnt"></span></div>
 <div class="chips" id="chips"></div>
 <div id="note"></div>
@@ -150,7 +151,7 @@ function build(){
   if(S.sort!=null){const i=S.sort,d=S.dir;rows=[...rows].sort((a,b)=>{const x=a[i],y=b[i];if(x==null)return 1;if(y==null)return -1;const nx=+x,ny=+y;return (isNaN(nx)||isNaN(ny)?String(x).localeCompare(String(y)):nx-ny)*d;});}
   S.view=rows;S.sel=-1;
   const same=rows.length===t.rows.length;
-  cnt.textContent=same?`${fmt(rows.length)} rows`:`${fmt(rows.length)} of ${fmt(t.rows.length)} rows`;
+  cnt.textContent=same?pl(rows.length,'row'):`${fmt(rows.length)} of ${pl(t.rows.length,'row')}`;
   note.innerHTML=t.trunc?`<div class="note">Showing the first ${fmt(t.rows.length)} of ${fmt(t.n)} rows. Run with --export-dir for the full list.</div>`:'';
   const smp=rows.slice(0,300),widths=t.cols.map((c,i)=>{if(t.id==='changed'&&i>=NK)return 'minmax(360px,1fr)';
     let L=String(c).length;for(const r of smp){const v=r[i];if(v!=null)L=Math.max(L,String(v).length);}return Math.min(360,Math.max(96,Math.round(L*7.5)+26))+'px';});

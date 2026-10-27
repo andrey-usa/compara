@@ -210,6 +210,60 @@ fn an_option_compara_does_not_have_is_named() {
     assert_eq!(code, 0, "{stderr}");
 }
 
+/// A command compara doesn't have is named in one line with the ones it
+/// does, not followed by sixty lines of usage; a file given where the command
+/// goes gets the line that compares it.
+#[test]
+fn an_unknown_command_lists_the_commands() {
+    let out = Command::new(BIN).arg("diff").output().expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("unknown command \"diff\""), "{stderr}");
+    assert!(
+        stderr.contains("compare, columns, head, env and version"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    let out = Command::new(BIN)
+        .args(["a.csv", "b.csv"])
+        .output()
+        .expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("compara compare a.csv B -k KEY"),
+        "{stderr}"
+    );
+}
+
+/// `--fail-on-dups` names itself when it sets the exit code.
+#[test]
+fn exit_3_says_it_came_from_fail_on_dups() {
+    let f = Fixture::new(10);
+    let one = f.path("one.csv");
+    std::fs::write(&one, "id,name\n1,x\n").unwrap();
+    let dups = f.path("dups.csv");
+    std::fs::write(&dups, "id,name\n1,x\n1,y\n").unwrap();
+    let out = Command::new(BIN)
+        .args([
+            "compare",
+            one.to_str().unwrap(),
+            dups.to_str().unwrap(),
+            "-k",
+            "id",
+            "--fail-on-dups",
+        ])
+        .output()
+        .expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(
+        stderr.contains("exit 3 (--fail-on-dups): duplicate keys, A 0, B 1"),
+        "{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("duplicate keys A 0, B 1"), "{stdout}");
+}
+
 /// An empty file and a binary one are said as what they are, by every
 /// command and engine. A binary file used to be read as a CSV with one
 /// strange column, and the error blamed the key.

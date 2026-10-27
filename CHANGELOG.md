@@ -31,6 +31,26 @@ All notable changes to this project are documented here. The format follows
   small one. The reserve kept for the refusal now covers that too (on ARM,
   6 aborts in 4,800 runs at 4 MB before, none after).
 
+### Changed
+
+- Messages say what happened in plain words:
+  - an option compara doesn't have is named as unknown (`--bogus` used to be
+    reported as needing a value), and an unknown command names the
+    commands there are in one line instead of printing the whole usage;
+  - an empty file, a UTF-16 file and a binary file are each said as what
+    they are, by every command and engine, instead of a strange column name
+    and a missing key;
+  - a cloud read with no credentials starts with what to set, and the
+    store's retry log is left out; a URL that can't be reached says why (the
+    host name does not resolve, nothing answers on that port, no answer
+    within 30 s) and that a proxy is set when one is;
+  - exit 3 says it came from `--fail-on-dups`.
+- The counts line labels what it shows: `duplicate keys A 0, B 1 | engine
+  turbo, 0.4s`, and `1 row` is singular. The HTML report says
+  `engine turbo` and `1 row` too, and its tab title and heading agree.
+- `--help` fits 80 columns, describes every option, and says what the three
+  engines are for.
+
 ### Security
 
 - A Parquet page that claims more values, or more uncompressed bytes, than

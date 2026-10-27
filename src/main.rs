@@ -24,13 +24,13 @@ const USAGE: &str = "\
 usage: compara <command> [options]
 
 commands:
-  compare A B     Compare two tables on a composite key: print the counts, and with -o
-                  write an HTML report
+  compare A B     Compare two tables on a composite key and print the counts;
+                  with -o, also write an HTML report
   columns FILE    Print one file's column names, one per line
   head FILE       Print the first rows of one file (default 10)
   version         Print the version (also --version)
-  env             Print what this process sees: CPUs, memory and its limits, the
-                  temporary directory, and whether URLs can be read
+  env             Print what this process sees: CPUs, memory and its limits,
+                  the temporary directory, and whether URLs can be read
 
 A, B and FILE are paths, `-` for standard input, or with cloud support s3://,
 gs://, az:// and https:// URLs. Gzip and zstd files are read as what they hold.
@@ -50,39 +50,51 @@ head options:
 
 compare options:
   -k, --key COLS          Comma-separated key column(s) (or from --profile)
-  -c, --compare COLS      Columns to compare (default: all common non-key columns)
+  -c, --compare COLS      Columns to compare (default: every common non-key
+                          column)
   -i, --ignore COLS       Columns to skip
   -p, --profile NAME      Profile name from compara.toml
       --config PATH       Path to compara.toml
       --trim              Strip whitespace before comparing
-      --ignore-case
-      --empty-is-null     Treat empty string and null as equal
+      --ignore-case       Compare text without regard to case
+      --empty-is-null     Treat an empty string and null as equal
       --tolerance N       Absolute numeric tolerance
-      --max-rows N        Rows embedded per section (default 50000)
-      --delimiter D       Force delimiter (default: auto)
-      --encoding ENC      utf-8 is read as text; Latin-1 or a Windows code page compares
-                          as bytes (right counts); UTF-16 is refused
-      --engine E          auto | turbo | sortmerge | native
-      --threads N
-      --memory SIZE       Memory to plan for, e.g. 8G (default: what the machine or
-                          container has free); decides when large text files are
-                          joined in one pass instead of two, and how many columns of
-                          two Parquet files are read at once; Parquet that needs
-                          more than SIZE one column at a time is refused
-      --export-dir DIR    Write full changed/added/removed CSVs here (a directory, or a
-                          URL prefix such as s3://bucket/run-42/)
-  -o, --out PATH          Write the HTML report here, a path or a URL (no report without it)
-      --json PATH         Write a JSON summary (counts + column stats) here, a path or a
-                          URL; `-` prints it, and the counts line goes to stderr
-      --no-compress       Report: embed plain JSON instead of gzip (older browsers)
-      --summary           Print the counts and write nothing, and refuse any flag that would
-                          (the default without -o, --json or --export-dir)
+      --max-rows N        Rows embedded per report section (default 50000)
+      --delimiter D       Force the delimiter (default: detected)
+      --encoding ENC      UTF-8 (the default) is read as text; Latin-1 or a
+                          Windows code page compares as bytes (right counts);
+                          UTF-16 is refused
+      --engine E          auto (default) picks one: turbo, in memory and the
+                          fastest; sortmerge, which sorts on disk for files
+                          larger than memory; native, the simple baseline.
+                          sortmerge and native read CSV only
+      --threads N         Threads to use (default: every core, or the
+                          container's CPU quota)
+      --memory SIZE       Memory to plan for, e.g. 8G (default: what the
+                          machine or container has free); decides when large
+                          text files are joined in one pass instead of two,
+                          and how many columns of two Parquet files are read
+                          at once; Parquet that needs more than SIZE one
+                          column at a time is refused
+      --export-dir DIR    Write full changed, added and removed CSVs here (a
+                          directory, or a URL prefix such as s3://bucket/run/)
+  -o, --out PATH          Write the HTML report here, a path or a URL (no
+                          report without it)
+      --json PATH         Write a JSON summary (counts and column statistics)
+                          here, a path or a URL; `-` prints it, and the counts
+                          line goes to stderr
+      --no-compress       Report: embed plain JSON instead of gzip (for older
+                          browsers)
+      --summary           Print the counts, write nothing, and refuse any flag
+                          that would (the default without -o, --json or
+                          --export-dir)
       --fail-on-dups      Exit 3 when either file has duplicate keys
-      --exit-zero         Exit 0 when the tables differ: for a scheduled job whose
-                          output is the report, where a difference is not a failure
-                          (a Kubernetes Job, an Airflow task)
+      --exit-zero         Exit 0 when the tables differ: for a scheduled job
+                          whose output is the report, where a difference is
+                          not a failure (a Kubernetes Job, an Airflow task)
 
-Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (with --fail-on-dups).
+Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (with
+--fail-on-dups).
 ";
 
 /// Replaces the panic hook with one that cannot hang.
@@ -210,7 +222,17 @@ fn run(args: &[String]) -> u8 {
             }
         },
         other => {
-            eprint!("error: unknown command: {other}\n\n{USAGE}");
+            // The one line that matters, not 60 lines of usage it scrolls
+            // away under.
+            let hint = if std::path::Path::new(other).exists() || other.contains('.') {
+                format!(" (to compare files: compara compare {other} B -k KEY)")
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "error: unknown command {other:?}{hint}; the commands are compare, columns, \
+                 head, env and version (compara --help)"
+            );
             2
         }
     }
@@ -513,10 +535,10 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
 
     let c = &result.counts;
     let line = format!(
-        "A {} rows | B {} rows | matched {} (changed {}) | added {} | removed {} | \
-         dup keys A {} B {} | {} {}s",
-        comma(c.a_rows),
-        comma(c.b_rows),
+        "A {} | B {} | matched {} (changed {}) | added {} | removed {} | \
+         duplicate keys A {}, B {} | engine {}, {}s",
+        rows(c.a_rows),
+        rows(c.b_rows),
         comma(c.matched),
         comma(c.changed),
         comma(c.added),
@@ -538,6 +560,12 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     }
 
     if args.flag("fail-on-dups") && (c.a_dup_keys > 0 || c.b_dup_keys > 0) {
+        // Exit 3 says nothing on its own: name the option that chose it.
+        eprintln!(
+            "exit 3 (--fail-on-dups): duplicate keys, A {}, B {}",
+            comma(c.a_dup_keys),
+            comma(c.b_dup_keys)
+        );
         return Ok(3);
     }
     let code = if result.identical() || args.flag("exit-zero") {
@@ -625,6 +653,11 @@ fn print_env() {
 }
 
 /// Groups a count with thousands separators, matching the other implementations.
+/// `n rows`, or `1 row`.
+fn rows(n: i64) -> String {
+    format!("{} {}", comma(n), if n == 1 { "row" } else { "rows" })
+}
+
 fn comma(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);

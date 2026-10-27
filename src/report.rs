@@ -96,7 +96,7 @@ pub fn render(result: &CompareResult, compress: bool) -> Result<String> {
     };
     drop(raw);
 
-    let title = format!("{} vs {}", result.meta.a.name, result.meta.b.name);
+    let title = format!("{} → {}", result.meta.a.name, result.meta.b.name);
     let shell = TEMPLATE
         .replace("__TITLE__", &escape_html(&title))
         .replace("__MODE__", mode);
