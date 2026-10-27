@@ -42,7 +42,7 @@ at its latest version, or at TABLE@vN (s3://lake/orders@v41).
 
 columns and head read CSV, newline-delimited JSON and Parquet, and neither reads
 more of the file than it has to: `columns` on Parquet reads the footer, and
-`head` stops at the first page. Both take --delimiter and --encoding.
+`head` stops at the first page. Both take --delimiter.
 
 head options:
   -n, --rows N            Rows to show (default 10)
@@ -60,7 +60,7 @@ compare options:
       --tolerance N       Absolute numeric tolerance
       --max-rows N        Rows embedded per section (default 50000)
       --delimiter D       Force delimiter (default: auto)
-      --encoding ENC
+      --encoding ENC      utf-8 (the only one read; another encoding compares as bytes)
       --engine E          auto | turbo | sortmerge | native
       --threads N
       --memory SIZE       Memory to plan for, e.g. 8G (default: what the machine or

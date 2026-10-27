@@ -285,8 +285,7 @@ fn partition_directories_are_columns() {
     for side in ["a", "b"] {
         for fmt in ["csv", "parquet", "ndjson"] {
             for (date, p) in [("2026-10-01", "p"), ("2026-10-02", "q")] {
-                let dir =
-                    d.0.join(format!("{fmt}-{side}/date={date}/region=eu%2Fwest"));
+                let dir = d.0.join(format!("{fmt}-{side}/date={date}/zone=eu%2Fwest"));
                 std::fs::create_dir_all(&dir).unwrap();
                 std::fs::copy(
                     gen_dir.join(format!("{p}_{side}.{fmt}")),
@@ -295,14 +294,14 @@ fn partition_directories_are_columns() {
                 .unwrap();
             }
         }
-        // The flat equivalent: every row with its date and region.
+        // The flat equivalent: every row with its date and zone.
         let mut flat = String::new();
         for (date, p) in [("2026-10-01", "p"), ("2026-10-02", "q")] {
             let text = std::fs::read_to_string(gen_dir.join(format!("{p}_{side}.csv"))).unwrap();
             let mut lines = text.lines();
             let header = lines.next().unwrap();
             if flat.is_empty() {
-                flat.push_str(&format!("{header},date,region\n"));
+                flat.push_str(&format!("{header},date,zone\n"));
             }
             for l in lines {
                 flat.push_str(&format!("{l},{date},eu/west\n"));
@@ -311,7 +310,7 @@ fn partition_directories_are_columns() {
         std::fs::write(d.0.join(format!("flat_{side}.csv")), flat).unwrap();
     }
     let path = |s: &str| d.0.join(s).to_string_lossy().into_owned();
-    let key = ["-k", "date,region,account_id,txn_id", "-i", "updated_at"];
+    let key = ["-k", "date,zone,account_id,txn_id", "-i", "updated_at"];
     let want = compare(&path("flat_a.csv"), &path("flat_b.csv"), &key);
     assert_eq!(want.0, 1, "{}", want.1);
     assert!(want.2.contains("\"a_dup_keys\":"), "{}", want.2);
@@ -332,7 +331,7 @@ fn partition_directories_are_columns() {
             got.1
         );
         assert!(
-            got.1.contains("partitioned by date, region"),
+            got.1.contains("partitioned by date, zone"),
             "{a}: {}",
             got.1
         );

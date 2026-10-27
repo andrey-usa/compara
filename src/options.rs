@@ -201,6 +201,20 @@ impl Options {
         if self.encoding.is_empty() {
             self.encoding = "utf-8".to_string();
         }
+        // Cells are compared as their bytes and shown as UTF-8; no reader
+        // decodes another encoding, so a name it can't honour is refused
+        // rather than quietly ignored.
+        if !matches!(
+            self.encoding.to_ascii_lowercase().as_str(),
+            "utf-8" | "utf8" | "ascii" | "us-ascii"
+        ) {
+            return Err(Error::input(format!(
+                "--encoding {:?}: compara reads UTF-8 only. Files in another encoding still compare \
+                 correctly, cell by cell as bytes; convert them (iconv -f <enc> -t utf-8) for a \
+                 readable report",
+                self.encoding
+            )));
+        }
         if self.engine.is_empty() {
             self.engine = Engine::Auto.label().to_string();
         }

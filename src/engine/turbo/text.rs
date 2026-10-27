@@ -146,10 +146,12 @@ pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
         if close <= from {
             break;
         }
-        names.push(text_of(
-            slab,
-            pack(from as u64, (close - 1 - from) as u64, escaped),
-        ));
+        // A name repeated in the object is one column (its last value wins),
+        // not two.
+        let name = text_of(slab, pack(from as u64, (close - 1 - from) as u64, escaped));
+        if !names.contains(&name) {
+            names.push(name);
+        }
         pos = close;
         while pos < end && json_space(data[pos]) {
             pos += 1;

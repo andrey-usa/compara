@@ -33,17 +33,46 @@ impl Resolved {
 
 /// Works out the compared columns from the two headers.
 pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Resolved> {
-    let missing: Vec<&String> = opt
-        .key
-        .iter()
-        .filter(|k| !a_cols.contains(k) || !b_cols.contains(k))
-        .collect();
-    if !missing.is_empty() {
-        let names: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
-        return Err(Error::new(format!(
-            "key column(s) missing from one of the files: {}",
-            names.join(", ")
-        )));
+    // Columns are matched by name: two of one name in a file would leave one
+    // of them out of the comparison without a word.
+    for (side, cols) in [("A", a_cols), ("B", b_cols)] {
+        let mut seen = std::collections::HashSet::new();
+        if let Some(twice) = cols.iter().find(|c| !seen.insert(c.as_str())) {
+            return Err(Error::input(format!(
+                "{side} has two columns named {twice:?}; compara matches columns by name, so rename one"
+            )));
+        }
+    }
+    let shown = |cols: &[String]| {
+        let mut list = cols
+            .iter()
+            .take(12)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if cols.len() > 12 {
+            list.push_str(&format!(", … ({} in all)", cols.len()));
+        }
+        list
+    };
+    for (side, cols) in [("A", a_cols), ("B", b_cols)] {
+        let missing: Vec<&str> = opt
+            .key
+            .iter()
+            .filter(|k| !cols.contains(k))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::input(format!(
+                "key column {} not in {side} (its columns: {})",
+                missing
+                    .iter()
+                    .map(|k| format!("{k:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                shown(cols)
+            )));
+        }
     }
 
     // A name that is in neither file is a typo, and a typo here is the one that
@@ -63,7 +92,7 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
         .map(String::as_str)
         .collect();
     if !unknown.is_empty() {
-        return Err(Error::new(format!(
+        return Err(Error::input(format!(
             "ignore column(s) present in neither file: {}",
             unknown.join(", ")
         )));
@@ -84,7 +113,7 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
                 .map(String::as_str)
                 .collect();
             if !bad.is_empty() {
-                return Err(Error::new(format!(
+                return Err(Error::input(format!(
                     "compare column(s) not present in both files: {}",
                     bad.join(", ")
                 )));
@@ -406,6 +435,55 @@ mod tests {
             ignore: names(ignore),
             ..Options::default()
         }
+    }
+
+    /// Columns are matched by name: a second column of one name was left out
+    /// of the comparison, which then reported everything matched.
+    #[test]
+    fn two_columns_of_one_name_are_refused() {
+        let err = resolve(
+            &names(&["id", "id", "x"]),
+            &names(&["id", "x"]),
+            &opt(&["id"], &[]),
+        )
+        .unwrap_err();
+        assert!(err.is_input());
+        assert_eq!(
+            err.to_string(),
+            "A has two columns named \"id\"; compara matches columns by name, so rename one"
+        );
+        let err = resolve(
+            &names(&["id", "x"]),
+            &names(&["id", "x", "x"]),
+            &opt(&["id"], &[]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().starts_with("B has two columns named \"x\""),
+            "{err}"
+        );
+    }
+
+    /// A missing key says which side lacks it and what that side has, as a
+    /// mistake in the input, not an engine failing.
+    #[test]
+    fn a_missing_key_names_the_side_and_its_columns() {
+        let err = resolve(
+            &names(&["id", "x"]),
+            &names(&["x", "y"]),
+            &opt(&["id"], &[]),
+        )
+        .unwrap_err();
+        assert!(err.is_input());
+        assert_eq!(
+            err.to_string(),
+            "key column \"id\" not in B (its columns: x, y)"
+        );
+        let many: Vec<String> = (0..20).map(|i| format!("c{i}")).collect();
+        let err = resolve(&many, &many, &opt(&["id"], &[])).unwrap_err();
+        assert!(err.to_string().ends_with(", … (20 in all))"), "{err}");
+        let err = err.context_unless_input("the turbo engine failed: ");
+        assert!(!err.to_string().contains("engine failed"), "{err}");
     }
 
     /// The fault this check exists for. `--key` makes the answer impossible and

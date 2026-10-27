@@ -69,7 +69,7 @@ compara compare examples/orders_2026-08.csv examples/orders_2026-09.csv -k order
 | `-i`, `--ignore` | columns to skip (timestamps, run ids) |
 | `--trim`, `--ignore-case`, `--empty-is-null` | normalisation before comparing (applies to key and values) |
 | `--tolerance` | absolute numeric tolerance where both sides parse as numbers |
-| `--delimiter`, `--encoding` | override auto-detection (CSV only) |
+| `--delimiter` | override delimiter detection (CSV only); text is read as UTF-8, and a file in another encoding compares as bytes |
 | `--threads` | how wide the engines run; the default is every core |
 | `--memory` | memory to plan for (e.g. `8G`); decides when large text files are joined in one pass instead of two, and how many columns of two Parquet files are read at once (a Parquet pair that needs more than a stated budget is refused) |
 | `--max-rows` | rows embedded per report section (default 50 000) |

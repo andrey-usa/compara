@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A file with two columns of the same name was compared with one of them
+  left out and no word about it; it is refused now, naming the side and the
+  column (`A has two columns named "id"`). A name repeated inside one JSON
+  object is still one column, its last value.
+- `--encoding` was accepted and ignored. compara reads UTF-8; any other name
+  is refused with how to convert (a file in another encoding still compares
+  correctly as bytes).
+- A key that isn't in a file says which side lacks it and what columns that
+  side has, without "the turbo engine failed" before it: nothing failed.
+
 - Delta-encoded Parquet integers whose deltas need more than 32 bits (an
   INT64 column with large jumps between rows) lost their high bits and were
   read as wrong values; they are read whole now.
