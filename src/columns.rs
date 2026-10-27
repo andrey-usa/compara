@@ -34,10 +34,15 @@ impl Resolved {
 /// Works out the compared columns from the two headers.
 pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Resolved> {
     // Columns are matched by name: two of one name in a file would leave one
-    // of them out of the comparison without a word.
+    // of them out of the comparison without a word. Unnamed ones (a header
+    // ending in commas, as spreadsheets write it) have no name to match by.
     for (side, cols) in [("A", a_cols), ("B", b_cols)] {
         let mut seen = std::collections::HashSet::new();
-        if let Some(twice) = cols.iter().find(|c| !seen.insert(c.as_str())) {
+        if let Some(twice) = cols
+            .iter()
+            .filter(|c| !c.trim().is_empty())
+            .find(|c| !seen.insert(c.as_str()))
+        {
             return Err(Error::input(format!(
                 "{side} has two columns named {twice:?}; compara matches columns by name, so rename one"
             )));
@@ -462,6 +467,9 @@ mod tests {
             err.to_string().starts_with("B has two columns named \"x\""),
             "{err}"
         );
+        // A header ending in commas names no column twice.
+        let blank = names(&["id", "x", "", ""]);
+        assert!(resolve(&blank, &blank, &opt(&["id"], &[])).is_ok());
     }
 
     /// A missing key says which side lacks it and what that side has, as a
