@@ -25,7 +25,7 @@
 
 use std::cmp::Ordering;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -201,6 +201,11 @@ fn reader(path: &Path, opt: &Options) -> Result<csv::Reader<File>> {
 }
 
 fn read_header(path: &Path, opt: &Options) -> Result<Vec<String>> {
+    let mut head = Vec::with_capacity(1024);
+    File::open(path)
+        .and_then(|f| f.take(1024).read_to_end(&mut head))
+        .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
+    crate::engine::turbo::refuse_non_text(&head, path)?;
     let mut rdr = reader(path, opt)?;
     let headers = rdr
         .headers()

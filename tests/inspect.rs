@@ -210,6 +210,47 @@ fn an_option_compara_does_not_have_is_named() {
     assert_eq!(code, 0, "{stderr}");
 }
 
+/// An empty file and a binary one are said as what they are, by every
+/// command and engine. A binary file used to be read as a CSV with one
+/// strange column, and the error blamed the key.
+#[test]
+fn an_empty_or_binary_file_is_named_as_such() {
+    let f = Fixture::new(10);
+    let empty = f.path("empty.csv");
+    std::fs::write(&empty, b"").unwrap();
+    let binary = f.path("bad.bin");
+    // Bytes like a compressed or executable file's: control bytes throughout.
+    let bytes: Vec<u8> = (0..4000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    std::fs::write(&binary, bytes).unwrap();
+    let a = f.path("a.csv");
+    for (file, said) in [(&empty, "is empty"), (&binary, "binary data")] {
+        for engine in ["turbo", "native", "sortmerge"] {
+            let (code, _, stderr) = run(
+                &[
+                    "compare",
+                    a.to_str().unwrap(),
+                    "-k",
+                    "id",
+                    "--engine",
+                    engine,
+                ],
+                file,
+            );
+            assert_eq!(code, 2, "{engine}: {stderr}");
+            assert!(stderr.contains(said), "{engine}: {stderr}");
+            assert!(!stderr.contains("key column"), "{engine}: {stderr}");
+        }
+        for cmd in ["columns", "head"] {
+            let (code, stdout, stderr) = run(&[cmd], file);
+            assert_eq!(code, 2, "{cmd}: {stderr}");
+            assert!(stderr.contains(said), "{cmd}: {stderr}");
+            assert!(stdout.is_empty(), "{cmd} printed {stdout:?}");
+        }
+    }
+}
+
 #[test]
 fn both_commands_need_a_file() {
     let out = Command::new(BIN).arg("columns").output().expect("runs");

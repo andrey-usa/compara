@@ -67,31 +67,51 @@ pub(super) fn detect_delimiter(header: &[u8]) -> u8 {
     best
 }
 
-/// The CSV header row's names, and where the first data row starts.
-pub(super) fn csv_header(slab: &Slab, delimiter: u8, path: &Path) -> Result<(Vec<String>, usize)> {
-    let data = slab.data();
-    let end = data.len();
-    if end == 0 {
-        return Err(Error::new(format!(
-            "file has no header row: {}",
-            path.display()
+/// A file that can't be delimited text, said as what it is: empty, UTF-16
+/// or binary data. Read as CSV, its first bytes
+/// would become one strange column name and the error would blame the key.
+/// `head` is the file's first bytes (up to 1 KiB).
+pub(crate) fn refuse_non_text(head: &[u8], path: &Path) -> Result<()> {
+    let path = path.display();
+    if head.is_empty() {
+        return Err(Error::input(format!(
+            "{path} is empty: no header row and no data"
         )));
     }
     // A UTF-16 file's commas are two bytes each: read as UTF-8 its header is
     // noise. Its byte-order mark says what it is.
     // Without the mark, its ASCII header is every other byte zero.
-    let head = &data[..end.min(64)];
-    let zeros = head.iter().filter(|&&b| b == 0).count();
-    if data.starts_with(&[0xFF, 0xFE])
-        || data.starts_with(&[0xFE, 0xFF])
-        || (zeros >= 4 && zeros * 3 >= head.len())
+    let first = &head[..head.len().min(64)];
+    let zeros = first.iter().filter(|&&b| b == 0).count();
+    if head.starts_with(&[0xFF, 0xFE])
+        || head.starts_with(&[0xFE, 0xFF])
+        || (zeros >= 4 && zeros * 3 >= first.len())
     {
         return Err(Error::input(format!(
-            "{} is UTF-16 (a UTF-16 byte-order mark, or every other byte of its header zero); \
-             compara reads UTF-8: convert it (iconv -f utf-16 -t utf-8)",
-            path.display()
+            "{path} is UTF-16 (a UTF-16 byte-order mark, or every other byte of its header zero); \
+             compara reads UTF-8: convert it (iconv -f utf-16 -t utf-8)"
         )));
     }
+    // Text has tabs, line ends and the odd form feed; binary data has
+    // control bytes all through it (about one in nine of random bytes).
+    let control = head
+        .iter()
+        .filter(|&&b| (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x0c)) || b == 0x7f)
+        .count();
+    if control > (head.len() / 16).max(1) {
+        return Err(Error::input(format!(
+            "{path} does not look like CSV or JSON lines: its first bytes are binary data \
+             (compara reads CSV, JSON lines and Parquet)"
+        )));
+    }
+    Ok(())
+}
+
+/// The CSV header row's names, and where the first data row starts.
+pub(super) fn csv_header(slab: &Slab, delimiter: u8, path: &Path) -> Result<(Vec<String>, usize)> {
+    let data = slab.data();
+    let end = data.len();
+    refuse_non_text(&data[..end.min(1024)], path)?;
     let mut names = Vec::new();
     let mut pos = 0usize;
     loop {
