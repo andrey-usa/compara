@@ -44,6 +44,8 @@ All notable changes to this project are documented here. The format follows
     host name does not resolve, nothing answers on that port, no answer
     within 30 s) and that a proxy is set when one is;
   - exit 3 says it came from `--fail-on-dups`;
+  - a Parquet file that can't be read says so (`reading the Parquet files:
+    …`) instead of "the turbo engine failed";
   - standard input and a decompressed file are named as given (`standard
     input is empty`, `e0.gz is empty`), not as the temporary copy read;
   - a pipe or process substitution given as a file (`<(…)`) says to pipe
