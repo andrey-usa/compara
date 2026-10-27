@@ -241,6 +241,34 @@ const FLAGS: [&str; 10] = [
     "h",
 ];
 
+/// The options that take a value, long and short. A name in neither list is
+/// a typo or an option compara doesn't have, and is refused by name rather
+/// than taking the token after it as its value.
+const VALUED: [&str; 22] = [
+    "key",
+    "k",
+    "compare",
+    "c",
+    "ignore",
+    "i",
+    "profile",
+    "p",
+    "config",
+    "tolerance",
+    "max-rows",
+    "threads",
+    "memory",
+    "delimiter",
+    "encoding",
+    "engine",
+    "export-dir",
+    "out",
+    "o",
+    "json",
+    "rows",
+    "n",
+];
+
 impl Args {
     fn parse(argv: &[String]) -> Result<Self> {
         let mut values = Vec::new();
@@ -257,6 +285,13 @@ impl Args {
                 positional.push(token.clone());
                 i += 1;
                 continue;
+            }
+            let name = rest.split_once('=').map_or(rest, |(n, _)| n);
+            if !FLAGS.contains(&name) && !VALUED.contains(&name) {
+                return Err(Error::new(format!(
+                    "unknown option: {}{name} (compara --help lists them)",
+                    if token.starts_with("--") { "--" } else { "-" }
+                )));
             }
             match rest.split_once('=') {
                 Some((name, value)) => values.push((name.to_string(), Some(value.to_string()))),

@@ -188,6 +188,28 @@ fn a_bad_row_count_is_an_error() {
     assert!(stderr.contains("--rows must be a whole number"), "{stderr}");
 }
 
+/// A typo in an option used to take the file after it as its value and fail
+/// with "needs a value", or quietly do nothing.
+#[test]
+fn an_option_compara_does_not_have_is_named() {
+    let f = Fixture::new(10);
+    for (args, said) in [
+        (vec!["head", "--bogus"], "unknown option: --bogus"),
+        (
+            vec!["columns", "--delimeter", ";"],
+            "unknown option: --delimeter",
+        ),
+        (vec!["compare", "-x"], "unknown option: -x"),
+        (vec!["head", "--rows-max=3"], "unknown option: --rows-max"),
+    ] {
+        let (code, _, stderr) = run(&args, &f.path("a.csv"));
+        assert_eq!(code, 2, "{args:?}: {stderr}");
+        assert!(stderr.contains(said), "{args:?}: {stderr}");
+    }
+    let (code, _, stderr) = run(&["head", "-n", "3", "--delimiter=,"], &f.path("a.csv"));
+    assert_eq!(code, 0, "{stderr}");
+}
+
 #[test]
 fn both_commands_need_a_file() {
     let out = Command::new(BIN).arg("columns").output().expect("runs");
