@@ -21,7 +21,6 @@ All notable changes to this project are documented here. The format follows
   instead of failing on a header of noise.
 - A key that isn't in a file says which side lacks it and what columns that
   side has, without "the turbo engine failed" before it: nothing failed.
-
 - Delta-encoded Parquet integers whose deltas need more than 32 bits (an
   INT64 column with large jumps between rows) lost their high bits and were
   read as wrong values; they are read whole now.
@@ -44,7 +43,7 @@ All notable changes to this project are documented here. The format follows
     store's retry log is left out; a URL that can't be reached says why (the
     host name does not resolve, nothing answers on that port, no answer
     within 30 s) and that a proxy is set when one is;
-  - exit 3 says it came from `--fail-on-dups`.
+  - exit 3 says it came from `--fail-on-dups`;
   - standard input and a decompressed file are named as given (`standard
     input is empty`, `e0.gz is empty`), not as the temporary copy read;
   - a pipe or process substitution given as a file (`<(…)`) says to pipe
@@ -64,7 +63,6 @@ All notable changes to this project are documented here. The format follows
   than 1000 times) is refused before anything is sized from it
   (`COMPARA_MAX_EXPANSION`). Found by fuzzing: a 9.7 KB file had 2.8 GB
   reserved for a page that claimed 1.47 billion values.
-
 - A Parquet page that claims a bit width wider than its values (found by
   fuzzing) is refused with a message; a debug build panicked on it and a
   release one read garbage.
