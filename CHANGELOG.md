@@ -19,6 +19,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Through a proxy (`HTTPS_PROXY`), a table at a name that leads to a cloud
+  metadata address (a hosts entry or DNS name for 169.254.169.254), or at
+  a metadata service's own name (`metadata.google.internal`), was read: the
+  proxy looked the name up, past compara's check. The name is looked up
+  before the request goes to the proxy, and refused like the address
+  (`COMPARA_ALLOW_LINK_LOCAL=1` allows it); so is a redirect to one. A name
+  only the proxy can look up still goes to it. Found by red-teaming the
+  0.6 check.
+
 - A Parquet page that claims more values, or more uncompressed bytes, than
   its stored bytes can hold by the decompression-bomb rule (past 1 GB, more
   than 1000 times) is refused before anything is sized from it

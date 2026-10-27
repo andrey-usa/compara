@@ -1197,17 +1197,42 @@ fn link_local_allowed() -> bool {
 
 /// The refusal for a URL whose host is a metadata address, if it is one.
 fn metadata_url(url: &url::Url) -> Option<String> {
-    let ip = match url.host()? {
-        url::Host::Ipv4(v4) => std::net::IpAddr::V4(v4),
-        url::Host::Ipv6(v6) => std::net::IpAddr::V6(v6),
-        url::Host::Domain(_) => return None,
-    };
-    metadata_address(ip).then(|| {
+    metadata_url_via(url, proxy_from_env().is_some())
+}
+
+/// [`metadata_url`], `proxied` or not. Through a proxy the proxy looks the
+/// name up, past [`NoMetadata`], so the name is looked up here too: one that
+/// leads to a metadata address, or a metadata service's own name, is refused
+/// before anything is sent. A name only the proxy can look up passes.
+fn metadata_url_via(url: &url::Url, proxied: bool) -> Option<String> {
+    let refused = || {
         format!(
             "{url}: a link-local address (a cloud metadata service) is not read; \
              COMPARA_ALLOW_LINK_LOCAL=1 allows it"
         )
-    })
+    };
+    let ip = match url.host()? {
+        url::Host::Ipv4(v4) => std::net::IpAddr::V4(v4),
+        url::Host::Ipv6(v6) => std::net::IpAddr::V6(v6),
+        url::Host::Domain(name) if proxied => {
+            use std::net::ToSocketAddrs;
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            let known = matches!(
+                name.as_str(),
+                "metadata.google.internal"
+                    | "metadata.goog"
+                    | "instance-data"
+                    | "instance-data.ec2.internal"
+            );
+            let port = url.port_or_known_default().unwrap_or(80);
+            let leads = (name.as_str(), port)
+                .to_socket_addrs()
+                .is_ok_and(|mut found| found.any(|a| metadata_address(a.ip())));
+            return (known || leads).then(refused);
+        }
+        url::Host::Domain(_) => return None,
+    };
+    metadata_address(ip).then(refused)
 }
 
 /// Name resolution that leaves out metadata addresses (see [`metadata_address`]).
@@ -1720,6 +1745,13 @@ mod tests {
         assert!(metadata_url(&url("http://[fd00:ec2::254]/")).is_some());
         assert!(metadata_url(&url("https://example.com/a.csv")).is_none());
         assert!(metadata_url(&url("http://127.0.0.1:8080/a.csv")).is_none());
+        // Through a proxy, names too: a metadata service's own, or one that
+        // leads to a metadata address here.
+        assert!(metadata_url_via(&url("http://metadata.google.internal/x.csv"), true).is_some());
+        assert!(metadata_url_via(&url("http://Metadata.Google.Internal./x.csv"), true).is_some());
+        assert!(metadata_url_via(&url("http://metadata.google.internal/x.csv"), false).is_none());
+        assert!(metadata_url_via(&url("http://localhost:8080/a.csv"), true).is_none());
+        assert!(metadata_url_via(&url("http://169.254.169.254.nip.invalid/a.csv"), true).is_none());
     }
 
     #[test]

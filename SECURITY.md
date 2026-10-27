@@ -21,7 +21,8 @@ or report a wrong count is a bug we want to hear about.
   size is refused (`COMPARA_MAX_EXPANSION`), and so is a Parquet page that
   claims that many values or bytes from what it stores; an `http(s)://` input or
   redirect that leads to a link-local address (a cloud metadata service) is
-  refused (`COMPARA_ALLOW_LINK_LOCAL=1`). Other private and loopback hosts
+  refused (`COMPARA_ALLOW_LINK_LOCAL=1`), through a proxy too: the name is
+  looked up before the request goes to the proxy. Other private and loopback hosts
   stay readable: they are where many tables live.
 - The HTML report shows cell values as text. It loads nothing from the
   network and runs no code from the data.
