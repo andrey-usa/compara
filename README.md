@@ -69,7 +69,8 @@ compara compare examples/orders_2026-08.csv examples/orders_2026-09.csv -k order
 | `-i`, `--ignore` | columns to skip (timestamps, run ids) |
 | `--trim`, `--ignore-case`, `--empty-is-null` | normalisation before comparing (applies to key and values) |
 | `--tolerance` | absolute numeric tolerance where both sides parse as numbers |
-| `--delimiter` | override delimiter detection (CSV only); text is read as UTF-8, and a file in another encoding compares as bytes |
+| `--delimiter` | override delimiter detection (CSV only); one that isn't in a file's header is noted |
+| `--encoding` | UTF-8 (the default) is read as text; Latin-1 or a Windows code page compares as bytes, with the right counts; UTF-16 and UTF-32 are refused with how to convert |
 | `--threads` | how wide the engines run; the default is every core |
 | `--memory` | memory to plan for (e.g. `8G`); decides when large text files are joined in one pass instead of two, and how many columns of two Parquet files are read at once (a Parquet pair that needs more than a stated budget is refused) |
 | `--max-rows` | rows embedded per report section (default 50 000) |
@@ -80,6 +81,7 @@ compara compare examples/orders_2026-08.csv examples/orders_2026-09.csv -k order
 | `--engine` | `auto` (default), `turbo`, `sortmerge` or `native`; `sortmerge` and `native` read CSV only |
 | `--no-compress` | plain JSON payload in the report, for pre-2023 browsers (with `-o`) |
 | `--fail-on-dups` | exit 3 when either file has duplicate keys |
+| `--exit-zero` | exit 0 when the tables differ: for a scheduled job whose output is the report (a Kubernetes Job, an Airflow task) |
 
 Duplicate keys are counted and listed per file; the first occurrence of each
 key takes part in the join.
