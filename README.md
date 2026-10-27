@@ -4,7 +4,6 @@
 [![CI](https://github.com/andrey-usa/compara/actions/workflows/ci.yml/badge.svg)](https://github.com/andrey-usa/compara/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/compara.svg)](https://crates.io/crates/compara)
 [![PyPI](https://img.shields.io/pypi/v/compara.svg)](https://pypi.org/project/compara/)
-[![npm](https://img.shields.io/npm/v/compara.svg)](https://www.npmjs.com/package/compara)
 
 Extremely fast table comparison: two tables on a composite key, with counts,
 per-column statistics and a self-contained HTML report. Key columns, compared
@@ -33,10 +32,9 @@ Prebuilt binaries for Linux (x86_64, aarch64), macOS (arm64, x86_64) and
 Windows (x64) are on the [releases page](https://github.com/andrey-usa/compara/releases),
 and the same binaries through package managers:
 
-| | |
+| Channel | Install |
 |---|---|
 | Cargo | `cargo install --locked compara` |
-| npm | `npm install -g compara` (or `npx compara …`) |
 | pip / uv | `pip install compara` · `uv tool install compara` |
 | Homebrew | `brew install andrey-usa/tap/compara` |
 | Scoop | `scoop bucket add andrey-usa https://github.com/andrey-usa/scoop-bucket` then `scoop install compara` |
