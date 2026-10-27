@@ -79,10 +79,16 @@ pub(super) fn csv_header(slab: &Slab, delimiter: u8, path: &Path) -> Result<(Vec
     }
     // A UTF-16 file's commas are two bytes each: read as UTF-8 its header is
     // noise. Its byte-order mark says what it is.
-    if data.starts_with(&[0xFF, 0xFE]) || data.starts_with(&[0xFE, 0xFF]) {
+    // Without the mark, its ASCII header is every other byte zero.
+    let head = &data[..end.min(64)];
+    let zeros = head.iter().filter(|&&b| b == 0).count();
+    if data.starts_with(&[0xFF, 0xFE])
+        || data.starts_with(&[0xFE, 0xFF])
+        || (zeros >= 4 && zeros * 3 >= head.len())
+    {
         return Err(Error::input(format!(
-            "{} is UTF-16 (it starts with a UTF-16 byte-order mark); compara reads UTF-8: \
-             convert it (iconv -f utf-16 -t utf-8)",
+            "{} is UTF-16 (a UTF-16 byte-order mark, or every other byte of its header zero); \
+             compara reads UTF-8: convert it (iconv -f utf-16 -t utf-8)",
             path.display()
         )));
     }
