@@ -235,6 +235,47 @@ fn an_unknown_command_lists_the_commands() {
     );
 }
 
+/// Standard input and a compressed file are named as the user gave them,
+/// not as the temporary copy compara read; a forced delimiter that isn't in
+/// the header says so.
+#[test]
+fn inputs_are_named_as_given() {
+    use std::io::Write;
+    let f = Fixture::new(10);
+    let mut child = Command::new(BIN)
+        .args([
+            "compare",
+            "-",
+            f.path("a.csv").to_str().unwrap(),
+            "-k",
+            "id",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("runs");
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("standard input is empty"), "{stderr}");
+    assert!(!stderr.contains("compara-"), "a temporary path: {stderr}");
+
+    let gz = f.path("empty.csv.gz");
+    let mut enc = flate2::write::GzEncoder::new(
+        std::fs::File::create(&gz).unwrap(),
+        flate2::Compression::default(),
+    );
+    enc.write_all(b"").unwrap();
+    enc.finish().unwrap();
+    let (code, _, stderr) = run(&["columns"], &gz);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("empty.csv.gz is empty"), "{stderr}");
+
+    let (code, _, stderr) = run(&["head", "--delimiter", ";"], &f.path("a.csv"));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains("--delimiter ';' is not in"), "{stderr}");
+}
+
 /// `--fail-on-dups` names itself when it sets the exit code.
 #[test]
 fn exit_3_says_it_came_from_fail_on_dups() {

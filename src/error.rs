@@ -101,6 +101,19 @@ impl Error {
         }
     }
 
+    /// The same error with every `from` in its message read as `to`, and its
+    /// kind kept: an engine names the file it read, which for standard input
+    /// or a decompressed copy is a temporary file the user never saw.
+    pub fn renamed(self, from: &str, to: &str) -> Self {
+        if from.is_empty() || from == to {
+            return self;
+        }
+        Error {
+            message: self.message.replace(from, to),
+            ..self
+        }
+    }
+
     /// The same error with `suffix` after its message, and its kind kept.
     pub fn context_after(self, suffix: impl fmt::Display) -> Self {
         Error {

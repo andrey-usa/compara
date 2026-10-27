@@ -45,6 +45,12 @@ All notable changes to this project are documented here. The format follows
     host name does not resolve, nothing answers on that port, no answer
     within 30 s) and that a proxy is set when one is;
   - exit 3 says it came from `--fail-on-dups`.
+  - standard input and a decompressed file are named as given (`standard
+    input is empty`, `e0.gz is empty`), not as the temporary copy read;
+  - a pipe or process substitution given as a file (`<(…)`) says to pipe
+    into `-` instead;
+  - a `--delimiter` that isn't in a file's header says so, and what the
+    header has, instead of quietly reading every row as one column.
 - The counts line labels what it shows: `duplicate keys A 0, B 1 | engine
   turbo, 0.4s`, and `1 row` is singular. The HTML report says
   `engine turbo` and `1 row` too, and its tab title and heading agree.

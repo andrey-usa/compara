@@ -485,13 +485,16 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
         (a, b)
     });
     let (a, b) = (a?, b?);
+    for source in [&a, &b] {
+        delimiter_note(source, &opt);
+    }
     for (side, source) in [("A", &a), ("B", &b)] {
         for step in source.steps() {
             eprintln!("{side} {}: {step}", source.spec());
         }
     }
 
-    let mut result = compare(a.path(), b.path(), &mut opt)?;
+    let mut result = compare(a.path(), b.path(), &mut opt).map_err(|e| as_given(e, &[&a, &b]))?;
     for (meta, source) in [(&mut result.meta.a, &a), (&mut result.meta.b, &b)] {
         if source.path() != Path::new(source.spec()) {
             meta.name = source.name();
@@ -653,6 +656,23 @@ fn print_env() {
 }
 
 /// Groups a count with thousands separators, matching the other implementations.
+/// `e` with each input's temporary copy named as the user gave it:
+/// `standard input` for `-`, else the file or URL (`eg.gz`), so a message
+/// about an empty or binary input points at something they can find.
+fn as_given(e: Error, sources: &[&Source]) -> Error {
+    sources.iter().fold(e, |e, s| {
+        if s.path() == Path::new(s.spec()) {
+            return e;
+        }
+        let name = if s.spec() == "-" {
+            "standard input".to_string()
+        } else {
+            s.spec().to_string()
+        };
+        e.renamed(&s.path().display().to_string(), &name)
+    })
+}
+
 /// `n rows`, or `1 row`.
 fn rows(n: i64) -> String {
     format!("{} {}", comma(n), if n == 1 { "row" } else { "rows" })
@@ -715,7 +735,9 @@ fn cmd_columns(argv: &[String]) -> Result<u8> {
     apply_read_options(&args, &mut opt)?;
 
     let source = Source::open(first, &Want::footer_only())?;
-    let shape = compara::engine::turbo::shape(source.path(), &opt)?;
+    delimiter_note(&source, &opt);
+    let shape =
+        compara::engine::turbo::shape(source.path(), &opt).map_err(|e| as_given(e, &[&source]))?;
     for name in &shape.columns {
         println!("{name}");
     }
@@ -757,7 +779,9 @@ fn cmd_head(argv: &[String]) -> Result<u8> {
     apply_read_options(&args, &mut opt)?;
 
     let source = Source::open(first, &Want::all())?;
-    let (columns, rows) = compara::engine::turbo::head(source.path(), want, &opt)?;
+    delimiter_note(&source, &opt);
+    let (columns, rows) = compara::engine::turbo::head(source.path(), want, &opt)
+        .map_err(|e| as_given(e, &[&source]))?;
     if args.flag("csv") {
         println!("{}", csv_line(&columns));
         for row in &rows {
@@ -782,6 +806,47 @@ fn apply_read_options(args: &Args, opt: &mut Options) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A note when `--delimiter` isn't in a text file's header: every row then
+/// reads as one column, and nothing else would say why.
+fn delimiter_note(source: &Source, opt: &Options) {
+    use std::io::Read;
+    let Some(d) = opt.delimiter else { return };
+    let mut head = Vec::with_capacity(4096);
+    let Ok(file) = fs::File::open(source.path()) else {
+        return;
+    };
+    if file.take(64 * 1024).read_to_end(&mut head).is_err() {
+        return;
+    }
+    let line = head.split(|&b| b == b'\n').next().unwrap_or_default();
+    let text = String::from_utf8_lossy(line);
+    let lead = text.trim_start_matches('\u{feff}').trim_start();
+    if lead.is_empty()
+        || head.starts_with(b"PAR1")
+        || lead.starts_with(['{', '['])
+        || text.contains(d)
+    {
+        return;
+    }
+    let seen = [',', '\t', ';', '|']
+        .into_iter()
+        .map(|c| (text.matches(c).count(), c))
+        .max()
+        .filter(|(n, _)| *n > 0);
+    let has = match seen {
+        Some((_, c)) => format!("; its header has {c:?} (leave --delimiter out to detect it)"),
+        None => String::new(),
+    };
+    let name = if source.spec() == "-" {
+        "standard input"
+    } else {
+        source.spec()
+    };
+    eprintln!(
+        "note: --delimiter {d:?} is not in {name}'s header, so each row reads as one column{has}"
+    );
 }
 
 /// One CSV line, quoting only what has to be quoted.
