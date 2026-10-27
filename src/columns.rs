@@ -36,15 +36,23 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
     // Columns are matched by name: two of one name in a file would leave one
     // of them out of the comparison without a word. Unnamed ones (a header
     // ending in commas, as spreadsheets write it) have no name to match by.
+    // A repeated name the options leave out (`-i`, or not in `-c`) is never
+    // read, so it is no reason to refuse the file.
+    let read = |c: &String| {
+        opt.key.contains(c)
+            || (!opt.ignore.contains(c)
+                && opt.compare.as_ref().is_none_or(|wanted| wanted.contains(c)))
+    };
     for (side, cols) in [("A", a_cols), ("B", b_cols)] {
         let mut seen = std::collections::HashSet::new();
         if let Some(twice) = cols
             .iter()
-            .filter(|c| !c.trim().is_empty())
+            .filter(|c| !c.trim().is_empty() && read(c))
             .find(|c| !seen.insert(c.as_str()))
         {
             return Err(Error::input(format!(
-                "{side} has two columns named {twice:?}; compara matches columns by name, so rename one"
+                "{side} has two columns named {twice:?}; compara matches columns by name, so rename one \
+                 (or leave it out with -i {twice})"
             )));
         }
     }
@@ -98,8 +106,10 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
         .collect();
     if !unknown.is_empty() {
         return Err(Error::input(format!(
-            "ignore column(s) present in neither file: {}",
-            unknown.join(", ")
+            "ignore column(s) present in neither file: {} (A has: {}; B has: {})",
+            unknown.join(", "),
+            shown(a_cols),
+            shown(b_cols)
         )));
     }
 
@@ -119,8 +129,9 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
                 .collect();
             if !bad.is_empty() {
                 return Err(Error::input(format!(
-                    "compare column(s) not present in both files: {}",
-                    bad.join(", ")
+                    "compare column(s) not present in both files: {} (in both: {})",
+                    bad.join(", "),
+                    shown(&common)
                 )));
             }
             wanted.clone()
@@ -455,7 +466,7 @@ mod tests {
         assert!(err.is_input());
         assert_eq!(
             err.to_string(),
-            "A has two columns named \"id\"; compara matches columns by name, so rename one"
+            "A has two columns named \"id\"; compara matches columns by name, so rename one (or leave it out with -i id)"
         );
         let err = resolve(
             &names(&["id", "x"]),
@@ -467,6 +478,14 @@ mod tests {
             err.to_string().starts_with("B has two columns named \"x\""),
             "{err}"
         );
+        // A repeated column the options leave out isn't read: no refusal.
+        let twice = names(&["id", "v", "v", "w"]);
+        assert!(resolve(&twice, &twice, &opt(&["id"], &["v"])).is_ok());
+        let only_w = Options {
+            compare: Some(names(&["w"])),
+            ..opt(&["id"], &[])
+        };
+        assert!(resolve(&twice, &twice, &only_w).is_ok());
         // A header ending in commas names no column twice.
         let blank = names(&["id", "x", "", ""]);
         assert!(resolve(&blank, &blank, &opt(&["id"], &[])).is_ok());

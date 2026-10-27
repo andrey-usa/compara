@@ -60,7 +60,8 @@ compare options:
       --tolerance N       Absolute numeric tolerance
       --max-rows N        Rows embedded per section (default 50000)
       --delimiter D       Force delimiter (default: auto)
-      --encoding ENC      utf-8 (the only one read; another encoding compares as bytes)
+      --encoding ENC      utf-8 is read as text; Latin-1 or a Windows code page compares
+                          as bytes (right counts); UTF-16 is refused
       --engine E          auto | turbo | sortmerge | native
       --threads N
       --memory SIZE       Memory to plan for, e.g. 8G (default: what the machine or
@@ -643,7 +644,7 @@ fn cmd_columns(argv: &[String]) -> Result<u8> {
         return Err(Error::new("columns needs a file: compara columns data.csv"));
     };
     let mut opt = Options::default();
-    apply_read_options(&args, &mut opt);
+    apply_read_options(&args, &mut opt)?;
 
     let source = Source::open(first, &Want::footer_only())?;
     let shape = compara::engine::turbo::shape(source.path(), &opt)?;
@@ -685,7 +686,7 @@ fn cmd_head(argv: &[String]) -> Result<u8> {
         None => 10,
     };
     let mut opt = Options::default();
-    apply_read_options(&args, &mut opt);
+    apply_read_options(&args, &mut opt)?;
 
     let source = Source::open(first, &Want::all())?;
     let (columns, rows) = compara::engine::turbo::head(source.path(), want, &opt)?;
@@ -700,14 +701,19 @@ fn cmd_head(argv: &[String]) -> Result<u8> {
     Ok(0)
 }
 
-/// The two flags that change how a file is *read* rather than compared.
-fn apply_read_options(args: &Args, opt: &mut Options) {
+/// The two flags that change how a file is *read* rather than compared;
+/// `--encoding` is checked as `compare` checks it.
+fn apply_read_options(args: &Args, opt: &mut Options) -> Result<()> {
     if let Some(v) = args.get("delimiter", None) {
         opt.delimiter = v.chars().next();
     }
     if let Some(v) = args.get("encoding", None) {
         opt.encoding = v.to_string();
+        if let Some(note) = compara::options::encoding_note(v)? {
+            eprintln!("note: {note}");
+        }
     }
+    Ok(())
 }
 
 /// One CSV line, quoting only what has to be quoted.

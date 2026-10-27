@@ -77,6 +77,15 @@ pub(super) fn csv_header(slab: &Slab, delimiter: u8, path: &Path) -> Result<(Vec
             path.display()
         )));
     }
+    // A UTF-16 file's commas are two bytes each: read as UTF-8 its header is
+    // noise. Its byte-order mark says what it is.
+    if data.starts_with(&[0xFF, 0xFE]) || data.starts_with(&[0xFE, 0xFF]) {
+        return Err(Error::input(format!(
+            "{} is UTF-16 (it starts with a UTF-16 byte-order mark); compara reads UTF-8: \
+             convert it (iconv -f utf-16 -t utf-8)",
+            path.display()
+        )));
+    }
     let mut names = Vec::new();
     let mut pos = 0usize;
     loop {
