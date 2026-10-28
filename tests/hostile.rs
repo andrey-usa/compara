@@ -255,3 +255,69 @@ fn a_bit_width_wider_than_its_values_is_refused() {
     );
     assert!(stderr.contains("bits wide"), "{stderr}");
 }
+
+/// Keys built to share one hash under the FNV the engines used before
+/// `keyhash`: a second word that cancels the first (`w2 = f(w1) ^ C`). Every
+/// row landed in one probe chain, and 40,000 rows took 40 s.
+fn colliding_keys(n: usize) -> Vec<[u8; 16]> {
+    const PRIME: u64 = 0x100_0000_01b3;
+    const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    let f = |h: u64, w: u64| {
+        let h = (h ^ w).wrapping_mul(PRIME);
+        h ^ (h >> 29)
+    };
+    let c = f(BASIS, u64::from_le_bytes(*b"AAAAAAAA")) ^ u64::from_le_bytes(*b"BBBBBBBB");
+    let fits = |b: &[u8; 8]| {
+        b.iter()
+            .all(|&x| (0x21..=0xfe).contains(&x) && x != b',' && x != b'"')
+    };
+    let mut out = Vec::with_capacity(n);
+    for i in 0u64.. {
+        if out.len() == n {
+            break;
+        }
+        let w1: [u8; 8] = std::array::from_fn(|k| b'A' + ((i >> (4 * k)) & 15) as u8);
+        let w2 = (f(BASIS, u64::from_le_bytes(w1)) ^ c).to_le_bytes();
+        if fits(&w2) {
+            let mut key = [0u8; 16];
+            key[..8].copy_from_slice(&w1);
+            key[8..].copy_from_slice(&w2);
+            out.push(key);
+        }
+    }
+    out
+}
+
+#[test]
+fn keys_built_to_collide_do_not_make_a_compare_quadratic() {
+    let keys = colliding_keys(20_000);
+    let file = |changed: bool| {
+        let mut b = b"id,v\n".to_vec();
+        for (i, k) in keys.iter().enumerate() {
+            b.extend_from_slice(k);
+            b.extend_from_slice(
+                format!(",{}\n", i + usize::from(changed && i % 100 == 0)).as_bytes(),
+            );
+        }
+        b
+    };
+    let (a, b) = (
+        Scratch::new("flood_a.csv", &file(false)),
+        Scratch::new("flood_b.csv", &file(true)),
+    );
+    // turbo, the default: these keys aren't UTF-8, which the native engine
+    // refuses before hashing; it hashes by the same `keyhash`.
+    let started = Instant::now();
+    let out = Command::new(BIN)
+        .args(["compare", "-k", "id", "--engine", "turbo"])
+        .arg(&a.0)
+        .arg(&b.0)
+        .output()
+        .expect("run compara");
+    let took = started.elapsed();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("matched 20,000 (changed 200)"), "{stdout}");
+    // Ordinary keys: well under a second, debug build included. Hashed the
+    // old way these rows took about 10 s in a release build.
+    assert!(took < Duration::from_secs(5), "took {took:?}");
+}

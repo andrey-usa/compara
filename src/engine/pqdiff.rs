@@ -46,6 +46,7 @@ use crate::alloc;
 use crate::columns::{compare_keys, resolve};
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
 use crate::error::{Error, Result};
+use crate::keyhash::{self, tail_word};
 use crate::memory;
 use crate::options::Options;
 use crate::parallel;
@@ -196,9 +197,6 @@ fn cell_differs(x: Look<'_>, y: Look<'_>, opt: &Options) -> bool {
     !same(x, y, opt)
 }
 
-const PRIME: u64 = 0x100000001b3;
-const SEED: u64 = 0xcbf29ce484222325;
-
 /// FNV-1a, eight bytes at a time.
 ///
 /// A hash here is internal in exactly the sense the CSV engine's is: nothing
@@ -212,57 +210,28 @@ const SEED: u64 = 0xcbf29ce484222325;
 /// dictionary-encoded -- which a high-cardinality key column usually is not,
 /// since a writer gives up on a dictionary that never repeats -- is hashed once
 /// per row, on both sides, indexed and probed.
-fn fold_bytes(mut h: u64, v: &[u8]) -> u64 {
+fn fold_bytes(mut h: u64, v: &[u8], mul: u64) -> u64 {
     let (words, tail) = v.as_chunks::<8>();
     for chunk in words {
-        h = (h ^ u64::from_le_bytes(*chunk)).wrapping_mul(PRIME);
-        h ^= h >> 29; // the xor-shift is what spreads a whole word into the low bits
+        h = keyhash::word(h, u64::from_le_bytes(*chunk), mul);
     }
     if !tail.is_empty() {
-        h = (h ^ tail_word(v, tail.len())).wrapping_mul(PRIME);
-        h ^= h >> 29;
+        h = keyhash::word(h, tail_word(v, tail.len()), mul);
     }
-    (h ^ v.len() as u64).wrapping_mul(PRIME)
+    keyhash::word(h, v.len() as u64, mul)
 }
 
-/// The last `rem` bytes of `v`, one to seven of them, as a little-endian word
-/// padded with zeros.
-///
-/// This was a copy into a zeroed buffer, and a copy of a length only known at
-/// run time is a call to memcpy, once per key cell per row. A value of eight
-/// bytes or more has eight real bytes ending where the tail does, so one load
-/// and a shift gives the same word; a shorter one is read as two overlapping
-/// halves, or as its first, middle and last byte. The Zig port does the same
-/// (`scan.tailWord`).
-#[inline]
-pub(super) fn tail_word(v: &[u8], rem: usize) -> u64 {
-    let n = v.len();
-    debug_assert!(rem > 0 && rem < 8 && rem <= n);
-    if n >= 8 {
-        let last = u64::from_le_bytes(v[n - 8..].try_into().unwrap());
-        return last >> (8 * (8 - rem));
-    }
-    // Shorter than a word: nothing was folded yet, so the tail is all of it.
-    if n >= 4 {
-        let lo = u32::from_le_bytes(v[..4].try_into().unwrap()) as u64;
-        let hi = u32::from_le_bytes(v[n - 4..].try_into().unwrap()) as u64;
-        return lo | (hi << (8 * (n - 4)));
-    }
-    v[0] as u64 | (v[n / 2] as u64) << (8 * (n / 2)) | (v[n - 1] as u64) << (8 * (n - 1))
-}
 /// [`fold_bytes`] of one eight-byte word, the same value without the loop
 /// and the tail test: a word key column is hashed once per row on both sides.
 #[inline]
-fn fold_word(h: u64, w: &[u8; 8]) -> u64 {
-    let mut h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(PRIME);
-    h ^= h >> 29;
-    (h ^ 8).wrapping_mul(PRIME)
+fn fold_word(h: u64, w: &[u8; 8], mul: u64) -> u64 {
+    keyhash::word(keyhash::word(h, u64::from_le_bytes(*w), mul), 8, mul)
 }
-fn fold_absent(h: u64) -> u64 {
-    (h ^ 0x9e3779b97f4a7c15).wrapping_mul(PRIME)
+fn fold_absent(h: u64, mul: u64) -> u64 {
+    keyhash::word(h, keyhash::ABSENT, mul)
 }
-fn fold_id(h: u64, id: i32) -> u64 {
-    (h ^ (id as u32) as u64).wrapping_mul(PRIME)
+fn fold_id(h: u64, id: i32, mul: u64) -> u64 {
+    keyhash::word(h, (id as u32) as u64, mul)
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +345,8 @@ impl Hasher for FoldHasher {
         self.0
     }
     fn write(&mut self, bytes: &[u8]) {
-        self.0 = fold_bytes(self.0 ^ SEED, bytes);
+        let k = keyhash::keys();
+        self.0 = fold_bytes(self.0 ^ k.start, bytes, k.mul);
     }
 }
 
@@ -421,12 +391,14 @@ struct KeySide<'m> {
 /// over one column of words is a load, a multiply and a shift. Each row's hash
 /// folds its columns in the same order either way, so the value is the same.
 fn hash_rows(as_id: &[bool], s: &KeySide<'_>, from: usize, out: &mut [u64], opt: &Options) {
-    out.fill(SEED);
+    let k = keyhash::keys();
+    let mul = k.mul;
+    out.fill(k.start);
     let rows = from..from + out.len();
     for (j, &coded) in as_id.iter().enumerate() {
         if coded {
             for (h, &id) in out.iter_mut().zip(&s.id[j][rows.clone()]) {
-                *h = fold_id(*h, id);
+                *h = fold_id(*h, id, mul);
             }
             continue;
         }
@@ -436,14 +408,14 @@ fn hash_rows(as_id: &[bool], s: &KeySide<'_>, from: usize, out: &mut [u64], opt:
             let values = &w.values[rows.clone()];
             if w.nulls.is_empty() {
                 for (h, v) in out.iter_mut().zip(values) {
-                    *h = fold_word(*h, v);
+                    *h = fold_word(*h, v, mul);
                 }
             } else {
                 for ((h, v), r) in out.iter_mut().zip(values).zip(rows.clone()) {
                     *h = if w.is_null(r) {
-                        fold_absent(*h)
+                        fold_absent(*h, mul)
                     } else {
-                        fold_word(*h, v)
+                        fold_word(*h, v, mul)
                     };
                 }
             }
@@ -453,8 +425,8 @@ fn hash_rows(as_id: &[bool], s: &KeySide<'_>, from: usize, out: &mut [u64], opt:
             let read = KeyRead::of(false, s, j);
             for (h, r) in out.iter_mut().zip(rows.clone()) {
                 *h = match read.bytes(r) {
-                    None => fold_absent(*h),
-                    Some(v) => fold_bytes(*h, v),
+                    None => fold_absent(*h, mul),
+                    Some(v) => fold_bytes(*h, v, mul),
                 };
             }
             continue;
@@ -462,11 +434,11 @@ fn hash_rows(as_id: &[bool], s: &KeySide<'_>, from: usize, out: &mut [u64], opt:
         for (h, r) in out.iter_mut().zip(rows.clone()) {
             let c = s.col[j].at(r);
             *h = if absent(c, opt) {
-                fold_absent(*h)
+                fold_absent(*h, mul)
             } else if !needs_normalising(opt) {
-                fold_bytes(*h, c.bytes)
+                fold_bytes(*h, c.bytes, mul)
             } else {
-                fold_bytes(*h, value_of(c, opt).unwrap_or_default().as_bytes())
+                fold_bytes(*h, value_of(c, opt).unwrap_or_default().as_bytes(), mul)
             };
         }
     }
@@ -2379,12 +2351,13 @@ mod tests {
 
     #[test]
     fn fold_word_is_fold_bytes_of_the_word() {
+        let k = keyhash::from_seed(7);
         for (h, w) in [
-            (SEED, [0u8; 8]),
+            (k.start, [0u8; 8]),
             (1, [1, 2, 3, 4, 5, 6, 7, 8]),
             (u64::MAX, [0xff; 8]),
         ] {
-            assert_eq!(fold_word(h, &w), fold_bytes(h, &w));
+            assert_eq!(fold_word(h, &w, k.mul), fold_bytes(h, &w, k.mul));
         }
     }
 

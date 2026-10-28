@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Keys built to share one hash made a compare quadratic: every engine
+  hashed keys with a fixed FNV, and a file whose keys cancel each other's
+  words put every row in one probe chain (40,000 such rows, 0.9 MB: 40 s
+  instead of 10 ms). Keys are now hashed by a full 64x64-bit multiply,
+  folded, by a multiplier and from a start chosen at random for each run,
+  so they can't be built to collide. Results are the same as before, byte
+  for byte, and as fast. `COMPARA_HASH_SEED` fixes the keys for a run that
+  must repeat exactly (a benchmark).
+
 ### Fixed
 
 - A file with two columns of the same name was compared with one of them

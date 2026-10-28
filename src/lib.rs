@@ -28,6 +28,7 @@ pub mod engine;
 pub mod error;
 pub mod gendata;
 pub mod hugepages;
+pub mod keyhash;
 pub mod memory;
 pub mod options;
 pub mod parallel;
