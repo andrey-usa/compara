@@ -1024,7 +1024,18 @@ mod tests {
         let pool: Vec<Option<String>> = {
             let mut v: Vec<Option<String>> = vec![None, Some(String::new())];
             for lead in ["", "ACC-0000", "ACC-0000"] {
-                for tail in ["", "a", "ab", "ab\0", "ab\0c", "12345678", "123456789", "12345678z", "\u{ff}\u{ff}", "z"] {
+                for tail in [
+                    "",
+                    "a",
+                    "ab",
+                    "ab\0",
+                    "ab\0c",
+                    "12345678",
+                    "123456789",
+                    "12345678z",
+                    "\u{ff}\u{ff}",
+                    "z",
+                ] {
                     v.push(Some(format!("{lead}{tail}")));
                 }
             }
@@ -1038,13 +1049,21 @@ mod tests {
                     let mut cells: Vec<Option<String>> = Vec::new();
                     for _ in 0..key_size {
                         // Some rounds draw from one lead only, so the shared part is long.
-                        let pick = if round % 3 == 0 { 2 + (next() % 10) as usize } else { (next() % pool.len() as u64) as usize };
+                        let pick = if round % 3 == 0 {
+                            2 + (next() % 10) as usize
+                        } else {
+                            (next() % pool.len() as u64) as usize
+                        };
                         cells.push(pool[pick].clone());
                     }
                     cells.push(Some(r.to_string()));
                     batch.push(cells.iter().map(|c| c.as_deref())).unwrap();
                 }
-                assert_eq!(sorted_order(&batch, key_size), reference(&batch, key_size), "key_size {key_size} round {round}");
+                assert_eq!(
+                    sorted_order(&batch, key_size),
+                    reference(&batch, key_size),
+                    "key_size {key_size} round {round}"
+                );
             }
         }
     }
