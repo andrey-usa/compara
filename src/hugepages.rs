@@ -77,6 +77,9 @@ unsafe impl GlobalAlloc for HugePages {
     }
 
     #[inline]
+    // SAFETY: the caller meets `GlobalAlloc::alloc_zeroed`'s contract (a layout of
+    // non-zero size); it is passed on unchanged, and `advise` only hints at the
+    // returned block, so the contract is `System`'s own.
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded as given.
         let p = retried(layout.size(), || unsafe { System.alloc_zeroed(layout) });
@@ -85,6 +88,9 @@ unsafe impl GlobalAlloc for HugePages {
     }
 
     #[inline]
+    // SAFETY: the caller meets `GlobalAlloc::dealloc`'s contract (`ptr` came from
+    // this allocator with this same `layout`, and is not used again); every
+    // allocation here is `System`'s, so `System` frees it.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: forwarded as given.
         unsafe { System.dealloc(ptr, layout) }

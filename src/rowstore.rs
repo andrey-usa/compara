@@ -203,20 +203,26 @@ impl Packed {
     /// A hash of the row's key cells, with an absent cell distinct from any
     /// value, the empty one included.
     pub fn key_hash(&self, row: usize, key_size: usize) -> u64 {
-        let mut h: u64 = 0xcbf29ce484222325;
+        // Keyed per process (see `keyhash`): keys built to share a hash
+        // would otherwise put every row in one chain.
+        let k = crate::keyhash::keys();
+        let mut h = k.start;
         for i in 0..key_size {
             match self.cell_bytes(row, i) {
-                None => h = (h ^ 0x9e37_79b9_7f4a_7c15).wrapping_mul(0x100000001b3),
+                None => h = crate::keyhash::word(h, crate::keyhash::ABSENT, k.mul),
                 Some(v) => {
                     let (words, tail) = v.as_chunks::<8>();
                     for w in words {
-                        h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(0x100000001b3);
-                        h ^= h >> 29;
+                        h = crate::keyhash::word(h, u64::from_le_bytes(*w), k.mul);
                     }
-                    for &b in tail {
-                        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+                    if !tail.is_empty() {
+                        h = crate::keyhash::word(
+                            h,
+                            crate::keyhash::tail_word(v, tail.len()),
+                            k.mul,
+                        );
                     }
-                    h = (h ^ v.len() as u64).wrapping_mul(0x100000001b3);
+                    h = crate::keyhash::word(h, v.len() as u64, k.mul);
                 }
             }
         }

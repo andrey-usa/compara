@@ -58,6 +58,7 @@ use crate::alloc;
 use crate::columns::{Resolved, Typed, compare_keys, differs, empty_to_null, normalise, resolve};
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
 use crate::error::{Error, Result};
+use crate::keyhash;
 use crate::options::Options;
 use crate::parallel;
 use crate::phases::Phases;
@@ -296,16 +297,12 @@ fn cell_differs(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
 /// twenty-six, and the key hash is computed four times over at every row (both
 /// files, indexed then probed), which made byte-at-a-time FNV about a billion
 /// dependent multiply-xor steps of a ten-million-row run.
-fn hash_bytes(bytes: &[u8], seed: u64) -> u64 {
-    const PRIME: u64 = 0x100_0000_01b3;
+fn hash_bytes(bytes: &[u8], seed: u64, mul: u64) -> u64 {
     let mut h = seed;
     let mut chunks = bytes.as_chunks::<8>().0.iter();
     for chunk in &mut chunks {
-        let word = u64::from_le_bytes(*chunk);
-        h = (h ^ word).wrapping_mul(PRIME);
-        // The xor-shift is what spreads a whole word into the low bits, which
-        // is where the table's slot comes from.
-        h ^= h >> 29;
+        // Folded by a secret multiplier: see `keyhash`.
+        h = keyhash::word(h, u64::from_le_bytes(*chunk), mul);
     }
     let rem = bytes.len() % 8;
     if rem != 0 {
@@ -313,25 +310,23 @@ fn hash_bytes(bytes: &[u8], seed: u64) -> u64 {
         // stay inside the bytes, rather than a copy of a run-time length --
         // a `memcpy` call per key column of every row of both files. It is the
         // word the escaped branch of `hash_field` assembles byte by byte.
-        h = (h ^ super::pqdiff::tail_word(bytes, rem)).wrapping_mul(PRIME);
-        h ^= h >> 29;
+        h = keyhash::word(h, keyhash::tail_word(bytes, rem), mul);
     }
     h
 }
 
-/// FNV-1a over the bytes equality would compare, so the two cannot disagree.
-fn hash_field(slab: &Slab, f: Field, opt: &Options, normalise: bool, seed: u64) -> u64 {
-    const PRIME: u64 = 0x100_0000_01b3;
+/// A hash of the bytes equality would compare, so the two cannot disagree.
+fn hash_field(slab: &Slab, f: Field, opt: &Options, normalise: bool, seed: u64, mul: u64) -> u64 {
     let mut h = seed;
     // Fast path: no normalization options set, so absence is just the field
     // word. The `needs_normalising` check was done once per sweep, not once
     // per field per row.
     if !normalise {
         if f == ABSENT || field::len_of(f) == 0 || f == TOO_LONG {
-            return (h ^ 0x9e37_79b9_7f4a_7c15).wrapping_mul(PRIME);
+            return keyhash::word(h, keyhash::ABSENT, mul);
         }
     } else if is_absent(slab, f, opt) {
-        return (h ^ 0x9e37_79b9_7f4a_7c15).wrapping_mul(PRIME);
+        return keyhash::word(h, keyhash::ABSENT, mul);
     }
     // Hash exactly the bytes equality compares, by the same route, so the two
     // cannot disagree: the Java port shipped two silently wrong answers when a
@@ -339,10 +334,8 @@ fn hash_field(slab: &Slab, f: Field, opt: &Options, normalise: bool, seed: u64) 
     let mut len = 0u64;
     if normalise {
         let owned = value(slab, f, opt).unwrap_or_default();
-        for b in owned.as_bytes() {
-            h = (h ^ (*b as u64)).wrapping_mul(PRIME);
-            len += 1;
-        }
+        h = hash_bytes(owned.as_bytes(), h, mul);
+        len = owned.len() as u64;
     } else if !field::is_escaped(f) {
         // Nothing to unescape, so the bytes are the value and eight of them can
         // be taken at a time. See `hash_bytes`.
@@ -352,7 +345,7 @@ fn hash_field(slab: &Slab, f: Field, opt: &Options, normalise: bool, seed: u64) 
         // -- the cost `same_bytes` used to pay, in the one function that runs
         // for every key column of every row of both files.
         let raw = slab.raw(f);
-        h = hash_bytes(raw, h);
+        h = hash_bytes(raw, h, mul);
         len = raw.len() as u64;
     } else {
         // Decoded, then folded by the same word-at-a-time loop as the branch
@@ -369,17 +362,15 @@ fn hash_field(slab: &Slab, f: Field, opt: &Options, normalise: bool, seed: u64) 
             have += 1;
             len += 1;
             if have == 8 {
-                h = (h ^ word).wrapping_mul(PRIME);
-                h ^= h >> 29;
+                h = keyhash::word(h, word, mul);
                 (word, have) = (0, 0);
             }
         }
         if have > 0 {
-            h = (h ^ word).wrapping_mul(PRIME);
-            h ^= h >> 29;
+            h = keyhash::word(h, word, mul);
         }
     }
-    (h ^ len).wrapping_mul(PRIME)
+    keyhash::word(h, len, mul)
 }
 
 /// Each occupied slot's row becomes its key's position: the marks in `words`
@@ -429,30 +420,30 @@ fn rows_to_positions_with(part: &mut [u32], pos_mask: u32, words: &[u64], before
 /// once a row. The same number by the same steps; `None` for an escaped key,
 /// which goes through `key_hash` and its decoder.
 #[inline(always)]
-fn key_hash_plain(data: &[u8], keys: &[Field]) -> Option<u64> {
-    const PRIME: u64 = 0x100_0000_01b3;
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+fn key_hash_plain(data: &[u8], keys: &[Field], k: keyhash::Keys) -> Option<u64> {
+    let mut h = k.start;
     for &f in keys {
         if !field::is_real(f) || field::len_of(f) == 0 {
-            h = (h ^ 0x9e37_79b9_7f4a_7c15).wrapping_mul(PRIME);
+            h = keyhash::word(h, keyhash::ABSENT, k.mul);
             continue;
         }
         if field::is_escaped(f) {
             return None;
         }
         let (at, len) = (field::offset_of(f), field::len_of(f));
-        h = hash_bytes(data.get(at..at + len)?, h);
-        h = (h ^ len as u64).wrapping_mul(PRIME);
+        h = hash_bytes(data.get(at..at + len)?, h, k.mul);
+        h = keyhash::word(h, len as u64, k.mul);
     }
     Some(h)
 }
 
 fn key_hash(slab: &Slab, fields: &[Field], key_size: usize, opt: &Options) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325;
+    let k = keyhash::keys();
+    let mut h = k.start;
     // Hoisted from per-field: the options do not change mid-sweep.
     let normalise = needs_normalising(opt);
     for f in &fields[..key_size] {
-        h = hash_field(slab, *f, opt, normalise, h);
+        h = hash_field(slab, *f, opt, normalise, h, k.mul);
     }
     match narrow_hash() {
         Some(mask) => {
@@ -1700,6 +1691,7 @@ fn sweep_chunks(
     let parts = bounds.len() - 1;
     // Asked once for the file rather than once a row (see `key_hash_plain`).
     let plain_keys = !needs_normalising(opt) && narrow_hash().is_none();
+    let hash_keys = keyhash::keys();
     in_parallel(parts, |i| {
         let (begin, stop) = (bounds[i], bounds[i + 1]);
         let mut chunk = Chunk {
@@ -1745,10 +1737,11 @@ fn sweep_chunks(
                      use --engine native"
                 )));
             }
-            let hash = match plain_keys.then(|| key_hash_plain(data, &fields[..key_size])) {
-                Some(Some(h)) => h,
-                _ => key_hash(&side.slab, &fields, key_size, opt),
-            };
+            let hash =
+                match plain_keys.then(|| key_hash_plain(data, &fields[..key_size], hash_keys)) {
+                    Some(Some(h)) => h,
+                    _ => key_hash(&side.slab, &fields, key_size, opt),
+                };
             chunk.push(pos as u64, hash)?;
             // The row before this one ends where this one starts, and its
             // pages are still hot: the fused join takes it now, rather than
