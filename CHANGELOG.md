@@ -22,6 +22,12 @@ All notable changes to this project are documented here. The format follows
 - The sortmerge engine sorts each batch by an eight-byte key prefix held
   beside the row number, reading the key text only on a tie: 1M rows 5.9 s
   -> 4.35 s on one core, 2M rows 7.7 s -> 6.7 s on two; same output.
+- The sortmerge engine's spilled runs hold each row as one record (its
+  length, a length per cell, then its text), read back in two reads and
+  checked once, where each cell was read and checked on its own: about a
+  quarter fewer instructions, 2M rows 5.8 s -> 4.6 s on two cores, runs on
+  disk the same size within 3%; same output. A damaged run (cut short,
+  lengths that don't add up, text that isn't UTF-8) is an error.
 
 ### Fixed
 

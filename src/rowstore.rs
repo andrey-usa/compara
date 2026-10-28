@@ -126,6 +126,45 @@ impl Packed {
         self.push((0..other.width).map(|i| other.cell(row, i)))
     }
 
+    /// A row as it is spilled: its per-cell ends (with [`ABSENT`] flags) and
+    /// its text.
+    #[inline]
+    pub fn row_raw(&self, row: usize) -> (&[u32], &[u8]) {
+        let from = self.starts[row];
+        let to = self.starts.get(row + 1).copied().unwrap_or(self.text.len());
+        (
+            &self.ends[row * self.width..(row + 1) * self.width],
+            &self.text.as_bytes()[from..to],
+        )
+    }
+
+    /// The flag a spilled cell end carries when the cell has no value.
+    pub const ABSENT_FLAG: u32 = ABSENT;
+
+    /// Appends one row from its spilled form: `ends` as [`Packed::row_raw`]
+    /// gives them and `text` the row's bytes. Checks what `push` would have
+    /// guaranteed: the text is UTF-8, the ends do not decrease, and each one
+    /// falls on a character boundary and within the text.
+    pub fn push_raw(&mut self, ends: &[u32], text: &[u8]) -> Result<()> {
+        let text = std::str::from_utf8(text)
+            .map_err(|e| Error::new(format!("spilled run holds invalid UTF-8: {e}")))?;
+        let mut prev = 0usize;
+        for &e in ends {
+            let at = (e & !ABSENT) as usize;
+            if at < prev || at > text.len() || !text.is_char_boundary(at) {
+                return Err(Error::new("spilled run holds invalid UTF-8"));
+            }
+            prev = at;
+        }
+        if prev != text.len() {
+            return Err(Error::new("spilled run holds invalid UTF-8"));
+        }
+        self.starts.push(self.text.len());
+        self.text.push_str(text);
+        self.ends.extend_from_slice(ends);
+        Ok(())
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.ends.clear();
