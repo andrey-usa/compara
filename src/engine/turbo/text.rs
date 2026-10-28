@@ -771,6 +771,8 @@ pub(super) fn guard_span(
     ),
     target_feature(enable = "avx2,popcnt,bmi1")
 )]
+// Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
+// enables; the body is the safe `guard_span_with`, so the feature is the only requirement.
 unsafe fn guard_span_wide(
     w: Wide,
     data: &[u8],
@@ -899,6 +901,8 @@ impl Runs {
         ),
         target_feature(enable = "avx2,popcnt,bmi1")
     )]
+    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
+    // enables; the body is the safe `of_row_with`, so the feature is the only requirement.
     unsafe fn of_row_wide(
         &self,
         w: Wide,
@@ -982,6 +986,8 @@ impl Runs {
         ),
         target_feature(enable = "avx2,popcnt,bmi1")
     )]
+    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
+    // enables; the body is the safe `matches_with`, so the feature is the only requirement.
     unsafe fn matches_wide(
         &self,
         w: Wide,
@@ -1155,6 +1161,8 @@ impl RowParser {
         ),
         target_feature(enable = "avx2,popcnt,bmi1")
     )]
+    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
+    // enables; the body is the safe `parse_with`, so the feature is the only requirement.
     unsafe fn parse_wide(
         &self,
         w: Wide,
@@ -1557,6 +1565,8 @@ pub(super) fn json_rows_match_at(
     target_feature(enable = "avx2,popcnt,bmi1")
 )]
 #[allow(clippy::too_many_arguments)]
+// Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
+// enables; the body is the safe `json_rows_match_with`, so the feature is the only requirement.
 unsafe fn json_rows_match_wide(
     w: Wide,
     p: &RowParser,
