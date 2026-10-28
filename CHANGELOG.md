@@ -22,6 +22,11 @@ All notable changes to this project are documented here. The format follows
 - The sortmerge engine sorts each batch by an eight-byte key prefix held
   beside the row number, reading the key text only on a tie: 1M rows 5.9 s
   -> 4.35 s on one core, 2M rows 7.7 s -> 6.7 s on two; same output.
+- The turbo engine keeps each row's key hash in 32 bits rather than 64 (it
+  only ever filtered candidates; the key bytes decide), and frees the
+  duplicate-key counts once the duplicate sections are written: 10M rows
+  take about 79 MB less memory (700 -> 625 MB of heap), 2M rows 161 -> 132
+  MB, with 1.3% fewer instructions; same output.
 
 ### Fixed
 
