@@ -17,6 +17,12 @@ All notable changes to this project are documented here. The format follows
   for byte, and as fast. `COMPARA_HASH_SEED` fixes the keys for a run that
   must repeat exactly (a benchmark).
 
+### Changed
+
+- The sortmerge engine sorts each batch by an eight-byte key prefix held
+  beside the row number, reading the key text only on a tie: 1M rows 5.9 s
+  -> 4.35 s on one core, 2M rows 7.7 s -> 6.7 s on two; same output.
+
 ### Fixed
 
 - A file with two columns of the same name was compared with one of them
