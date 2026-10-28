@@ -201,6 +201,9 @@ impl Options {
         if self.encoding.is_empty() {
             self.encoding = "utf-8".to_string();
         }
+        if let Some(note) = encoding_note(&self.encoding)? {
+            eprintln!("note: {note}");
+        }
         if self.engine.is_empty() {
             self.engine = Engine::Auto.label().to_string();
         }
@@ -236,4 +239,81 @@ pub fn parse_list(value: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// What `--encoding` means here, for a name given: nothing to say for UTF-8,
+/// a note for an encoding whose bytes still compare right, and a refusal for
+/// one that can't be compared as bytes or isn't an encoding at all.
+///
+/// Cells are compared as their bytes and shown as UTF-8; no reader decodes
+/// another encoding. Latin-1 and the Windows code pages keep every
+/// delimiter, quote and newline the byte it is in ASCII, so a pair in one of
+/// them compares cell for cell; only the report's text is off. UTF-16 and
+/// UTF-32 don't: their commas are two or four bytes.
+pub fn encoding_note(name: &str) -> Result<Option<String>> {
+    let lower = name.trim().to_ascii_lowercase().replace('_', "-");
+    let single_byte = lower.starts_with("iso-8859-")
+        || lower.starts_with("iso8859-")
+        || lower.starts_with("windows-125")
+        || lower.starts_with("cp125")
+        || matches!(
+            lower.as_str(),
+            "latin1" | "latin-1" | "l1" | "cp1252" | "macroman" | "mac-roman" | "koi8-r" | "koi8-u"
+        );
+    if lower.is_empty() || matches!(lower.as_str(), "utf-8" | "utf8" | "ascii" | "us-ascii") {
+        Ok(None)
+    } else if single_byte {
+        Ok(Some(format!(
+            "--encoding {name}: compara compares the bytes of each cell, so the counts are right; \
+             values are shown as UTF-8, so the report may show some characters wrongly"
+        )))
+    } else if lower.starts_with("utf-16")
+        || lower.starts_with("utf-32")
+        || lower.starts_with("ucs-")
+    {
+        Err(Error::input(format!(
+            "--encoding {name}: compara reads UTF-8 and ASCII-compatible encodings, not {name}; \
+             convert the files first (iconv -f {name} -t utf-8)"
+        )))
+    } else {
+        Err(Error::input(format!(
+            "--encoding {name}: not an encoding compara knows. It reads UTF-8, and Latin-1 or Windows \
+             code-page files compare correctly as bytes"
+        )))
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::encoding_note;
+
+    #[test]
+    fn encodings_are_read_said_or_refused() {
+        for name in ["", "utf-8", "UTF8", "ascii"] {
+            assert_eq!(encoding_note(name).unwrap(), None, "{name}");
+        }
+        // Their bytes compare right: a note, not a refusal.
+        for name in ["latin1", "ISO-8859-1", "cp1252", "windows-1252"] {
+            assert!(
+                encoding_note(name)
+                    .unwrap()
+                    .unwrap()
+                    .contains("counts are right"),
+                "{name}"
+            );
+        }
+        for name in ["utf-16", "UTF-16LE", "utf-32"] {
+            let err = encoding_note(name).unwrap_err();
+            assert!(
+                err.is_input() && err.to_string().contains("iconv"),
+                "{name}: {err}"
+            );
+        }
+        assert!(
+            encoding_note("bogus")
+                .unwrap_err()
+                .to_string()
+                .contains("not an encoding compara knows")
+        );
+    }
 }

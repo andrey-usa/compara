@@ -134,7 +134,13 @@ impl Source {
             let meta = std::fs::metadata(&path)
                 .map_err(|_| Error::new(format!("file not found: {spec}")))?;
             if !meta.is_file() {
-                return Err(Error::new(format!("not a file: {spec}")));
+                // A pipe can be read once and not seeked, and compara reads
+                // its inputs more than once: say how it takes one instead.
+                return Err(Error::input(format!(
+                    "{spec} is not a regular file (a pipe, a device or a process substitution); \
+                     compara reads a pipe as standard input: `… | compara compare - B`, or save it \
+                     to a file first"
+                )));
             }
             Source {
                 spec: spec.to_string(),

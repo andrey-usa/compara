@@ -113,9 +113,11 @@ fn run(
         // value here would send every pair to `turbo` and quietly retire the
         // columnar path. Only an explicit `--engine turbo` should do that.
         if requested == Engine::Turbo {
+            // A damaged file is the usual reason this fails: say what was
+            // being read, not that an engine broke.
             return turbo::compare(a, b, opt)
                 .map(|r| (r, Engine::Turbo.label().to_string()))
-                .map_err(|e| e.context("the turbo engine failed: "));
+                .map_err(|e| e.context_unless_input("reading the Parquet files: "));
         }
         // The columnar path reads a narrow slice of Parquet on purpose -- PLAIN
         // and dictionary v1 pages of byte arrays and word-sized types -- and
@@ -134,18 +136,19 @@ fn run(
                         // Both refusals: the first says what the fast path could
                         // not read, the second what actually stopped the run.
                         Error::new(format!(
-                            "the parquet engine failed: {e}; and the turbo \
-engine, which reads more of the format, failed too: {turbo_err}"
+                            "reading the Parquet files: {e}; the slower reader, which \
+handles more of the format, could not read them either: {turbo_err}"
                         ))
                     });
             }
-            Err(e) => return Err(Error::new(format!("the parquet engine failed: {e}"))),
+            Err(e) if e.is_input() => return Err(e),
+            Err(e) => return Err(Error::new(format!("reading the Parquet files: {e}"))),
         }
     }
     if a_pq || b_pq {
         return turbo::compare(a, b, opt)
             .map(|r| (r, Engine::Turbo.label().to_string()))
-            .map_err(|e| e.context("the turbo engine failed: "));
+            .map_err(|e| e.context_unless_input("reading the Parquet file: "));
     }
 
     // Below this, the sortmerge engine's own buffers and threads don't fit
@@ -194,7 +197,7 @@ engine, which reads more of the format, failed too: {turbo_err}"
             crate::memory::release_free();
             sortmerge::compare(a, b, opt)
                 .map(|r| (r, Engine::SortMerge.label().to_string()))
-                .map_err(|e| e.context("the sortmerge engine failed: "))
+                .map_err(|e| e.context_unless_input("the sortmerge engine failed: "))
         }
         // A pair that didn't fit `turbo`, in a heap too small to hand it to
         // `sortmerge` with room to spare: say that the engine can be named.
@@ -216,7 +219,7 @@ engine, which reads more of the format, failed too: {turbo_err}"
         }
         result => result
             .map(|r| (r, engine.label().to_string()))
-            .map_err(|e| e.context(format!("the {engine} engine failed: "))),
+            .map_err(|e| e.context_unless_input(format!("the {engine} engine failed: "))),
     }
 }
 

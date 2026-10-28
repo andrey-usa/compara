@@ -500,9 +500,16 @@ fn a_real_error_is_not_dressed_up_as_an_unsupported_codec() {
     let mut opt = options(&["no_such_column"], |_| {});
     let err = compare(&f.path("a", ".parquet"), &f.path("b", ".parquet"), &mut opt)
         .expect_err("a key column that is in neither file");
+    // Said as what it is, a key the files don't have, not handed to the other
+    // reader or blamed on an engine.
+    let text = err.to_string();
     assert!(
-        err.to_string().contains("the parquet engine failed"),
-        "the columnar path owns this failure: {err}"
+        text.starts_with("key column \"no_such_column\" not in A"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("turbo") && !text.contains("engine failed"),
+        "{text}"
     );
 }
 

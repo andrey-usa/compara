@@ -68,7 +68,7 @@ from one machine and one sitting only.
 
 ## Layout
 
-```
+```text
 src/main.rs               argument parsing and exit codes
 src/lib.rs                the library's public surface
 src/contract.rs           the result contract

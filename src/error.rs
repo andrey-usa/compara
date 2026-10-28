@@ -23,6 +23,10 @@ pub struct Error {
     /// (see `crate::memory::contain`), and `auto` answers a CSV pair that hit
     /// it with the engine that spills to disk instead.
     out_of_memory: bool,
+    /// Set when the inputs or the options are what is wrong (a key column
+    /// that isn't there, two columns of one name): the user's to fix, said
+    /// as it is, not as an engine failing.
+    input: bool,
 }
 
 impl Error {
@@ -31,6 +35,15 @@ impl Error {
             message: message.into(),
             unsupported: false,
             out_of_memory: false,
+            input: false,
+        }
+    }
+
+    /// The inputs or options are wrong. See [`Error::input`].
+    pub fn input(message: impl Into<String>) -> Self {
+        Error {
+            input: true,
+            ..Error::new(message)
         }
     }
 
@@ -40,6 +53,7 @@ impl Error {
             message: message.into(),
             unsupported: true,
             out_of_memory: false,
+            input: false,
         }
     }
 
@@ -49,6 +63,7 @@ impl Error {
             message: message.into(),
             unsupported: false,
             out_of_memory: true,
+            input: false,
         }
     }
 
@@ -62,10 +77,39 @@ impl Error {
         self.out_of_memory
     }
 
+    /// Whether the inputs or the options are what is wrong.
+    pub fn is_input(&self) -> bool {
+        self.input
+    }
+
+    /// `prefix` before the message, unless the inputs are what is wrong: "the
+    /// turbo engine failed: key column x is not in B" says an engine broke
+    /// when nothing did.
+    pub fn context_unless_input(self, prefix: impl fmt::Display) -> Self {
+        if self.input {
+            self
+        } else {
+            self.context(prefix)
+        }
+    }
+
     /// The same error with `prefix` before its message, and its kind kept.
     pub fn context(self, prefix: impl fmt::Display) -> Self {
         Error {
             message: format!("{prefix}{}", self.message),
+            ..self
+        }
+    }
+
+    /// The same error with every `from` in its message read as `to`, and its
+    /// kind kept: an engine names the file it read, which for standard input
+    /// or a decompressed copy is a temporary file the user never saw.
+    pub fn renamed(self, from: &str, to: &str) -> Self {
+        if from.is_empty() || from == to {
+            return self;
+        }
+        Error {
+            message: self.message.replace(from, to),
             ..self
         }
     }

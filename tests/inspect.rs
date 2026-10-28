@@ -188,6 +188,164 @@ fn a_bad_row_count_is_an_error() {
     assert!(stderr.contains("--rows must be a whole number"), "{stderr}");
 }
 
+/// A typo in an option used to take the file after it as its value and fail
+/// with "needs a value", or quietly do nothing.
+#[test]
+fn an_option_compara_does_not_have_is_named() {
+    let f = Fixture::new(10);
+    for (args, said) in [
+        (vec!["head", "--bogus"], "unknown option: --bogus"),
+        (
+            vec!["columns", "--delimeter", ";"],
+            "unknown option: --delimeter",
+        ),
+        (vec!["compare", "-x"], "unknown option: -x"),
+        (vec!["head", "--rows-max=3"], "unknown option: --rows-max"),
+    ] {
+        let (code, _, stderr) = run(&args, &f.path("a.csv"));
+        assert_eq!(code, 2, "{args:?}: {stderr}");
+        assert!(stderr.contains(said), "{args:?}: {stderr}");
+    }
+    let (code, _, stderr) = run(&["head", "-n", "3", "--delimiter=,"], &f.path("a.csv"));
+    assert_eq!(code, 0, "{stderr}");
+}
+
+/// A command compara doesn't have is named in one line with the ones it
+/// does, not followed by sixty lines of usage; a file given where the command
+/// goes gets the line that compares it.
+#[test]
+fn an_unknown_command_lists_the_commands() {
+    let out = Command::new(BIN).arg("diff").output().expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("unknown command \"diff\""), "{stderr}");
+    assert!(
+        stderr.contains("compare, columns, head, env and version"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    let out = Command::new(BIN)
+        .args(["a.csv", "b.csv"])
+        .output()
+        .expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("compara compare a.csv B -k KEY"),
+        "{stderr}"
+    );
+}
+
+/// Standard input and a compressed file are named as the user gave them,
+/// not as the temporary copy compara read; a forced delimiter that isn't in
+/// the header says so.
+#[test]
+fn inputs_are_named_as_given() {
+    use std::io::Write;
+    let f = Fixture::new(10);
+    let mut child = Command::new(BIN)
+        .args([
+            "compare",
+            "-",
+            f.path("a.csv").to_str().unwrap(),
+            "-k",
+            "id",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("runs");
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("standard input is empty"), "{stderr}");
+    assert!(!stderr.contains("compara-"), "a temporary path: {stderr}");
+
+    let gz = f.path("empty.csv.gz");
+    let mut enc = flate2::write::GzEncoder::new(
+        std::fs::File::create(&gz).unwrap(),
+        flate2::Compression::default(),
+    );
+    enc.write_all(b"").unwrap();
+    enc.finish().unwrap();
+    let (code, _, stderr) = run(&["columns"], &gz);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("empty.csv.gz is empty"), "{stderr}");
+
+    let (code, _, stderr) = run(&["head", "--delimiter", ";"], &f.path("a.csv"));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains("--delimiter ';' is not in"), "{stderr}");
+}
+
+/// `--fail-on-dups` names itself when it sets the exit code.
+#[test]
+fn exit_3_says_it_came_from_fail_on_dups() {
+    let f = Fixture::new(10);
+    let one = f.path("one.csv");
+    std::fs::write(&one, "id,name\n1,x\n").unwrap();
+    let dups = f.path("dups.csv");
+    std::fs::write(&dups, "id,name\n1,x\n1,y\n").unwrap();
+    let out = Command::new(BIN)
+        .args([
+            "compare",
+            one.to_str().unwrap(),
+            dups.to_str().unwrap(),
+            "-k",
+            "id",
+            "--fail-on-dups",
+        ])
+        .output()
+        .expect("runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(
+        stderr.contains("exit 3 (--fail-on-dups): duplicate keys, A 0, B 1"),
+        "{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("duplicate keys A 0, B 1"), "{stdout}");
+}
+
+/// An empty file and a binary one are said as what they are, by every
+/// command and engine. A binary file used to be read as a CSV with one
+/// strange column, and the error blamed the key.
+#[test]
+fn an_empty_or_binary_file_is_named_as_such() {
+    let f = Fixture::new(10);
+    let empty = f.path("empty.csv");
+    std::fs::write(&empty, b"").unwrap();
+    let binary = f.path("bad.bin");
+    // Bytes like a compressed or executable file's: control bytes throughout.
+    let bytes: Vec<u8> = (0..4000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    std::fs::write(&binary, bytes).unwrap();
+    let a = f.path("a.csv");
+    for (file, said) in [(&empty, "is empty"), (&binary, "binary data")] {
+        for engine in ["turbo", "native", "sortmerge"] {
+            let (code, _, stderr) = run(
+                &[
+                    "compare",
+                    a.to_str().unwrap(),
+                    "-k",
+                    "id",
+                    "--engine",
+                    engine,
+                ],
+                file,
+            );
+            assert_eq!(code, 2, "{engine}: {stderr}");
+            assert!(stderr.contains(said), "{engine}: {stderr}");
+            assert!(!stderr.contains("key column"), "{engine}: {stderr}");
+        }
+        for cmd in ["columns", "head"] {
+            let (code, stdout, stderr) = run(&[cmd], file);
+            assert_eq!(code, 2, "{cmd}: {stderr}");
+            assert!(stderr.contains(said), "{cmd}: {stderr}");
+            assert!(stdout.is_empty(), "{cmd} printed {stdout:?}");
+        }
+    }
+}
+
 #[test]
 fn both_commands_need_a_file() {
     let out = Command::new(BIN).arg("columns").output().expect("runs");

@@ -688,7 +688,7 @@ fn public_buckets_need_no_credentials_and_profiles_run_their_process() {
     ];
     let (code, err) = compare_bare("s3://bkt/t_a.csv", "s3://bkt/t_b.csv", &endpoint);
     assert_eq!(code, 2, "{err}");
-    assert!(err.contains("No usable credentials"), "{err}");
+    assert!(err.contains("no usable credentials"), "{err}");
 
     let home = f.0.join("home");
     std::fs::create_dir_all(home.join(".aws")).unwrap();

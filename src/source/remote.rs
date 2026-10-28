@@ -756,23 +756,55 @@ impl From<object_store::Error> for FetchError {
 }
 
 /// A store error, with what to do about the common one: no credentials.
+///
+/// That one is said first: the store's own message opens with its retry log
+/// for a metadata service the user never asked about (`Error performing PUT
+/// http://169.254.169.254/latest/api/token in 14.4s, after 10 retries, …`),
+/// and the advice used to come after two hundred characters of it.
 fn explain(e: &str) -> String {
     let lower = e.to_ascii_lowercase();
-    if let Some(trouble) = PROFILE_TROUBLE.get()
-        && (lower.contains("credential") || lower.contains("metadata"))
-    {
-        return format!("{e}. No usable credentials: {trouble}");
+    let credentials =
+        lower.contains("credential") || lower.contains("metadata") || lower.contains("token");
+    if !credentials {
+        return e.to_string();
     }
-    if lower.contains("credential") || lower.contains("metadata") || lower.contains("token") {
-        format!(
-            "{e}. No usable credentials: set the cloud's usual variables (AWS_ACCESS_KEY_ID and \
-             AWS_SECRET_ACCESS_KEY or AWS_PROFILE; GOOGLE_APPLICATION_CREDENTIALS; \
-             AZURE_STORAGE_ACCOUNT_KEY or AZURE_STORAGE_SAS_KEY), run where a role is attached, \
-             or for a public bucket set AWS_SKIP_SIGNATURE=true"
-        )
-    } else {
-        e.to_string()
+    let advice = match PROFILE_TROUBLE.get() {
+        Some(trouble) if lower.contains("credential") || lower.contains("metadata") => {
+            trouble.to_string()
+        }
+        _ => "set the cloud's usual variables (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY or \
+              AWS_PROFILE; GOOGLE_APPLICATION_CREDENTIALS; AZURE_STORAGE_ACCOUNT_KEY or \
+              AZURE_STORAGE_SAS_KEY), run where a role is attached, or for a public bucket set \
+              AWS_SKIP_SIGNATURE=true"
+            .to_string(),
+    };
+    format!("{NO_CREDENTIALS}: {advice} (the store said: {})", brief(e))
+}
+
+/// How [`explain`] opens a missing-credentials error, and how
+/// [`no_credentials`] knows one.
+const NO_CREDENTIALS: &str = "no usable credentials";
+
+/// The first sentence of a library's message, at most 160 characters: enough
+/// to search for, without its retry bookkeeping.
+fn brief(e: &str) -> String {
+    // Cut where the retry bookkeeping starts: ` in 14.4s`, `, after 10
+    // retries`, ` - HTTP error: …`.
+    let timed = e
+        .match_indices(" in ")
+        .find(|(at, _)| e[at + 4..].starts_with(|c: char| c.is_ascii_digit()))
+        .map(|(at, _)| at);
+    let end = [e.find(", after "), e.find(" - "), timed]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(e.len());
+    let first = e[..end].trim();
+    let mut out: String = first.chars().take(160).collect();
+    if out.len() < first.len() {
+        out.push('…');
     }
+    out
 }
 
 /// The object's size and its last [`TAIL`] bytes (all of it, if smaller). A
@@ -1242,7 +1274,14 @@ impl reqwest::dns::Resolve for NoMetadata {
     }
 }
 
-/// An HTTP error with what caused it (a refused redirect says why only there).
+/// An HTTP error in plain words, with what caused it (a refused redirect
+/// says why only there).
+///
+/// The client's own text repeats the URL the caller already names (`error
+/// sending request for url (…)`), wraps the cause in its layers (`client error
+/// (Connect): tcp connect error: …`) and ends in an OS error number. A
+/// connection that failed says which way it failed instead, and that a proxy
+/// is set when one is: through a dead proxy every host looks unreachable.
 fn said(e: &reqwest::Error) -> String {
     let mut text = e.to_string();
     let mut cause = std::error::Error::source(e);
@@ -1253,7 +1292,51 @@ fn said(e: &reqwest::Error) -> String {
         }
         cause = c.source();
     }
-    text
+    let lower = text.to_ascii_lowercase();
+    let why = if [
+        "dns error",
+        "failed to lookup",
+        "name or service not known",
+        "nodename nor servname",
+        "no such host",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
+    {
+        Some("the host name does not resolve")
+    } else if lower.contains("connection refused") {
+        Some("connection refused (nothing answers on that port)")
+    } else if e.is_connect() && (e.is_timeout() || lower.contains("timed out")) {
+        Some("no answer within 30 s")
+    } else if e.is_connect() && (lower.contains("certificate") || lower.contains("tls")) {
+        Some("the TLS handshake failed (a certificate this system doesn't trust?)")
+    } else {
+        None
+    };
+    let proxy = proxy_from_env()
+        .map(|p| format!(" (a proxy is set: {p})"))
+        .unwrap_or_default();
+    match why {
+        Some(why) => format!("cannot connect: {why}{proxy}"),
+        None => plain(&text),
+    }
+}
+
+/// `text` without the URL the caller already names and the OS error number.
+fn plain(text: &str) -> String {
+    let mut out = text.to_string();
+    if let Some(at) = out.find(" for url (")
+        && let Some(len) = out[at..].find(')')
+    {
+        out.replace_range(at..at + len + 1, "");
+    }
+    while let Some(at) = out.find(" (os error ") {
+        let Some(len) = out[at..].find(')') else {
+            break;
+        };
+        out.replace_range(at..at + len + 1, "");
+    }
+    out
 }
 
 fn http_client() -> Result<reqwest::Client> {
@@ -1336,7 +1419,7 @@ async fn store_for(spec: &str, url: &url::Url) -> Result<Reader> {
 /// Whether a store error is the absence of credentials, the one an unsigned
 /// request to a public bucket gets past.
 fn no_credentials(message: &str) -> bool {
-    message.contains("No usable credentials")
+    message.contains(NO_CREDENTIALS)
 }
 
 /// A store as [`store_for`] builds it, or with `signed` false one that sends
@@ -1693,6 +1776,22 @@ fn ini_section(text: &str, name: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_errors_lose_the_url_twice_and_the_os_error_number() {
+        let raw = "error sending request for url (http://h:1/x.csv): client error (Connect): \
+                   tcp connect error: Broken pipe (os error 32)";
+        assert_eq!(
+            plain(raw),
+            "error sending request: client error (Connect): tcp connect error: Broken pipe"
+        );
+        let log = "Generic S3 error: Error performing PUT http://169.254.169.254/latest/api/token in 14.4s, \
+                   after 10 retries, max_retries: 10, retry_timeout: 180s - HTTP error: error sending request";
+        let said = explain(log);
+        assert!(said.starts_with("no usable credentials: "), "{said}");
+        assert!(!said.contains("max_retries"), "{said}");
+        assert!(no_credentials(&said));
+    }
 
     #[test]
     fn metadata_addresses_are_link_local_ones() {

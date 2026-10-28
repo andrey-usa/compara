@@ -24,13 +24,13 @@ const USAGE: &str = "\
 usage: compara <command> [options]
 
 commands:
-  compare A B     Compare two tables on a composite key: print the counts, and with -o
-                  write an HTML report
+  compare A B     Compare two tables on a composite key and print the counts;
+                  with -o, also write an HTML report
   columns FILE    Print one file's column names, one per line
   head FILE       Print the first rows of one file (default 10)
   version         Print the version (also --version)
-  env             Print what this process sees: CPUs, memory and its limits, the
-                  temporary directory, and whether URLs can be read
+  env             Print what this process sees: CPUs, memory and its limits,
+                  the temporary directory, and whether URLs can be read
 
 A, B and FILE are paths, `-` for standard input, or with cloud support s3://,
 gs://, az:// and https:// URLs. Gzip and zstd files are read as what they hold.
@@ -42,7 +42,7 @@ at its latest version, or at TABLE@vN (s3://lake/orders@v41).
 
 columns and head read CSV, newline-delimited JSON and Parquet, and neither reads
 more of the file than it has to: `columns` on Parquet reads the footer, and
-`head` stops at the first page. Both take --delimiter and --encoding.
+`head` stops at the first page. Both take --delimiter.
 
 head options:
   -n, --rows N            Rows to show (default 10)
@@ -50,38 +50,51 @@ head options:
 
 compare options:
   -k, --key COLS          Comma-separated key column(s) (or from --profile)
-  -c, --compare COLS      Columns to compare (default: all common non-key columns)
+  -c, --compare COLS      Columns to compare (default: every common non-key
+                          column)
   -i, --ignore COLS       Columns to skip
   -p, --profile NAME      Profile name from compara.toml
       --config PATH       Path to compara.toml
       --trim              Strip whitespace before comparing
-      --ignore-case
-      --empty-is-null     Treat empty string and null as equal
+      --ignore-case       Compare text without regard to case
+      --empty-is-null     Treat an empty string and null as equal
       --tolerance N       Absolute numeric tolerance
-      --max-rows N        Rows embedded per section (default 50000)
-      --delimiter D       Force delimiter (default: auto)
-      --encoding ENC
-      --engine E          auto | turbo | sortmerge | native
-      --threads N
-      --memory SIZE       Memory to plan for, e.g. 8G (default: what the machine or
-                          container has free); decides when large text files are
-                          joined in one pass instead of two, and how many columns of
-                          two Parquet files are read at once; Parquet that needs
-                          more than SIZE one column at a time is refused
-      --export-dir DIR    Write full changed/added/removed CSVs here (a directory, or a
-                          URL prefix such as s3://bucket/run-42/)
-  -o, --out PATH          Write the HTML report here, a path or a URL (no report without it)
-      --json PATH         Write a JSON summary (counts + column stats) here, a path or a
-                          URL; `-` prints it, and the counts line goes to stderr
-      --no-compress       Report: embed plain JSON instead of gzip (older browsers)
-      --summary           Print the counts and write nothing, and refuse any flag that would
-                          (the default without -o, --json or --export-dir)
+      --max-rows N        Rows embedded per report section (default 50000)
+      --delimiter D       Force the delimiter (default: detected)
+      --encoding ENC      UTF-8 (the default) is read as text; Latin-1 or a
+                          Windows code page compares as bytes (right counts);
+                          UTF-16 is refused
+      --engine E          auto (default) picks one: turbo, in memory and the
+                          fastest; sortmerge, which sorts on disk for files
+                          larger than memory; native, the simple baseline.
+                          sortmerge and native read CSV only
+      --threads N         Threads to use (default: every core, or the
+                          container's CPU quota)
+      --memory SIZE       Memory to plan for, e.g. 8G (default: what the
+                          machine or container has free); decides when large
+                          text files are joined in one pass instead of two,
+                          and how many columns of two Parquet files are read
+                          at once; Parquet that needs more than SIZE one
+                          column at a time is refused
+      --export-dir DIR    Write full changed, added and removed CSVs here (a
+                          directory, or a URL prefix such as s3://bucket/run/)
+  -o, --out PATH          Write the HTML report here, a path or a URL (no
+                          report without it)
+      --json PATH         Write a JSON summary (counts and column statistics)
+                          here, a path or a URL; `-` prints it, and the counts
+                          line goes to stderr
+      --no-compress       Report: embed plain JSON instead of gzip (for older
+                          browsers)
+      --summary           Print the counts, write nothing, and refuse any flag
+                          that would (the default without -o, --json or
+                          --export-dir)
       --fail-on-dups      Exit 3 when either file has duplicate keys
-      --exit-zero         Exit 0 when the tables differ: for a scheduled job whose
-                          output is the report, where a difference is not a failure
-                          (a Kubernetes Job, an Airflow task)
+      --exit-zero         Exit 0 when the tables differ: for a scheduled job
+                          whose output is the report, where a difference is
+                          not a failure (a Kubernetes Job, an Airflow task)
 
-Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (with --fail-on-dups).
+Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (with
+--fail-on-dups).
 ";
 
 /// Replaces the panic hook with one that cannot hang.
@@ -209,7 +222,17 @@ fn run(args: &[String]) -> u8 {
             }
         },
         other => {
-            eprint!("error: unknown command: {other}\n\n{USAGE}");
+            // The one line that matters, not 60 lines of usage it scrolls
+            // away under.
+            let hint = if std::path::Path::new(other).exists() || other.contains('.') {
+                format!(" (to compare files: compara compare {other} B -k KEY)")
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "error: unknown command {other:?}{hint}; the commands are compare, columns, \
+                 head, env and version (compara --help)"
+            );
             2
         }
     }
@@ -240,6 +263,34 @@ const FLAGS: [&str; 10] = [
     "h",
 ];
 
+/// The options that take a value, long and short. A name in neither list is
+/// a typo or an option compara doesn't have, and is refused by name rather
+/// than taking the token after it as its value.
+const VALUED: [&str; 22] = [
+    "key",
+    "k",
+    "compare",
+    "c",
+    "ignore",
+    "i",
+    "profile",
+    "p",
+    "config",
+    "tolerance",
+    "max-rows",
+    "threads",
+    "memory",
+    "delimiter",
+    "encoding",
+    "engine",
+    "export-dir",
+    "out",
+    "o",
+    "json",
+    "rows",
+    "n",
+];
+
 impl Args {
     fn parse(argv: &[String]) -> Result<Self> {
         let mut values = Vec::new();
@@ -256,6 +307,13 @@ impl Args {
                 positional.push(token.clone());
                 i += 1;
                 continue;
+            }
+            let name = rest.split_once('=').map_or(rest, |(n, _)| n);
+            if !FLAGS.contains(&name) && !VALUED.contains(&name) {
+                return Err(Error::new(format!(
+                    "unknown option: {}{name} (compara --help lists them)",
+                    if token.starts_with("--") { "--" } else { "-" }
+                )));
             }
             match rest.split_once('=') {
                 Some((name, value)) => values.push((name.to_string(), Some(value.to_string()))),
@@ -427,13 +485,16 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
         (a, b)
     });
     let (a, b) = (a?, b?);
+    for source in [&a, &b] {
+        delimiter_note(source, &opt);
+    }
     for (side, source) in [("A", &a), ("B", &b)] {
         for step in source.steps() {
             eprintln!("{side} {}: {step}", source.spec());
         }
     }
 
-    let mut result = compare(a.path(), b.path(), &mut opt)?;
+    let mut result = compare(a.path(), b.path(), &mut opt).map_err(|e| as_given(e, &[&a, &b]))?;
     for (meta, source) in [(&mut result.meta.a, &a), (&mut result.meta.b, &b)] {
         if source.path() != Path::new(source.spec()) {
             meta.name = source.name();
@@ -477,10 +538,10 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
 
     let c = &result.counts;
     let line = format!(
-        "A {} rows | B {} rows | matched {} (changed {}) | added {} | removed {} | \
-         dup keys A {} B {} | {} {}s",
-        comma(c.a_rows),
-        comma(c.b_rows),
+        "A {} | B {} | matched {} (changed {}) | added {} | removed {} | \
+         duplicate keys A {}, B {} | engine {}, {}s",
+        rows(c.a_rows),
+        rows(c.b_rows),
         comma(c.matched),
         comma(c.changed),
         comma(c.added),
@@ -502,6 +563,12 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     }
 
     if args.flag("fail-on-dups") && (c.a_dup_keys > 0 || c.b_dup_keys > 0) {
+        // Exit 3 says nothing on its own: name the option that chose it.
+        eprintln!(
+            "exit 3 (--fail-on-dups): duplicate keys, A {}, B {}",
+            comma(c.a_dup_keys),
+            comma(c.b_dup_keys)
+        );
         return Ok(3);
     }
     let code = if result.identical() || args.flag("exit-zero") {
@@ -589,6 +656,28 @@ fn print_env() {
 }
 
 /// Groups a count with thousands separators, matching the other implementations.
+/// `e` with each input's temporary copy named as the user gave it:
+/// `standard input` for `-`, else the file or URL (`eg.gz`), so a message
+/// about an empty or binary input points at something they can find.
+fn as_given(e: Error, sources: &[&Source]) -> Error {
+    sources.iter().fold(e, |e, s| {
+        if s.path() == Path::new(s.spec()) {
+            return e;
+        }
+        let name = if s.spec() == "-" {
+            "standard input".to_string()
+        } else {
+            s.spec().to_string()
+        };
+        e.renamed(&s.path().display().to_string(), &name)
+    })
+}
+
+/// `n rows`, or `1 row`.
+fn rows(n: i64) -> String {
+    format!("{} {}", comma(n), if n == 1 { "row" } else { "rows" })
+}
+
 fn comma(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
@@ -643,10 +732,12 @@ fn cmd_columns(argv: &[String]) -> Result<u8> {
         return Err(Error::new("columns needs a file: compara columns data.csv"));
     };
     let mut opt = Options::default();
-    apply_read_options(&args, &mut opt);
+    apply_read_options(&args, &mut opt)?;
 
     let source = Source::open(first, &Want::footer_only())?;
-    let shape = compara::engine::turbo::shape(source.path(), &opt)?;
+    delimiter_note(&source, &opt);
+    let shape =
+        compara::engine::turbo::shape(source.path(), &opt).map_err(|e| as_given(e, &[&source]))?;
     for name in &shape.columns {
         println!("{name}");
     }
@@ -685,10 +776,12 @@ fn cmd_head(argv: &[String]) -> Result<u8> {
         None => 10,
     };
     let mut opt = Options::default();
-    apply_read_options(&args, &mut opt);
+    apply_read_options(&args, &mut opt)?;
 
     let source = Source::open(first, &Want::all())?;
-    let (columns, rows) = compara::engine::turbo::head(source.path(), want, &opt)?;
+    delimiter_note(&source, &opt);
+    let (columns, rows) = compara::engine::turbo::head(source.path(), want, &opt)
+        .map_err(|e| as_given(e, &[&source]))?;
     if args.flag("csv") {
         println!("{}", csv_line(&columns));
         for row in &rows {
@@ -700,14 +793,60 @@ fn cmd_head(argv: &[String]) -> Result<u8> {
     Ok(0)
 }
 
-/// The two flags that change how a file is *read* rather than compared.
-fn apply_read_options(args: &Args, opt: &mut Options) {
+/// The two flags that change how a file is *read* rather than compared;
+/// `--encoding` is checked as `compare` checks it.
+fn apply_read_options(args: &Args, opt: &mut Options) -> Result<()> {
     if let Some(v) = args.get("delimiter", None) {
         opt.delimiter = v.chars().next();
     }
     if let Some(v) = args.get("encoding", None) {
         opt.encoding = v.to_string();
+        if let Some(note) = compara::options::encoding_note(v)? {
+            eprintln!("note: {note}");
+        }
     }
+    Ok(())
+}
+
+/// A note when `--delimiter` isn't in a text file's header: every row then
+/// reads as one column, and nothing else would say why.
+fn delimiter_note(source: &Source, opt: &Options) {
+    use std::io::Read;
+    let Some(d) = opt.delimiter else { return };
+    let mut head = Vec::with_capacity(4096);
+    let Ok(file) = fs::File::open(source.path()) else {
+        return;
+    };
+    if file.take(64 * 1024).read_to_end(&mut head).is_err() {
+        return;
+    }
+    let line = head.split(|&b| b == b'\n').next().unwrap_or_default();
+    let text = String::from_utf8_lossy(line);
+    let lead = text.trim_start_matches('\u{feff}').trim_start();
+    if lead.is_empty()
+        || head.starts_with(b"PAR1")
+        || lead.starts_with(['{', '['])
+        || text.contains(d)
+    {
+        return;
+    }
+    let seen = [',', '\t', ';', '|']
+        .into_iter()
+        .map(|c| (text.matches(c).count(), c))
+        .max()
+        .filter(|(n, _)| *n > 0);
+    let has = match seen {
+        Some((_, c)) => format!("; its header has {c:?} (leave --delimiter out to detect it)"),
+        None => String::new(),
+    };
+    let name = if source.spec() == "-" {
+        "standard input"
+    } else {
+        source.spec()
+    };
+    eprintln!(
+        "note: --delimiter {d:?} is not in {name}'s header, so each row reads as one column{has}"
+    );
 }
 
 /// One CSV line, quoting only what has to be quoted.
