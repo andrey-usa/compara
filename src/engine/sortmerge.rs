@@ -321,9 +321,53 @@ fn stream_into(
 /// is what makes first-occurrence-wins mean the same thing here as in every
 /// other engine.
 fn sorted_order(batch: &Packed, key_size: usize) -> Vec<u32> {
-    let mut order: Vec<u32> = (0..batch.len() as u32).collect();
-    order.sort_by(|&x, &y| batch.key_order(x as usize, batch, y as usize, key_size));
-    order
+    let n = batch.len();
+    if key_size == 0 || n < 2 {
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_by(|&x, &y| batch.key_order(x as usize, batch, y as usize, key_size));
+        return order;
+    }
+    // The first key cell's bytes after what every row in the batch shares
+    // (ids that all begin `ACC-0000`), eight of them, as a big-endian number:
+    // comparing two is one instruction and reads nothing from the batch's text,
+    // which is where a sort on 144 thousand rows spends its time (a cache miss
+    // for each cell of each comparison). A tie, or an absent cell, is settled by
+    // the full comparison, so the order is the one `key_order` gives and, the
+    // sort being stable, equal keys keep file order.
+    let mut shared = usize::MAX;
+    let first = (0..n).find_map(|r| batch.cell_bytes(r, 0));
+    if let Some(first) = first {
+        for r in 0..n {
+            if let Some(c) = batch.cell_bytes(r, 0) {
+                let l = first.iter().zip(c).take_while(|(x, y)| x == y).count();
+                shared = shared.min(l);
+                if shared == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    let shared = if shared == usize::MAX { 0 } else { shared };
+    let mut rows: Vec<(u64, u32)> = (0..n as u32)
+        .map(|r| {
+            let prefix = match batch.cell_bytes(r as usize, 0) {
+                None => u64::MAX,
+                Some(c) => {
+                    let mut word = [0u8; 8];
+                    let rest = c.get(shared..).unwrap_or(&[]);
+                    let k = rest.len().min(8);
+                    word[..k].copy_from_slice(&rest[..k]);
+                    u64::from_be_bytes(word)
+                }
+            };
+            (prefix, r)
+        })
+        .collect();
+    rows.sort_by(|x, y| {
+        x.0.cmp(&y.0)
+            .then_with(|| batch.key_order(x.1 as usize, batch, y.1 as usize, key_size))
+    });
+    rows.into_iter().map(|(_, r)| r).collect()
 }
 
 /// One file, sorted: the runs spilled to disk, or the one batch it took and
@@ -953,4 +997,55 @@ impl Dups {
 /// The sort-merge engine has no optional dependency.
 pub fn available() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the sort did before the prefix: every comparison on the cells.
+    fn reference(batch: &Packed, key_size: usize) -> Vec<u32> {
+        let mut order: Vec<u32> = (0..batch.len() as u32).collect();
+        order.sort_by(|&x, &y| batch.key_order(x as usize, batch, y as usize, key_size));
+        order
+    }
+
+    #[test]
+    fn the_prefix_sort_gives_the_order_the_cells_give() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Cells that share a lead, are shorter or longer than eight bytes past
+        // it, hold a NUL or a high byte, repeat, or are absent.
+        let pool: Vec<Option<String>> = {
+            let mut v: Vec<Option<String>> = vec![None, Some(String::new())];
+            for lead in ["", "ACC-0000", "ACC-0000"] {
+                for tail in ["", "a", "ab", "ab\0", "ab\0c", "12345678", "123456789", "12345678z", "\u{ff}\u{ff}", "z"] {
+                    v.push(Some(format!("{lead}{tail}")));
+                }
+            }
+            v
+        };
+        for key_size in 1..=3usize {
+            for round in 0..40 {
+                let n = 2 + (next() % 300) as usize;
+                let mut batch = Packed::new(key_size + 1);
+                for r in 0..n {
+                    let mut cells: Vec<Option<String>> = Vec::new();
+                    for _ in 0..key_size {
+                        // Some rounds draw from one lead only, so the shared part is long.
+                        let pick = if round % 3 == 0 { 2 + (next() % 10) as usize } else { (next() % pool.len() as u64) as usize };
+                        cells.push(pool[pick].clone());
+                    }
+                    cells.push(Some(r.to_string()));
+                    batch.push(cells.iter().map(|c| c.as_deref())).unwrap();
+                }
+                assert_eq!(sorted_order(&batch, key_size), reference(&batch, key_size), "key_size {key_size} round {round}");
+            }
+        }
+    }
 }
