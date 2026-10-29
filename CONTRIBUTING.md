@@ -57,6 +57,25 @@ measured honestly, records generation time, wall time, throughput, report
 size and counts, and fails when a scale exceeds its budget. Compare numbers
 from one machine and one sitting only.
 
+### The performance gate
+
+Every pull request counts the instructions `compare` takes, for each engine,
+on 50k and 200k generated rows a side, at its head and at its base:
+
+```sh
+python3 scripts/perf_gate.py --head target/release/compara --base /path/to/base/compara \
+  --small 50k_a.csv 50k_b.csv --large 200k_a.csv 200k_b.csv -- -k account_id,txn_id -i updated_at
+```
+
+It fails when an engine's count rises more than 5% over the base's, or when
+four times the rows cost more than 5.5 times the instructions (linear and
+n log n work sits at 4.0-4.2, quadratic at 16). A count repeats to a few
+hundredths of a percent where a time on a shared runner varies by two or
+three times, so the bounds can be tight. `scripts/icount.py` counts one
+command: with the processor's counter where the kernel offers one, else with
+valgrind (exact, about 25 times slower); compare counts from one counter only.
+A change that is meant to cost more says so in its description.
+
 ### Diagnostics
 
 | variable | effect |
