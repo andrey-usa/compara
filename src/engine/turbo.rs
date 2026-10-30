@@ -558,7 +558,7 @@ fn prefetch_slot(part: &[u32], slot: usize) {
 /// into the room `out` already has for all of them, and releasing each as soon
 /// as it is copied. Errs, `out` untouched, if that room is short or a copy
 /// cannot finish.
-fn append_in_parallel(out: &mut Vec<u64>, parts: Vec<Vec<u64>>) -> Result<()> {
+fn append_in_parallel<T: Copy + Send>(out: &mut Vec<T>, parts: Vec<Vec<T>>) -> Result<()> {
     let adding: usize = parts.iter().map(Vec::len).sum();
     if out.capacity() - out.len() < adding {
         return Err(Error::new("no room to join the sweep's chunks"));
@@ -637,14 +637,21 @@ const EMPTY_SLOT: u32 = 0;
 /// One chunk's rows, in the order they appear in it.
 struct Chunk {
     at: Vec<u64>,
-    hash: Vec<u64>,
+    // The key hash folded to 32 bits (high half XOR low half): the tag is
+    // taken from the top bits and hash equality is only ever a filter --
+    // the byte proof or the key comparison behind it decides -- so the
+    // low half on its own buys nothing. Folding, rather than keeping the
+    // high half, keeps the slot function below identical to the 64-bit
+    // build's: the slot was the folded hash masked, and the fold is the
+    // stored value now.
+    hash: Vec<u32>,
 }
 
 impl Chunk {
     /// Pushes a row's offset and hash with a single capacity check, instead of
     /// two separate fallible pushes. The sweep does this for every row, so the
     /// doubled branch and `Result` handling was measurable.
-    fn push(&mut self, at: u64, hash: u64) -> Result<()> {
+    fn push(&mut self, at: u64, hash: u32) -> Result<()> {
         if self.at.len() == self.at.capacity() {
             alloc::room(&mut self.at, 1, "one offset per row")?;
             alloc::room(&mut self.hash, 1, "one hash per row")?;
@@ -662,7 +669,8 @@ impl Chunk {
 /// by comparing the key bytes, so the hash only has to be fast and spread.
 struct RowIndex {
     row_at: Vec<u64>,
-    row_hash: Vec<u64>,
+    // One stored hash per row: the full hash folded to 32 bits (see `Chunk`).
+    row_hash: Vec<u32>,
     table: Vec<u32>,
     /// Low bits of a slot holding `first_row` positions plus one; the high
     /// bits hold the top of the key's hash as a tag. Chosen from the row count
@@ -697,23 +705,27 @@ impl RowIndex {
     /// Packs a slot: the top `32 - pos_bits` bits of the hash above the
     /// position plus one. Zero tag bits (past two billion rows) degrades to
     /// no tag rather than a wrong answer.
-    fn slot_for(&self, hash: u64, pos: usize) -> u32 {
+    fn slot_for(&self, hash: u32, pos: usize) -> u32 {
         let pos = pos as u32 + 1;
         let tag_bits = 32 - self.pos_bits;
         if tag_bits == 0 {
             pos
         } else {
-            (((hash >> (64 - tag_bits)) as u32) << self.pos_bits) | pos
+            // The tag is the stored hash's top `tag_bits` bits: `32 -
+            // tag_bits` is `pos_bits`. The folded hash's top bits mix the
+            // full hash's top bits with its middle bits, so the tag still
+            // rejects the same share of collisions.
+            ((hash >> self.pos_bits) << self.pos_bits) | pos
         }
     }
 
     /// Whether the slot's tag matches the hash's top bits.
-    fn tag_is(&self, word: u32, hash: u64) -> bool {
+    fn tag_is(&self, word: u32, hash: u32) -> bool {
         let tag_bits = 32 - self.pos_bits;
         if tag_bits == 0 {
             return true;
         }
-        (word >> self.pos_bits) == (hash >> (64 - tag_bits)) as u32
+        (word >> self.pos_bits) == (hash >> self.pos_bits)
     }
 
     /// The `first_row` position a non-empty slot holds.
@@ -819,7 +831,7 @@ impl RowIndex {
         // The rest are copied in, each by a thread of its own and released
         // as soon as it has been: at 150M rows that is 1.8 GB, which on one
         // thread was a second or more of every index's build.
-        let (ats, hashes): (Vec<Vec<u64>>, Vec<Vec<u64>>) =
+        let (ats, hashes): (Vec<Vec<u64>>, Vec<Vec<u32>>) =
             chunks.drain(..).skip(1).map(|c| (c.at, c.hash)).unzip();
         append_in_parallel(&mut row_at, ats)?;
         append_in_parallel(&mut row_hash, hashes)?;
@@ -1231,9 +1243,9 @@ impl RowIndex {
             }
         }
 
-        // Equal 64-bit hashes over different keys: never seen, but possible,
-        // and then the serial insertion, which proves each match before it
-        // takes it, has the answer.
+        // Equal stored hashes over different keys: common now that the
+        // stored hash is 32 bits, and then the serial insertion, which
+        // proves each match before it takes it, has the answer.
         for &(row, candidate) in &matched {
             side.keys_at(self.row_at[row], key_size, &mut mine);
             side.keys_at(self.row_at[candidate], key_size, &mut probe);
@@ -1263,9 +1275,11 @@ impl RowIndex {
         side.keys_at(self.row_at[row as usize], key_size, out);
     }
 
-    fn slot(&self, hash: u64) -> usize {
-        // The high bits of an FNV hash are the well-mixed ones; fold them down.
-        ((hash ^ (hash >> 32)) as usize) & self.mask
+    fn slot(&self, hash: u32) -> usize {
+        // The stored hash is already the folded hash the 64-bit build
+        // masked here, so the slot -- and the whole probe order -- is
+        // unchanged by the narrowing.
+        (hash as usize) & self.mask
     }
 
     /// The slot a probe tries after `slot`: the next one, wrapping at the end
@@ -1283,7 +1297,7 @@ impl RowIndex {
     /// before it was issued. Asking for the line `PREFETCH_AHEAD` rows early
     /// turns that serial chain of misses into overlapping ones.
     #[inline]
-    fn prefetch(&self, hash: u64) {
+    fn prefetch(&self, hash: u32) {
         #[cfg(target_arch = "x86_64")]
         // Safety: `slot` masks into the table's length, so the pointer is in
         // bounds, and a prefetch has no architectural effect in any case.
@@ -1330,7 +1344,7 @@ impl RowIndex {
         side: &Side,
         other: &Slab,
         fields: Option<&[Field]>,
-        hash: u64,
+        hash: u32,
         key_size: usize,
         opt: &Options,
         span: Option<Proof<'_>>,
@@ -1487,8 +1501,8 @@ impl RowSink<'_> {
         j: usize,
         from: u64,
         end: u64,
-        hash: u64,
-        next_hash: Option<u64>,
+        hash: u32,
+        next_hash: Option<u32>,
     ) {
         if let Some(next) = next_hash {
             self.ctx.bi.prefetch(next);
@@ -1742,7 +1756,10 @@ fn sweep_chunks(
                     Some(Some(h)) => h,
                     _ => key_hash(&side.slab, &fields, key_size, opt),
                 };
-            chunk.push(pos as u64, hash)?;
+            // Folded here, once, at the sweep: every later use -- the
+            // tag, the slot, the equality filter -- reads the stored
+            // value, so a stored hash is always the same 32 bits.
+            chunk.push(pos as u64, (hash ^ (hash >> 32)) as u32)?;
             // The row before this one ends where this one starts, and its
             // pages are still hot: the fused join takes it now, rather than
             // re-reading it after the sweep.
@@ -1797,9 +1814,12 @@ fn sweep_columnar(
         for row in lo..hi {
             side.fields_at(row as u64, &mut fields);
             chunk.at.push(row as u64);
-            chunk
-                .hash
-                .push(key_hash(&side.slab, &fields, key_size, opt));
+            // Same fold as the text sweep: the stored hash is the full
+            // hash's high half XOR its low half.
+            chunk.hash.push({
+                let h = key_hash(&side.slab, &fields, key_size, opt);
+                (h ^ (h >> 32)) as u32
+            });
         }
         Ok(chunk)
     });
@@ -2257,7 +2277,7 @@ fn join_row(
     row: i32,
     from: usize,
     end: usize,
-    hash: u64,
+    hash: u32,
     k: usize,
     seen: &[AtomicU64],
 ) {
@@ -3451,7 +3471,7 @@ fn compare_fused(
     // sweep cannot start until B's index is whole. So the reads A's sweep will
     // begin with are started then, by a thread that only asks for them.
     let stop = AtomicBool::new(false);
-    let (bi, _) = std::thread::scope(|scope| {
+    let (mut bi, _) = std::thread::scope(|scope| {
         let (go, wait) = std::sync::mpsc::channel::<usize>();
         let (a, stop) = (&a, &stop);
         scope.spawn(move || {
@@ -3468,7 +3488,7 @@ fn compare_fused(
         stop.store(true, Ordering::Relaxed);
         built
     })?;
-    let fused = fused_join(&a, &b, &bi, opt, nc, total)?;
+    let mut fused = fused_join(&a, &b, &bi, opt, nc, total)?;
 
     let mut phases = Phases::new("");
     let joined = if exporting {
@@ -3551,6 +3571,10 @@ fn compare_fused(
         (empty_section(opt), empty_section(opt))
     };
     phases.mark("duplicate sections");
+    // As in the classic path: `occurrences` is read only by the duplicate
+    // sections, so both arrays go before the report is assembled.
+    drop(std::mem::take(&mut fused.ai.occurrences));
+    drop(std::mem::take(&mut bi.occurrences));
     let meta = resolved.meta(&opt.key, a_cols, b_cols);
     let out = assemble(meta, joined, dup_a, dup_b, opt, &resolved.compared);
     phases.mark("assemble");
@@ -3821,8 +3845,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             .unwrap_or_else(|_| Err(Error::new("a file reader panicked")));
         (mine, theirs)
     });
-    let (a, ai) = from_a?;
-    let (b, bi) = from_b?;
+    let (a, mut ai) = from_a?;
+    let (b, mut bi) = from_b?;
     let mut phases = Phases::new("");
 
     // Both sections are empty when the caller asked for no rows: the duplicate
@@ -3837,6 +3861,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         (empty_section(opt), empty_section(opt))
     };
     phases.mark("duplicate sections");
+    // `occurrences` is read only by the duplicate sections above: the join
+    // counts distinct keys from `first_row.len()`, so both arrays go now
+    // rather than riding through the join and the report.
+    drop(std::mem::take(&mut ai.occurrences));
+    drop(std::mem::take(&mut bi.occurrences));
     let joined = join(
         &a,
         &ai,
