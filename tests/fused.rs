@@ -633,9 +633,13 @@ fn parallel_insert_off_switch_forces_serial_index_insert() {
         code_on == 0 || code_on == 1,
         "parallel insert run failed: {err_on}"
     );
+    // The parallel insertion gives way to the serial one when two keys share a
+    // stored hash (32 bits, keyed per run), so it is either kept or abandoned;
+    // the switch is what decides that it is tried at all.
     assert!(
-        err_on.contains("index insert (parallel)"),
-        "COMPARA_PARALLEL_INSERT=1 did not take parallel index insert:\n{err_on}"
+        err_on.contains("index insert (parallel)")
+            || err_on.contains("index insert (parallel, abandoned)"),
+        "COMPARA_PARALLEL_INSERT=1 did not try parallel index insert:\n{err_on}"
     );
 
     let (code_off, out_off, err_off) = run_with(
@@ -645,7 +649,7 @@ fn parallel_insert_off_switch_forces_serial_index_insert() {
     );
     assert_eq!(code_off, code_on, "serial insert run failed: {err_off}");
     assert!(
-        err_off.contains("index insert (serial)"),
+        err_off.contains("index insert (serial)") && !err_off.contains("index insert (parallel"),
         "COMPARA_PARALLEL_INSERT=0 did not take serial index insert:\n{err_off}"
     );
     assert_eq!(counts(&out_on), counts(&out_off));
