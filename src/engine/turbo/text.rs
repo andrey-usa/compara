@@ -10,9 +10,11 @@
 //! the JSON the same pipeline emits, and the key order on each side is free to
 //! differ, because the JSON reader joins by name.
 
+#[cfg(target_arch = "x86_64")]
+use super::field::Wide512;
 use super::field::{
-    ABSENT, Delims, Field, STEP, Scan, Swar, Wide, next_of1_with, next_of2, next_of2_with,
-    next_of3_with, pack, skip_quoted, skip_quoted_with,
+    ABSENT, Delims, Field, Scan, Swar, Wide, next_of1_with, next_of2, next_of2_with, next_of3_with,
+    pack, skip_quoted, skip_quoted_with,
 };
 use super::slab::{Dialect, Slab, text_of};
 use crate::error::{Error, Result};
@@ -384,12 +386,12 @@ fn guard_span_counted<S: Scan>(
         if at >= hi {
             return Some(None);
         }
-        if at + STEP > data.len() {
+        if at + S::STEP > data.len() {
             return None;
         }
         let room = hi - at;
-        let valid = if room >= STEP {
-            u64::MAX >> (64 - STEP)
+        let valid = if room >= S::STEP {
+            u64::MAX >> (64 - S::STEP)
         } else {
             (1u64 << room) - 1
         };
@@ -414,7 +416,7 @@ fn guard_span_counted<S: Scan>(
             break;
         }
         need -= seen;
-        at += STEP;
+        at += S::STEP;
     }
     guard_span_quoted(scan, data, lo, hi, delimiter, need, at)
 }
@@ -431,19 +433,19 @@ fn guard_span_quoted<S: Scan>(
     mut need: usize,
     mut at: usize,
 ) -> Option<Option<usize>> {
-    const TOP: usize = STEP - 1;
+    let top: usize = S::STEP - 1;
     let mut inside = 0u64; // all ones while a quoted field carries over
     // Whether the byte before the register lets a quote open a field: the
     // row's start, a delimiter, or a quote -- one that closed, as an opening
     // one leaves the register's first byte inside, where a quote only closes.
     let mut opens_field = u64::from(at == lo || data[at - 1] == delimiter || data[at - 1] == b'"');
     while at < hi {
-        if at + STEP > data.len() {
+        if at + S::STEP > data.len() {
             return None;
         }
         let room = hi - at;
-        let valid = if room >= STEP {
-            u64::MAX >> (64 - STEP)
+        let valid = if room >= S::STEP {
+            u64::MAX >> (64 - S::STEP)
         } else {
             (1u64 << room) - 1
         };
@@ -472,20 +474,20 @@ fn guard_span_quoted<S: Scan>(
             let bit = free_newline.trailing_zeros() as usize;
             (bit, (need - seen == 1).then_some(at + bit - lo))
         } else {
-            (STEP, None)
+            (S::STEP, None)
         };
         if stray & 1u64.checked_shl(answer as u32).map_or(u64::MAX, |b| b - 1) != 0 {
             return None;
         }
-        if answer < STEP {
+        if answer < S::STEP {
             return Some(found);
         }
         need -= seen;
-        opens_field = ((delims | closing) >> TOP) & 1;
+        opens_field = ((delims | closing) >> top) & 1;
         if quotes.count_ones() & 1 == 1 {
             inside = !inside;
         }
-        at += STEP;
+        at += S::STEP;
     }
     Some(None)
 }
@@ -564,7 +566,7 @@ fn end_of_row_counted<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize) -> 
     let mut at = first;
     let mut inside = 0u64; // all ones while a quoted field carries over
     while at < limit {
-        if at + STEP > data.len() {
+        if at + S::STEP > data.len() {
             // The last bytes of the slab: the walk, from a known state.
             if inside != 0 {
                 at = skip_quoted_with(scan, data, at, limit);
@@ -573,8 +575,8 @@ fn end_of_row_counted<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize) -> 
             return if found >= limit { end } else { found };
         }
         let room = limit - at;
-        let valid = if room >= STEP {
-            u64::MAX >> (64 - STEP)
+        let valid = if room >= S::STEP {
+            u64::MAX >> (64 - S::STEP)
         } else {
             (1u64 << room) - 1
         };
@@ -588,7 +590,7 @@ fn end_of_row_counted<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize) -> 
         if quotes.count_ones() & 1 == 1 {
             inside = !inside;
         }
-        at += STEP;
+        at += S::STEP;
     }
     end
 }
@@ -753,6 +755,11 @@ pub(super) fn guard_span(
     delimiter: u8,
     commas: usize,
 ) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(w) = Wide512::detect() {
+        // Safety: `w` proves the CPU has AVX-512BW.
+        return unsafe { guard_span_wide512(w, data, lo, hi, delimiter, commas) };
+    }
     match Wide::detect() {
         // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
         Some(w) => unsafe { guard_span_wide(w, data, lo, hi, delimiter, commas) },
@@ -776,6 +783,28 @@ pub(super) fn guard_span(
 // enables; the body is the safe `guard_span_with`, so the feature is the only requirement.
 unsafe fn guard_span_wide(
     w: Wide,
+    data: &[u8],
+    lo: usize,
+    hi: usize,
+    delimiter: u8,
+    commas: usize,
+) -> Option<usize> {
+    guard_span_with(w, data, lo, hi, delimiter, commas)
+}
+
+/// [`guard_span_with`], compiled for AVX-512BW in a baseline x86-64 build.
+///
+/// # Safety
+/// Holding a `Wide512` is the proof the CPU has AVX-512BW; nothing else is required.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512bw,popcnt,bmi1")
+)]
+// Safety: `w: Wide512` proves the CPU has AVX-512BW, BMI1 and POPCNT, which this fn's `target_feature`
+// enables; the body is the safe `guard_span_with`, so the feature is the only requirement.
+unsafe fn guard_span_wide512(
+    w: Wide512,
     data: &[u8],
     lo: usize,
     hi: usize,
@@ -884,6 +913,11 @@ impl Runs {
         delimiter: u8,
         out: &mut [(usize, usize)],
     ) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(w) = Wide512::detect() {
+            // Safety: `w` proves the CPU has AVX-512BW.
+            return unsafe { self.of_row_wide512(w, data, lo, hi, delimiter, out) };
+        }
         match Wide::detect() {
             // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
             Some(w) => unsafe { self.of_row_wide(w, data, lo, hi, delimiter, out) },
@@ -908,6 +942,29 @@ impl Runs {
     unsafe fn of_row_wide(
         &self,
         w: Wide,
+        data: &[u8],
+        lo: usize,
+        hi: usize,
+        delimiter: u8,
+        out: &mut [(usize, usize)],
+    ) -> bool {
+        self.of_row_with(w, data, lo, hi, delimiter, out)
+    }
+
+    /// [`Runs::of_row_with`], compiled for AVX-512BW in a baseline x86-64 build.
+    ///
+    /// # Safety
+    /// Holding a `Wide512` is the proof the CPU has AVX-512BW; nothing else is required.
+    #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(
+        not(target_feature = "avx512bw"),
+        target_feature(enable = "avx512bw,popcnt,bmi1")
+    )]
+    // Safety: `w: Wide512` proves the CPU has AVX-512BW, BMI1 and POPCNT, which this fn's `target_feature`
+    // enables; the body is the safe `of_row_with`, so the feature is the only requirement.
+    unsafe fn of_row_wide512(
+        &self,
+        w: Wide512,
         data: &[u8],
         lo: usize,
         hi: usize,
@@ -969,6 +1026,11 @@ impl Runs {
         hi: usize,
         delimiter: u8,
     ) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(w) = Wide512::detect() {
+            // Safety: `w` proves the CPU has AVX-512BW.
+            return unsafe { self.matches_wide512(w, a, spans, b, lo, hi, delimiter) };
+        }
         match Wide::detect() {
             // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
             Some(w) => unsafe { self.matches_wide(w, a, spans, b, lo, hi, delimiter) },
@@ -994,6 +1056,31 @@ impl Runs {
     unsafe fn matches_wide(
         &self,
         w: Wide,
+        a: &[u8],
+        spans: &[(usize, usize)],
+        b: &[u8],
+        lo: usize,
+        hi: usize,
+        delimiter: u8,
+    ) -> bool {
+        self.matches_with(w, a, spans, b, lo, hi, delimiter)
+    }
+
+    /// [`Runs::matches_with`], compiled for AVX-512BW in a baseline x86-64 build.
+    ///
+    /// # Safety
+    /// Holding a `Wide512` is the proof the CPU has AVX-512BW; nothing else is required.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(
+        not(target_feature = "avx512bw"),
+        target_feature(enable = "avx512bw,popcnt,bmi1")
+    )]
+    // Safety: `w: Wide512` proves the CPU has AVX-512BW, BMI1 and POPCNT, which this fn's `target_feature`
+    // enables; the body is the safe `matches_with`, so the feature is the only requirement.
+    unsafe fn matches_wide512(
+        &self,
+        w: Wide512,
         a: &[u8],
         spans: &[(usize, usize)],
         b: &[u8],
@@ -1145,6 +1232,11 @@ impl RowParser {
     /// A row shorter than the header leaves the missing fields [`ABSENT`], which
     /// compares as absent — a difference to report, not a file to refuse.
     pub(super) fn parse(&self, data: &[u8], start: usize, end: usize, out: &mut [Field]) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(w) = Wide512::detect() {
+            // Safety: `w` proves the CPU has AVX-512BW.
+            return unsafe { self.parse_wide512(w, data, start, end, out) };
+        }
         match Wide::detect() {
             // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
             Some(w) => unsafe { self.parse_wide(w, data, start, end, out) },
@@ -1170,6 +1262,29 @@ impl RowParser {
     unsafe fn parse_wide(
         &self,
         w: Wide,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        out: &mut [Field],
+    ) -> usize {
+        self.parse_with(w, data, start, end, out)
+    }
+
+    /// [`RowParser::parse_with`], compiled for AVX-512BW in a baseline x86-64 build, so
+    /// every scan of the row inlines into it as a 512-bit vector compare.
+    ///
+    /// # Safety
+    /// Holding a `Wide512` is the proof the CPU has AVX-512BW; nothing else is required.
+    #[cfg(target_arch = "x86_64")]
+    #[cfg_attr(
+        not(target_feature = "avx512bw"),
+        target_feature(enable = "avx512bw,popcnt,bmi1")
+    )]
+    // Safety: `w: Wide512` proves the CPU has AVX-512BW, BMI1 and POPCNT, which this fn's `target_feature`
+    // enables; the body is the safe `parse_with`, so the feature is the only requirement.
+    unsafe fn parse_wide512(
+        &self,
+        w: Wide512,
         data: &[u8],
         start: usize,
         end: usize,
@@ -1794,15 +1909,15 @@ fn json_rows_match_counted<S: Scan>(
             if i >= m {
                 break m;
             }
-            if ai + i + STEP > a.len() || bi + i + STEP > b.len() {
+            if ai + i + S::STEP > a.len() || bi + i + S::STEP > b.len() {
                 return None;
             }
             let room = m - i;
             // One bit per byte of the register, or of the bytes left: an
             // equality mask has its unused high bits clear, and inverted they
             // would read as differences.
-            let valid = if room >= STEP {
-                u64::MAX >> (64 - STEP)
+            let valid = if room >= S::STEP {
+                u64::MAX >> (64 - S::STEP)
             } else {
                 (1u64 << room) - 1
             };
@@ -1819,7 +1934,7 @@ fn json_rows_match_counted<S: Scan>(
             if differ != 0 {
                 break i + differ.trailing_zeros() as usize;
             }
-            i += STEP;
+            i += S::STEP;
         };
         if same == left {
             return Some(json_tail_is_clean_with(scan, p, b, bi + left, b_hi));

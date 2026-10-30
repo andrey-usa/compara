@@ -78,8 +78,11 @@ pub(super) fn is_real(f: Field) -> bool {
 /// The width a scan steps in. Implemented by `Swar` and `Wide` only.
 pub(super) trait Scan: Copy {
     const WIDE: bool;
+    /// The bytes one step of this scan covers. `Swar`'s is never read: the
+    /// wide loops sit behind `if S::WIDE`, which monomorphizes it away.
+    const STEP: usize;
     /// One bit per byte of the register at `at` that is `a` or `b`. Only asked
-    /// of `Wide`, and only where `at + STEP <= data.len()`.
+    /// of the wide scans, and only where `at + Self::STEP <= data.len()`.
     fn hits(self, data: &[u8], at: usize, a: u8, b: u8) -> u64;
     /// One bit per byte where `x` at `xi` and `y` at `yi` hold the same byte.
     /// Only asked of `Wide`, and only where a whole register fits in each.
@@ -92,6 +95,7 @@ pub(super) struct Swar;
 
 impl Scan for Swar {
     const WIDE: bool = false;
+    const STEP: usize = 8;
     #[inline(always)]
     fn hits(self, _: &[u8], _: usize, _: u8, _: u8) -> u64 {
         0
@@ -113,15 +117,9 @@ impl Wide {
     /// (`std` caches it); every later call is a load and a test.
     #[inline(always)]
     pub(super) fn detect() -> Option<Wide> {
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(target_feature = "avx2", target_feature = "avx512bw")
-        ))]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         return Some(Wide(()));
-        #[cfg(all(
-            target_arch = "x86_64",
-            not(any(target_feature = "avx2", target_feature = "avx512bw"))
-        ))]
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
         // POPCNT and BMI1 ride along: every CPU with AVX2 has them, and the
         // wide functions count and find bits with them.
         return (std::arch::is_x86_feature_detected!("avx2")
@@ -136,37 +134,13 @@ impl Wide {
     }
 }
 
-/// The bytes a `Wide` scan takes in one step.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-pub(super) const STEP: usize = 64;
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw")))]
-pub(super) const STEP: usize = 32;
-
 impl Scan for Wide {
     const WIDE: bool = true;
+    const STEP: usize = 32;
     #[inline(always)]
     fn hits(self, data: &[u8], at: usize, a: u8, b: u8) -> u64 {
-        debug_assert!(at + STEP <= data.len());
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-        // Safety: the caller has checked `at + 64 <= data.len()`, and this build
-        // targets a CPU with AVX-512BW.
-        return unsafe {
-            use std::arch::x86_64::*;
-            let chunk = _mm512_loadu_si512(data.as_ptr().add(at) as *const _);
-            _mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8(a as i8))
-                | _mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8(b as i8))
-        };
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(target_feature = "avx512bw")
-        ))]
-        // Safety: as above, with AVX2 and thirty-two bytes.
-        return unsafe { avx2_hits(data, at, a, b) };
-        #[cfg(all(
-            target_arch = "x86_64",
-            not(any(target_feature = "avx2", target_feature = "avx512bw"))
-        ))]
+        debug_assert!(at + Self::STEP <= data.len());
+        #[cfg(target_arch = "x86_64")]
         // Safety: `self` exists, so the CPU has AVX2 (`Wide::detect`), and the
         // caller has checked the bounds. Inside a function compiled for AVX2
         // this inlines to the few instructions it is.
@@ -184,17 +158,8 @@ impl Scan for Wide {
 
     #[inline(always)]
     fn same(self, x: &[u8], xi: usize, y: &[u8], yi: usize) -> u64 {
-        debug_assert!(xi + STEP <= x.len() && yi + STEP <= y.len());
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-        // Safety: the caller has checked both bounds, and this build targets a
-        // CPU with AVX-512BW.
-        return unsafe {
-            use std::arch::x86_64::*;
-            let a = _mm512_loadu_si512(x.as_ptr().add(xi) as *const _);
-            let b = _mm512_loadu_si512(y.as_ptr().add(yi) as *const _);
-            _mm512_cmpeq_epi8_mask(a, b)
-        };
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
+        debug_assert!(xi + Self::STEP <= x.len() && yi + Self::STEP <= y.len());
+        #[cfg(target_arch = "x86_64")]
         // Safety: `self` exists, so the CPU has AVX2, and the caller has
         // checked both bounds.
         return unsafe { avx2_same(x, xi, y, yi) };
@@ -208,6 +173,86 @@ impl Scan for Wide {
             unreachable!("no Wide scan off x86-64 and aarch64")
         }
     }
+}
+
+/// Sixty-four bytes at a time, x86-64 with AVX-512BW only. Holding one is the
+/// proof that the CPU has AVX-512BW: the field is private, and
+/// [`Wide512::detect`] is the only way to make one.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+pub(super) struct Wide512(());
+
+#[cfg(target_arch = "x86_64")]
+impl Wide512 {
+    /// `Some` where this CPU can scan sixty-four bytes a step. Asked of the
+    /// CPU once per process (`std` caches it); every later call is a load and
+    /// a test.
+    #[inline(always)]
+    pub(super) fn detect() -> Option<Wide512> {
+        #[cfg(target_feature = "avx512bw")]
+        return Some(Wide512(()));
+        #[cfg(not(target_feature = "avx512bw"))]
+        // Every CPU with AVX-512BW also has POPCNT and BMI1, which the wide
+        // functions count and find bits with.
+        return (std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("popcnt")
+            && std::arch::is_x86_feature_detected!("bmi1"))
+        .then_some(Wide512(()));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Scan for Wide512 {
+    const WIDE: bool = true;
+    const STEP: usize = 64;
+    #[inline(always)]
+    fn hits(self, data: &[u8], at: usize, a: u8, b: u8) -> u64 {
+        debug_assert!(at + Self::STEP <= data.len());
+        // Safety: `self` exists, so the CPU has AVX-512BW (`Wide512::detect`),
+        // and the caller has checked the bounds.
+        unsafe { avx512_hits(data, at, a, b) }
+    }
+    #[inline(always)]
+    fn same(self, x: &[u8], xi: usize, y: &[u8], yi: usize) -> u64 {
+        debug_assert!(xi + Self::STEP <= x.len() && yi + Self::STEP <= y.len());
+        // Safety: `self` exists, so the CPU has AVX-512BW (`Wide512::detect`),
+        // and the caller has checked both bounds.
+        unsafe { avx512_same(x, xi, y, yi) }
+    }
+}
+
+/// The AVX-512BW compare of a chunk against two bytes.
+///
+/// # Safety
+/// The CPU has AVX-512BW, and `at + 64 <= data.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+#[inline]
+unsafe fn avx512_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
+    use std::arch::x86_64::*;
+    // Safety: the bounds are the caller's promise.
+    let chunk = unsafe { _mm512_loadu_si512(data.as_ptr().add(at) as *const _) };
+    _mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8(a as i8))
+        | _mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8(b as i8))
+}
+
+/// The AVX-512BW byte-for-byte compare of two registers' worth.
+///
+/// # Safety
+/// The CPU has AVX-512BW, `xi + 64 <= x.len()` and `yi + 64 <= y.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+#[inline]
+unsafe fn avx512_same(x: &[u8], xi: usize, y: &[u8], yi: usize) -> u64 {
+    use std::arch::x86_64::*;
+    // Safety: the bounds are the caller's promise.
+    let (a, b) = unsafe {
+        (
+            _mm512_loadu_si512(x.as_ptr().add(xi) as *const _),
+            _mm512_loadu_si512(y.as_ptr().add(yi) as *const _),
+        )
+    };
+    _mm512_cmpeq_epi8_mask(a, b)
 }
 
 /// The AVX2 byte-for-byte compare of two registers' worth.
@@ -264,7 +309,7 @@ unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
 ///
 /// A 4-bits-per-byte mask (`vshrn`) would be fewer instructions here, but it
 /// does not fit what the callers count and find: they take `trailing_zeros` of
-/// a one-bit-per-byte mask and mask with `STEP` bits, so a 4-bit mask means
+/// a one-bit-per-byte mask as wide as the register, so a 4-bit mask means
 /// changing every caller. The one-bit mask keeps the callers untouched.
 ///
 /// # Safety
@@ -473,11 +518,11 @@ impl<'a, S: Scan> Delims<'a, S> {
     fn refill(&mut self, from: usize) -> usize {
         let mut at = from.max(self.scanned);
         if S::WIDE {
-            while at + STEP <= self.data.len() {
+            while at + S::STEP <= self.data.len() {
                 let mut hits = self.scan.hits(self.data, at, self.a, self.b);
                 self.held = at;
                 self.wide = true;
-                self.scanned = at + STEP;
+                self.scanned = at + S::STEP;
                 while hits != 0 {
                     let idx = at + hits.trailing_zeros() as usize;
                     hits &= hits - 1;
@@ -486,7 +531,7 @@ impl<'a, S: Scan> Delims<'a, S> {
                         return idx;
                     }
                 }
-                at += STEP;
+                at += S::STEP;
             }
         }
         while at + 8 <= self.data.len() {
@@ -584,12 +629,12 @@ pub(super) fn next_of2_with<S: Scan>(
     let data = &data[..end.min(data.len())];
     let mut at = from;
     if S::WIDE {
-        while at + STEP <= data.len() {
+        while at + S::STEP <= data.len() {
             let hits = scan.hits(data, at, a, b);
             if hits != 0 {
                 return at + hits.trailing_zeros() as usize;
             }
-            at += STEP;
+            at += S::STEP;
         }
     }
     let (ba, bb) = (broadcast(a), broadcast(b));
@@ -625,12 +670,12 @@ pub(super) fn next_of3_with<S: Scan>(
     let data = &data[..end.min(data.len())];
     let mut at = from;
     if S::WIDE {
-        while at + STEP <= data.len() {
+        while at + S::STEP <= data.len() {
             let hits = scan.hits(data, at, a, b) | scan.hits(data, at, c, c);
             if hits != 0 {
                 return at + hits.trailing_zeros() as usize;
             }
-            at += STEP;
+            at += S::STEP;
         }
     }
     let (ba, bb, bc) = (broadcast(a), broadcast(b), broadcast(c));
@@ -663,12 +708,12 @@ pub(super) fn next_of1_with<S: Scan>(
     let data = &data[..end.min(data.len())];
     let mut at = from;
     if S::WIDE {
-        while at + STEP <= data.len() {
+        while at + S::STEP <= data.len() {
             let hits = scan.hits(data, at, target, target);
             if hits != 0 {
                 return at + hits.trailing_zeros() as usize;
             }
-            at += STEP;
+            at += S::STEP;
         }
     }
     let bt = broadcast(target);
@@ -806,6 +851,113 @@ mod tests {
         }
     }
 
+    /// The sixty-four-byte width against `Swar`, over the same randomized
+    /// data as [`both_widths_find_the_same_bytes`]. Skipped, with a printed
+    /// line, where the CPU lacks AVX-512BW.
+    #[test]
+    fn wide512_finds_the_same_bytes() {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(w) = Wide512::detect() {
+            let mut d = Vec::new();
+            let mut x = 0x2545_f491_u32;
+            for _ in 0..300 {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                d.push(match x % 11 {
+                    0 => b',',
+                    1 => b'\n',
+                    2 => b'"',
+                    _ => b'a' + (x % 26) as u8,
+                });
+            }
+            for end in [d.len(), d.len() - 1, 100, 64, 33, 7] {
+                let mut wide = Delims::new(w, &d, 0, end, b',', b'\n');
+                let mut swar = Delims::new(Swar, &d, 0, end, b',', b'\n');
+                let mut at = 0;
+                loop {
+                    let want = next_of2_with(Swar, &d, at, end, b',', b'\n');
+                    assert_eq!(next_of2_with(w, &d, at, end, b',', b'\n'), want);
+                    assert_eq!(wide.next(at), want, "wide512 cursor from {at} to {end}");
+                    assert_eq!(swar.next(at), want, "SWAR cursor from {at} to {end}");
+                    if want >= end {
+                        break;
+                    }
+                    at = want + 1;
+                }
+                for from in 0..end {
+                    assert_eq!(
+                        next_of1_with(w, &d, from, end, b'"'),
+                        next_of1_with(Swar, &d, from, end, b'"'),
+                    );
+                    assert_eq!(
+                        skip_quoted_with(w, &d, from, end),
+                        skip_quoted_with(Swar, &d, from, end),
+                    );
+                }
+            }
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        println!("wide512_finds_the_same_bytes: no AVX-512BW on this CPU, skipped");
+        #[cfg(not(target_arch = "x86_64"))]
+        println!("wide512_finds_the_same_bytes: x86-64 only, skipped");
+    }
+
+    /// `Wide512`'s masks against a byte at a time, the same reference as
+    /// [`wide_masks_match_a_byte_at_a_time`]. Skipped, with a printed line,
+    /// where the CPU lacks AVX-512BW.
+    #[test]
+    fn wide512_masks_match_a_byte_at_a_time() {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(w) = Wide512::detect() {
+            let mut x = 0x9e37_79b9_u32;
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x
+            };
+            let mut d = Vec::new();
+            for _ in 0..300 {
+                d.push((next() % 251) as u8);
+            }
+            for a in 0..=255u8 {
+                for b in [a, a.wrapping_add(1), a.wrapping_sub(1), 0, 255] {
+                    for at in 0..=(d.len() - Wide512::STEP) {
+                        let mut want = 0u64;
+                        for i in 0..Wide512::STEP {
+                            if d[at + i] == a || d[at + i] == b {
+                                want |= 1 << i;
+                            }
+                        }
+                        assert_eq!(w.hits(&d, at, a, b), want, "hits at {at} for {a}/{b}");
+                    }
+                }
+            }
+            let mut e = Vec::new();
+            for _ in 0..300 {
+                e.push((next() % 251) as u8);
+            }
+            for xi in 0..=(d.len() - Wide512::STEP) {
+                for yi in 0..=(e.len() - Wide512::STEP) {
+                    let mut want = 0u64;
+                    for i in 0..Wide512::STEP {
+                        if d[xi + i] == e[yi + i] {
+                            want |= 1 << i;
+                        }
+                    }
+                    assert_eq!(w.same(&d, xi, &e, yi), want, "same at {xi}/{yi}");
+                }
+            }
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        println!("wide512_masks_match_a_byte_at_a_time: no AVX-512BW on this CPU, skipped");
+        #[cfg(not(target_arch = "x86_64"))]
+        println!("wide512_masks_match_a_byte_at_a_time: x86-64 only, skipped");
+    }
+
     /// `Wide`'s masks against a byte at a time, for every delimiter value and
     /// every offset a vector step can start at. Only runs where the CPU has
     /// the vector width: elsewhere there is one width and nothing to compare.
@@ -832,9 +984,9 @@ mod tests {
         // the same, sometimes a neighbour, sometimes far away.
         for a in 0..=255u8 {
             for b in [a, a.wrapping_add(1), a.wrapping_sub(1), 0, 255] {
-                for at in 0..=(d.len() - STEP) {
+                for at in 0..=(d.len() - Wide::STEP) {
                     let mut want = 0u64;
-                    for i in 0..STEP {
+                    for i in 0..Wide::STEP {
                         if d[at + i] == a || d[at + i] == b {
                             want |= 1 << i;
                         }
@@ -848,10 +1000,10 @@ mod tests {
         for _ in 0..300 {
             e.push((next() % 251) as u8);
         }
-        for xi in 0..=(d.len() - STEP) {
-            for yi in 0..=(e.len() - STEP) {
+        for xi in 0..=(d.len() - Wide::STEP) {
+            for yi in 0..=(e.len() - Wide::STEP) {
                 let mut want = 0u64;
-                for i in 0..STEP {
+                for i in 0..Wide::STEP {
                     if d[xi + i] == e[yi + i] {
                         want |= 1 << i;
                     }
