@@ -246,11 +246,12 @@ fn stream_into(
     std::thread::scope(|scope| {
         let spiller = scope.spawn(move || -> Result<Vec<PathBuf>> {
             let mut spilled = Vec::new();
+            let mut rowbuf: Vec<u8> = Vec::new();
             for batch in batches {
                 let path = spill_dir.join(format!("run-{}.bin", spilled.len()));
                 let mut w = BufWriter::with_capacity(1 << 16, File::create(&path)?);
                 for row in sorted_order(&batch, key_size) {
-                    write_row(&mut w, &batch, row as usize)?;
+                    write_row(&mut w, &batch, row as usize, &mut rowbuf)?;
                 }
                 w.flush()?;
                 let file = w.into_inner().map_err(|e| Error::new(e.to_string()))?;
@@ -511,7 +512,7 @@ struct MergeCursor {
     heap: Vec<usize>,
     key_size: usize,
     scratch: Vec<u8>,
-    spans: Vec<Option<(usize, usize)>>,
+    ends: Vec<u32>,
 }
 
 impl MergeCursor {
@@ -522,7 +523,7 @@ impl MergeCursor {
             heap: Vec::new(),
             key_size,
             scratch: Vec::new(),
-            spans: Vec::new(),
+            ends: Vec::new(),
         };
         for p in paths {
             c.readers
@@ -547,7 +548,7 @@ impl MergeCursor {
             &mut self.readers[run],
             &mut self.heads[run],
             &mut self.scratch,
-            &mut self.spans,
+            &mut self.ends,
         )
     }
 
@@ -603,105 +604,197 @@ impl Cursor for MergeCursor {
 }
 
 // ---------------------------------------------------------------------------
-// The spill format: a length-prefixed field per column, varint lengths, where
-// zero is an absent field and a real length is stored one higher.
+// The spill format: per row, a little-endian u32 with the length of what
+// follows, a varint per cell (zero for an absent cell, otherwise its length
+// plus one), then the row's text. A row comes back in two reads, and the
+// lengths are decoded from memory, not from the file a cell at a time.
 // ---------------------------------------------------------------------------
 
-fn write_row<W: Write>(w: &mut W, rows: &Packed, row: usize) -> Result<()> {
-    for i in 0..rows.width() {
-        match rows.cell(row, i) {
-            None => write_varint(w, 0)?,
-            Some(s) => {
-                write_varint(w, s.len() as u64 + 1)?;
-                w.write_all(s.as_bytes())?;
-            }
+fn write_row<W: Write>(w: &mut W, rows: &Packed, row: usize, buf: &mut Vec<u8>) -> Result<()> {
+    let (ends, text) = rows.row_raw(row);
+    buf.clear();
+    buf.extend_from_slice(&[0; 4]);
+    let mut prev = 0u32;
+    for &e in ends {
+        if e & Packed::ABSENT_FLAG != 0 {
+            buf.push(0);
+        } else {
+            push_varint(buf, u64::from(e - prev) + 1);
         }
+        prev = e & !Packed::ABSENT_FLAG;
     }
+    let len = buf.len() - 4 + text.len();
+    let len = u32::try_from(len).map_err(|_| Error::new("a row holds more than 4 GB of text"))?;
+    buf[..4].copy_from_slice(&len.to_le_bytes());
+    w.write_all(buf)?;
+    w.write_all(text)?;
     Ok(())
 }
 
-/// Reads one row into `into`, which is left empty at the end of the run.
+fn push_varint(buf: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        buf.push((value as u8 & 0x7F) | 0x80);
+        value >>= 7;
+    }
+    buf.push(value as u8);
+}
+
+/// Reads one row from a run and appends it to `into`; appends nothing at the
+/// end of the run. A damaged run is an error: a row cut short, lengths that do
+/// not add up to the text, or text that is not UTF-8.
 fn read_row<R: BufRead>(
     r: &mut R,
     into: &mut Packed,
     scratch: &mut Vec<u8>,
-    spans: &mut Vec<Option<(usize, usize)>>,
+    ends: &mut Vec<u32>,
 ) -> Result<()> {
     let width = into.width();
+    if r.fill_buf()?.is_empty() {
+        return Ok(());
+    }
+    let short = |_| Error::new("spilled run ended mid-row".to_string());
+    let corrupt = || Error::new("corrupt spilled run: cell lengths do not match the row");
+    let mut head = [0u8; 4];
+    r.read_exact(&mut head).map_err(short)?;
+    let len = u32::from_le_bytes(head) as usize;
     scratch.clear();
-    spans.clear();
-    for i in 0..width {
-        match read_varint(r)? {
-            None if i == 0 => return Ok(()),
-            None => return Err(Error::new("spilled run ended mid-row".to_string())),
-            Some(0) => spans.push(None),
-            Some(n) => {
-                let from = scratch.len();
-                scratch.resize(from + (n - 1) as usize, 0);
-                r.read_exact(&mut scratch[from..])
-                    .map_err(|_| Error::new("spilled run ended mid-row".to_string()))?;
-                spans.push(Some((from, scratch.len())));
+    if len <= 1 << 20 {
+        scratch.resize(len, 0);
+        r.read_exact(&mut scratch[..]).map_err(short)?;
+    } else {
+        // A length this large is rare; do not trust it to size a buffer.
+        r.by_ref().take(len as u64).read_to_end(scratch)?;
+        if scratch.len() != len {
+            return Err(Error::new("spilled run ended mid-row".to_string()));
+        }
+    }
+    ends.clear();
+    let mut at = 0usize;
+    let mut end = 0usize;
+    for _ in 0..width {
+        // Nearly every length is one byte; take that without a loop.
+        let b = *scratch.get(at).ok_or_else(corrupt)?;
+        at += 1;
+        let v = if b < 0x80 {
+            u64::from(b)
+        } else {
+            let mut v = u64::from(b & 0x7F);
+            let mut shift = 7;
+            loop {
+                let b = *scratch.get(at).ok_or_else(corrupt)?;
+                at += 1;
+                v |= u64::from(b & 0x7F) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+                if shift > 28 {
+                    return Err(corrupt());
+                }
+            }
+            v
+        };
+        // The ends only grow, so the last one is the one to check below.
+        if v == 0 {
+            ends.push(end as u32 | Packed::ABSENT_FLAG);
+        } else {
+            end += (v - 1) as usize;
+            ends.push(end as u32);
+        }
+    }
+    if scratch.len() - at != end || end >= Packed::ABSENT_FLAG as usize {
+        return Err(corrupt());
+    }
+    into.push_raw(ends, &scratch[at..])
+}
+
+/// The spill record: what is written reads back, and a damaged run is an
+/// error, not a panic or a wrong row.
+#[cfg(test)]
+mod run_format {
+    use super::*;
+    use std::io::Cursor;
+
+    fn run(rows: &[&[Option<&str>]]) -> Vec<u8> {
+        let mut p = Packed::new(rows[0].len());
+        for r in rows {
+            p.push(r.iter().copied()).unwrap();
+        }
+        let (mut out, mut buf) = (Vec::new(), Vec::new());
+        for i in 0..p.len() {
+            write_row(&mut out, &p, i, &mut buf).unwrap();
+        }
+        out
+    }
+
+    fn read_all(bytes: &[u8], width: usize) -> Result<Packed> {
+        let mut r = Cursor::new(bytes.to_vec());
+        let mut p = Packed::new(width);
+        let (mut s, mut e) = (Vec::new(), Vec::new());
+        loop {
+            let before = p.len();
+            read_row(&mut r, &mut p, &mut s, &mut e)?;
+            if p.len() == before {
+                return Ok(p);
             }
         }
     }
-    let text = std::str::from_utf8(scratch)
-        .map_err(|e| Error::new(format!("spilled run holds invalid UTF-8: {e}")))?;
-    if !spans
-        .iter()
-        .flatten()
-        .all(|&(a, b)| text.is_char_boundary(a) && text.is_char_boundary(b))
-    {
-        return Err(Error::new("spilled run holds invalid UTF-8"));
-    }
-    into.push(spans.iter().map(|c| c.map(|(a, b)| &text[a..b])))
-}
 
-fn write_varint<W: Write>(w: &mut W, value: u64) -> Result<()> {
-    let mut v = value;
-    while v >= 0x80 {
-        w.write_all(&[(v as u8) | 0x80])?;
-        v >>= 7;
+    #[test]
+    fn a_run_reads_back_as_written() {
+        let bytes = run(&[
+            &[Some("a"), None, Some(""), Some("héllo")],
+            &[None, None, None, None],
+            &[Some("x"), Some("y"), Some("z"), None],
+        ]);
+        let p = read_all(&bytes, 4).unwrap();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p.cell(0, 1), None);
+        assert_eq!(p.cell(0, 2), Some(""));
+        assert_eq!(p.cell(0, 3), Some("héllo"));
+        assert_eq!(p.cell(1, 0), None);
+        assert_eq!(p.cell(2, 3), None);
+        assert_eq!(p.cell(2, 1), Some("y"));
     }
-    w.write_all(&[v as u8])?;
-    Ok(())
-}
 
-fn read_varint<R: BufRead>(r: &mut R) -> Result<Option<u64>> {
-    // A length is almost always whole in the buffer: read it from there,
-    // rather than through a one-byte `read` per byte.
-    let buf = r.fill_buf()?;
-    if buf.len() >= 10 {
-        let mut result: u64 = 0;
-        for (i, &b) in buf[..10].iter().enumerate() {
-            result |= ((b & 0x7F) as u64) << (7 * i);
-            if b & 0x80 == 0 {
-                r.consume(i + 1);
-                return Ok(Some(result));
-            }
+    #[test]
+    fn a_run_cut_short_is_an_error() {
+        let bytes = run(&[&[Some("abc"), Some("def")], &[Some("ghi"), Some("jkl")]]);
+        for cut in [2, 5, bytes.len() / 2 + 1, bytes.len() - 1] {
+            assert!(read_all(&bytes[..cut], 2).is_err(), "cut at {cut}");
         }
-        return Err(Error::new(
-            "corrupt spilled run: length is not a varint".to_string(),
-        ));
     }
-    let mut result: u64 = 0;
-    let mut shift = 0;
-    loop {
-        let mut byte = [0u8; 1];
-        match r.read(&mut byte)? {
-            0 if shift == 0 => return Ok(None),
-            0 => return Err(Error::new("spilled run ended mid-row".to_string())),
-            _ => {}
-        }
-        result |= ((byte[0] & 0x7F) as u64) << shift;
-        if byte[0] & 0x80 == 0 {
-            return Ok(Some(result));
-        }
-        shift += 7;
-        if shift > 63 {
-            return Err(Error::new(
-                "corrupt spilled run: length is not a varint".to_string(),
-            ));
-        }
+
+    #[test]
+    fn lengths_that_do_not_fit_the_text_are_an_error() {
+        let mut bytes = run(&[&[Some("abc"), Some("def")]]);
+        bytes[4] += 1; // first cell claims one byte more
+        assert!(read_all(&bytes, 2).is_err());
+        let mut bytes = run(&[&[Some("abc"), Some("def")]]);
+        bytes[4] = 0x7f; // a length well past the text
+        assert!(read_all(&bytes, 2).is_err());
+        let bytes = run(&[&[Some("abc"), Some("def")]]);
+        assert!(read_all(&bytes, 3).is_err(), "a row wider than the run's");
+    }
+
+    #[test]
+    fn invalid_utf8_and_a_split_character_are_errors() {
+        let mut bytes = run(&[&[Some("abc"), Some("def")]]);
+        let last = bytes.len() - 1;
+        bytes[last] = 0xFF;
+        assert!(read_all(&bytes, 2).is_err());
+        // "é" is two bytes; cut a cell between them.
+        let mut bytes = run(&[&[Some("é"), Some("")]]);
+        bytes[4] = 2; // first cell is one byte, second is zero bytes, one byte left over
+        bytes[5] = 2;
+        assert!(read_all(&bytes, 2).is_err());
+    }
+
+    #[test]
+    fn a_huge_claimed_length_does_not_allocate_it() {
+        let mut bytes = vec![0xFF, 0xFF, 0xFF, 0x7F];
+        bytes.extend_from_slice(b"abc");
+        assert!(read_all(&bytes, 2).is_err());
     }
 }
 

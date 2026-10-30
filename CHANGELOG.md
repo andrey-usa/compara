@@ -27,6 +27,12 @@ All notable changes to this project are documented here. The format follows
   duplicate-key counts once the duplicate sections are written: 10M rows
   take about 79 MB less memory (700 -> 625 MB of heap), 2M rows 161 -> 132
   MB, with 1.3% fewer instructions; same output.
+- The sortmerge engine's spilled runs hold each row as one record (its
+  length, a length per cell, then its text), read back in two reads and
+  checked once, where each cell was read and checked on its own: about a
+  quarter fewer instructions, 2M rows 5.8 s -> 4.6 s on two cores, runs on
+  disk the same size within 3%; same output. A damaged run (cut short,
+  lengths that don't add up, text that isn't UTF-8) is an error.
 
 ### Fixed
 
