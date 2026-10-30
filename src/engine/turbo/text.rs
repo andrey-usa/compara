@@ -754,16 +754,16 @@ pub(super) fn guard_span(
     commas: usize,
 ) -> Option<usize> {
     match Wide::detect() {
-        // Safety: `w` proves the CPU has AVX2.
+        // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
         Some(w) => unsafe { guard_span_wide(w, data, lo, hi, delimiter, commas) },
         None => guard_span_with(Swar, data, lo, hi, delimiter, commas),
     }
 }
 
-/// [`guard_span_with`], compiled for AVX2 in a baseline build.
+/// [`guard_span_with`], compiled for AVX2 in a baseline x86-64 build, and for NEON on aarch64.
 ///
 /// # Safety
-/// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
+/// Holding a `Wide` is the proof the CPU has AVX2, or NEON on aarch64; nothing else is required.
 #[cfg_attr(
     all(
         target_arch = "x86_64",
@@ -771,7 +771,8 @@ pub(super) fn guard_span(
     ),
     target_feature(enable = "avx2,popcnt,bmi1")
 )]
-// Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+// Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
 // enables; the body is the safe `guard_span_with`, so the feature is the only requirement.
 unsafe fn guard_span_wide(
     w: Wide,
@@ -884,16 +885,16 @@ impl Runs {
         out: &mut [(usize, usize)],
     ) -> bool {
         match Wide::detect() {
-            // Safety: `w` proves the CPU has AVX2.
+            // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
             Some(w) => unsafe { self.of_row_wide(w, data, lo, hi, delimiter, out) },
             None => self.of_row_with(Swar, data, lo, hi, delimiter, out),
         }
     }
 
-    /// [`Runs::of_row_with`], compiled for AVX2 in a baseline build.
+    /// [`Runs::of_row_with`], compiled for AVX2 in a baseline x86-64 build, and for NEON on aarch64.
     ///
     /// # Safety
-    /// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
+    /// Holding a `Wide` is the proof the CPU has AVX2, or NEON on aarch64; nothing else is required.
     #[cfg_attr(
         all(
             target_arch = "x86_64",
@@ -901,7 +902,8 @@ impl Runs {
         ),
         target_feature(enable = "avx2,popcnt,bmi1")
     )]
-    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
+    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
     // enables; the body is the safe `of_row_with`, so the feature is the only requirement.
     unsafe fn of_row_wide(
         &self,
@@ -968,16 +970,16 @@ impl Runs {
         delimiter: u8,
     ) -> bool {
         match Wide::detect() {
-            // Safety: `w` proves the CPU has AVX2.
+            // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
             Some(w) => unsafe { self.matches_wide(w, a, spans, b, lo, hi, delimiter) },
             None => self.matches_with(Swar, a, spans, b, lo, hi, delimiter),
         }
     }
 
-    /// [`Runs::matches_with`], compiled for AVX2 in a baseline build.
+    /// [`Runs::matches_with`], compiled for AVX2 in a baseline x86-64 build, and for NEON on aarch64.
     ///
     /// # Safety
-    /// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
+    /// Holding a `Wide` is the proof the CPU has AVX2, or NEON on aarch64; nothing else is required.
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(
         all(
@@ -986,7 +988,8 @@ impl Runs {
         ),
         target_feature(enable = "avx2,popcnt,bmi1")
     )]
-    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
+    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
     // enables; the body is the safe `matches_with`, so the feature is the only requirement.
     unsafe fn matches_wide(
         &self,
@@ -1143,17 +1146,17 @@ impl RowParser {
     /// compares as absent — a difference to report, not a file to refuse.
     pub(super) fn parse(&self, data: &[u8], start: usize, end: usize, out: &mut [Field]) -> usize {
         match Wide::detect() {
-            // Safety: `w` proves the CPU has AVX2.
+            // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
             Some(w) => unsafe { self.parse_wide(w, data, start, end, out) },
             None => self.parse_with(Swar, data, start, end, out),
         }
     }
 
-    /// [`RowParser::parse_with`], compiled for AVX2 in a baseline build, so
+    /// [`RowParser::parse_with`], compiled for AVX2 in a baseline x86-64 build, and for NEON on aarch64, so
     /// every scan of the row inlines into it as a vector compare.
     ///
     /// # Safety
-    /// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
+    /// Holding a `Wide` is the proof the CPU has AVX2, or NEON on aarch64; nothing else is required.
     #[cfg_attr(
         all(
             target_arch = "x86_64",
@@ -1161,7 +1164,8 @@ impl RowParser {
         ),
         target_feature(enable = "avx2,popcnt,bmi1")
     )]
-    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
+    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+    // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
     // enables; the body is the safe `parse_with`, so the feature is the only requirement.
     unsafe fn parse_wide(
         &self,
@@ -1547,16 +1551,16 @@ pub(super) fn json_rows_match_at(
     b_hi: usize,
 ) -> bool {
     match Wide::detect() {
-        // Safety: `w` proves the CPU has AVX2.
+        // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
         Some(w) => unsafe { json_rows_match_wide(w, p, a, a_lo, a_hi, b, b_lo, b_hi) },
         None => json_rows_match_with(Swar, p, a, a_lo, a_hi, b, b_lo, b_hi),
     }
 }
 
-/// [`json_rows_match_with`], compiled for AVX2 in a baseline build.
+/// [`json_rows_match_with`], compiled for AVX2 in a baseline x86-64 build, and for NEON on aarch64.
 ///
 /// # Safety
-/// Holding a `Wide` is the proof the CPU has AVX2; nothing else is required.
+/// Holding a `Wide` is the proof the CPU has AVX2, or NEON on aarch64; nothing else is required.
 #[cfg_attr(
     all(
         target_arch = "x86_64",
@@ -1564,8 +1568,9 @@ pub(super) fn json_rows_match_at(
     ),
     target_feature(enable = "avx2,popcnt,bmi1")
 )]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 #[allow(clippy::too_many_arguments)]
-// Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT, which this fn's `target_feature`
+// Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
 // enables; the body is the safe `json_rows_match_with`, so the feature is the only requirement.
 unsafe fn json_rows_match_wide(
     w: Wide,

@@ -70,7 +70,10 @@ pub(super) fn is_real(f: Field) -> bool {
 // point in `text` then runs a copy of itself compiled for AVX2 (`*_wide`, marked
 // `#[target_feature]`), into which every scan below inlines, or its SWAR copy.
 // The check is a cached load and a branch per row, where a check and a call per
-// scan would land between every field and the next.
+// scan would land between every field and the next. On aarch64, NEON is
+// baseline, so every build takes `Wide` with a thirty-two-byte step; the
+// `*_wide` copies there carry `#[target_feature(enable = "neon")]` and the
+// one-bit-per-byte mask below is unchanged, so no caller changes.
 
 /// The width a scan steps in. Implemented by `Swar` and `Wide` only.
 pub(super) trait Scan: Copy {
@@ -125,7 +128,10 @@ impl Wide {
             && std::arch::is_x86_feature_detected!("popcnt")
             && std::arch::is_x86_feature_detected!("bmi1"))
         .then_some(Wide(()));
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        // NEON is baseline on aarch64: no run-time detection needed.
+        return Some(Wide(()));
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         return None;
     }
 }
@@ -165,10 +171,14 @@ impl Scan for Wide {
         // caller has checked the bounds. Inside a function compiled for AVX2
         // this inlines to the few instructions it is.
         return unsafe { avx2_hits(data, at, a, b) };
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        // Safety: `self` exists, so this is aarch64 with baseline NEON
+        // (`Wide::detect`), and the caller has checked the bounds.
+        return unsafe { neon_hits(data, at, a, b) };
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let _ = (data, at, a, b);
-            unreachable!("no Wide scan off x86-64")
+            unreachable!("no Wide scan off x86-64 and aarch64")
         }
     }
 
@@ -188,10 +198,14 @@ impl Scan for Wide {
         // Safety: `self` exists, so the CPU has AVX2, and the caller has
         // checked both bounds.
         return unsafe { avx2_same(x, xi, y, yi) };
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        // Safety: `self` exists, so this is aarch64 with baseline NEON, and
+        // the caller has checked both bounds.
+        return unsafe { neon_same(x, xi, y, yi) };
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let _ = (x, xi, y, yi);
-            unreachable!("no Wide scan off x86-64")
+            unreachable!("no Wide scan off x86-64 and aarch64")
         }
     }
 }
@@ -233,6 +247,91 @@ unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
         _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b as i8)),
     );
     _mm256_movemask_epi8(equal) as u32 as u64
+}
+
+/// The top bit of each byte of `v`, packed into bit `i` of the result for
+/// byte `i`. NEON has no movemask instruction, so the bits are packed by
+/// weight: byte `i` is weighted by `2^(i % 8)`, and the eight weights of each
+/// half are added. The weights are distinct powers of two, so the sum is the
+/// mask, not an approximation.
+///
+/// The weight has to meet a full byte, not a single bit: a compare byte is
+/// `0xFF` for a match and `0x00` otherwise, so ANDing it with its weight
+/// gives the weight for a match and zero for a miss. Shifting the top bit
+/// down to bit 0 first would break this -- `1 & 2`, `1 & 4` and so on are
+/// all zero, so every lane but the first of each half would be dropped
+/// (only mask bits 0, 8, 16 and 24 would survive).
+///
+/// A 4-bits-per-byte mask (`vshrn`) would be fewer instructions here, but it
+/// does not fit what the callers count and find: they take `trailing_zeros` of
+/// a one-bit-per-byte mask and mask with `STEP` bits, so a 4-bit mask means
+/// changing every caller. The one-bit mask keeps the callers untouched.
+///
+/// # Safety
+/// None beyond the caller's value: the lanes are plain arithmetic, and no
+/// memory is touched.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn neon_movemask(v: std::arch::aarch64::uint8x16_t) -> u32 {
+    use std::arch::aarch64::*;
+    // Safety: the lanes are plain arithmetic on a value the caller built.
+    const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    let weighted = unsafe { vandq_u8(v, vld1q_u8(WEIGHTS.as_ptr())) };
+    let lo = unsafe { vaddv_u8(vget_low_u8(weighted)) };
+    let hi = unsafe { vaddv_u8(vget_high_u8(weighted)) };
+    (lo as u32) | ((hi as u32) << 8)
+}
+
+/// The NEON compare of two registers' worth: one bit per byte of `x` at `xi`
+/// that equals `y` at `yi`.
+///
+/// # Safety
+/// NEON is baseline on aarch64, `xi + 32 <= x.len()` and `yi + 32 <= y.len()`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn neon_same(x: &[u8], xi: usize, y: &[u8], yi: usize) -> u64 {
+    use std::arch::aarch64::*;
+    // Safety: the bounds are the caller's promise.
+    let (a_lo, a_hi, b_lo, b_hi) = unsafe {
+        (
+            vld1q_u8(x.as_ptr().add(xi)),
+            vld1q_u8(x.as_ptr().add(xi + 16)),
+            vld1q_u8(y.as_ptr().add(yi)),
+            vld1q_u8(y.as_ptr().add(yi + 16)),
+        )
+    };
+    let lo = unsafe { neon_movemask(vceqq_u8(a_lo, b_lo)) };
+    let hi = unsafe { neon_movemask(vceqq_u8(a_hi, b_hi)) };
+    (lo as u64) | ((hi as u64) << 16)
+}
+
+/// The NEON compare.
+///
+/// # Safety
+/// NEON is baseline on aarch64, and `at + 32 <= data.len()`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn neon_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
+    use std::arch::aarch64::*;
+    // Safety: the bounds are the caller's promise.
+    let (lo, hi) = unsafe {
+        (
+            vld1q_u8(data.as_ptr().add(at)),
+            vld1q_u8(data.as_ptr().add(at + 16)),
+        )
+    };
+    // No `unsafe` here: inside a function with `target_feature(enable =
+    // "neon")`, the NEON intrinsics need no unsafe block, and clippy denies
+    // the unused one. The loads above keep theirs: raw-pointer arithmetic
+    // is unsafe, and so is the `neon_movemask` call below.
+    let (ba, bb) = (vdupq_n_u8(a), vdupq_n_u8(b));
+    let eq_lo = vorrq_u8(vceqq_u8(lo, ba), vceqq_u8(lo, bb));
+    let eq_hi = vorrq_u8(vceqq_u8(hi, ba), vceqq_u8(hi, bb));
+    let lo = unsafe { neon_movemask(eq_lo) };
+    let hi = unsafe { neon_movemask(eq_hi) };
+    (lo as u64) | ((hi as u64) << 16)
 }
 
 const ONES: u64 = 0x0101_0101_0101_0101;
@@ -435,9 +534,17 @@ fn word_at(data: &[u8], at: usize) -> u64 {
 fn fixed() -> Wide {
     Wide(())
 }
-#[cfg(not(all(
-    target_arch = "x86_64",
-    any(target_feature = "avx2", target_feature = "avx512bw")
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fixed() -> Wide {
+    Wide(())
+}
+#[cfg(not(any(
+    all(
+        target_arch = "x86_64",
+        any(target_feature = "avx2", target_feature = "avx512bw")
+    ),
+    target_arch = "aarch64"
 )))]
 #[inline(always)]
 fn fixed() -> Swar {
@@ -695,6 +802,61 @@ mod tests {
                     skip_quoted_with(w, &d, from, end),
                     skip_quoted_with(Swar, &d, from, end),
                 );
+            }
+        }
+    }
+
+    /// `Wide`'s masks against a byte at a time, for every delimiter value and
+    /// every offset a vector step can start at. Only runs where the CPU has
+    /// the vector width: elsewhere there is one width and nothing to compare.
+    /// `Swar` has no `hits`/`same` of its own -- its path is the `match_bits`
+    /// fallback in the `next_of*_with` functions, which
+    /// `both_widths_find_the_same_bytes` already compares end to end -- so
+    /// the reference here is the scalar definition of the mask itself.
+    #[test]
+    fn wide_masks_match_a_byte_at_a_time() {
+        let Some(w) = Wide::detect() else { return };
+        let mut x = 0x9e37_79b9_u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        // Random data with every byte value present, over several vector steps.
+        let mut d = Vec::new();
+        for _ in 0..300 {
+            d.push((next() % 251) as u8);
+        }
+        // Every delimiter value, paired with a second one that is sometimes
+        // the same, sometimes a neighbour, sometimes far away.
+        for a in 0..=255u8 {
+            for b in [a, a.wrapping_add(1), a.wrapping_sub(1), 0, 255] {
+                for at in 0..=(d.len() - STEP) {
+                    let mut want = 0u64;
+                    for i in 0..STEP {
+                        if d[at + i] == a || d[at + i] == b {
+                            want |= 1 << i;
+                        }
+                    }
+                    assert_eq!(w.hits(&d, at, a, b), want, "hits at {at} for {a}/{b}");
+                }
+            }
+        }
+        // `same` over two random slices, at every offset pair that fits.
+        let mut e = Vec::new();
+        for _ in 0..300 {
+            e.push((next() % 251) as u8);
+        }
+        for xi in 0..=(d.len() - STEP) {
+            for yi in 0..=(e.len() - STEP) {
+                let mut want = 0u64;
+                for i in 0..STEP {
+                    if d[xi + i] == e[yi + i] {
+                        want |= 1 << i;
+                    }
+                }
+                assert_eq!(w.same(&d, xi, &e, yi), want, "same at {xi}/{yi}");
             }
         }
     }
