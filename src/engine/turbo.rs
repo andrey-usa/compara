@@ -873,11 +873,15 @@ impl RowIndex {
         if let Some(hook) = after_sweep {
             hook(total);
         }
-        if let Some(arrays) = arrays
-            && idx.insert_parallel(side, key_size, opt, threads, arrays)?
-        {
-            phases.mark("index insert (parallel)");
-            return Ok((idx, fparts));
+        if let Some(arrays) = arrays {
+            if idx.insert_parallel(side, key_size, opt, threads, arrays)? {
+                phases.mark("index insert (parallel)");
+                return Ok((idx, fparts));
+            }
+            // Equal stored hashes over different keys, or a region filled past
+            // its probe: the serial insertion below has the answer. Marked, so
+            // the phases tell a parallel run that fell back from a serial one.
+            phases.mark("index insert (parallel, abandoned)");
         }
         idx.first_row = alloc::sized(total, "one row per distinct key")?;
         idx.occurrences = alloc::sized(total, "one count per distinct key")?;
