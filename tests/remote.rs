@@ -744,4 +744,40 @@ fn metadata_addresses_are_not_read() {
     let (code, err) = run(&format!("http://127.0.0.1:{port}/redir.csv"));
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("link-local"), "{err}");
+    // Through a proxy, which would look the name up itself and answer from
+    // the metadata service: refused before the proxy hears of it.
+    let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_url = format!("http://127.0.0.1:{}", proxy.local_addr().unwrap().port());
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = asked.clone();
+    std::thread::spawn(move || {
+        for mut stream in proxy.incoming().flatten() {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nkey\nsec\n",
+            );
+        }
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_compara"))
+        .args([
+            "head",
+            "http://metadata.google.internal/computeMetadata/v1/x.csv",
+        ])
+        .env_remove("COMPARA_ALLOW_LINK_LOCAL")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .env("HTTP_PROXY", &proxy_url)
+        .env("HTTPS_PROXY", &proxy_url)
+        .output()
+        .expect("run compara");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("link-local"), "{err}");
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the proxy was asked"
+    );
 }

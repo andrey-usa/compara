@@ -127,6 +127,30 @@ pub fn contained() -> Option<u64> {
     CONTAINED.get().copied().flatten()
 }
 
+/// What one input may hold in an in-memory file: a quarter of what is free,
+/// since both sides expand at once and the engines need the rest; inside a
+/// container, no more than a sixth of the heap limit, which [`hold`] then
+/// takes it out of.
+pub fn in_memory_budget() -> u64 {
+    let free = available(None) / 4;
+    contained().map_or(free, |cap| free.min(cap / 6))
+}
+
+/// Takes `bytes` an in-memory file holds off the heap limit [`contain`] set:
+/// the kernel counts that file against the container like the heap, and
+/// unlike a temporary file's pages it cannot be reclaimed, so heap and files
+/// together stay under the limit and running out is still a refusal.
+pub fn hold(bytes: u64) {
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if contained().is_none() {
+        return;
+    }
+    let _turn = ONE_AT_A_TIME.lock();
+    if let Some(now) = rlimit::data() {
+        rlimit::cap_data(now.saturating_sub(bytes));
+    }
+}
+
 /// The heap this process may have: its data limit (`ulimit -d`, or the one
 /// [`contain`] set from a container's), if it has one.
 pub fn heap_limit() -> Option<u64> {

@@ -7,7 +7,9 @@
 //! - a local file is read where it is;
 //! - `-` is standard input, spooled to a temporary file;
 //! - a gzip or zstd file (`.csv.gz`, `.ndjson.zst`, whatever its name) is
-//!   decompressed to a temporary file, by its first bytes rather than its name;
+//!   decompressed, by its first bytes rather than its name: on Linux into an
+//!   in-memory file while it fits a quarter of the memory free, to a
+//!   temporary file past that and elsewhere;
 //! - with the `cloud` feature, an `s3://`, `gs://`, `az://` or `https://` URL
 //!   is downloaded in parallel ranges, and a Parquet object only as far as the
 //!   comparison reads it: its footer and the column chunks of the columns it
@@ -17,7 +19,11 @@
 //! when the [`Source`] does. In a container that is the writable scratch
 //! space -- an `emptyDir` under a read-only root -- and a page cache the
 //! kernel can reclaim, where holding the bytes in memory would count against
-//! the container's limit until the end.
+//! the container's limit until the end. A decompressed input is the exception
+//! while it is small next to what is free (within that limit): writing it
+//! out made the disk, not the decoder, the slowest step of a compressed
+//! comparison -- 8 to 30 s a side for a 1.7 GB table on a VM whose disk
+//! takes 150 MB/s, against 3.5 s, the decoder's own pace, into memory.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -42,6 +48,9 @@ pub struct Source {
     stored: u64,
     temps: Vec<PathBuf>,
     steps: Vec<String>,
+    /// The in-memory file `path` names, when the input was expanded into one;
+    /// it goes when the [`Source`] does.
+    held: Option<File>,
 }
 
 impl Drop for Source {
@@ -148,6 +157,7 @@ impl Source {
                 stored: meta.len(),
                 temps: Vec::new(),
                 steps: Vec::new(),
+                held: None,
             }
         };
         source.decompress()?;
@@ -204,6 +214,7 @@ impl Source {
             stored: 0,
             temps: vec![combined.path.clone()],
             steps: Vec::new(),
+            held: None,
         };
         let total: u64 = files
             .iter()
@@ -233,6 +244,7 @@ impl Source {
             stored: 0,
             temps: vec![path],
             steps: Vec::new(),
+            held: None,
         };
         let mut out = BufWriter::with_capacity(1 << 20, crate::memory::WriteBehind::new(file));
         let n = std::io::copy(&mut std::io::stdin().lock(), &mut out)
@@ -295,14 +307,16 @@ impl Source {
             return Ok(());
         };
         let started = Instant::now();
-        let (path, file) = temp_file("plain")?;
-        self.temps.push(path.clone());
         let input = BufReader::with_capacity(
             1 << 20,
             File::open(&self.path)
                 .map_err(|e| Error::new(format!("cannot read {}: {e}", self.spec)))?,
         );
-        let mut out = BufWriter::with_capacity(1 << 20, crate::memory::WriteBehind::new(file));
+        let budget = crate::memory::in_memory_budget();
+        let mut out = match memfd::create() {
+            Some(file) => Sink::Memory(file),
+            None => Sink::disk(&mut self.temps)?,
+        };
         let read = std::rc::Rc::new(std::cell::Cell::new(0u64));
         let input = Counted(input, read.clone());
         let bad = |e: std::io::Error| {
@@ -322,6 +336,11 @@ impl Source {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(bad(e)),
             };
+            if let Sink::Memory(file) = &mut out
+                && written + k as u64 > budget
+            {
+                out = Sink::spill(file, &mut self.temps)?;
+            }
             out.write_all(&buf[..k]).map_err(bad)?;
             written += k as u64;
             if ratio > 0 && written > EXPANSION_FLOOR && written / read.get().max(1) > ratio {
@@ -340,14 +359,108 @@ impl Source {
         if let Some(i) = self.temps.iter().position(|t| *t == self.path) {
             let _ = std::fs::remove_file(self.temps.remove(i));
         }
-        self.path = path;
+        let place = match out {
+            Sink::Memory(file) => {
+                crate::memory::hold(written);
+                self.path = memfd::path(&file);
+                self.held = Some(file);
+                " in memory"
+            }
+            Sink::Disk(_, path) => {
+                self.path = path;
+                ""
+            }
+        };
         self.steps.push(format!(
-            "{kind}-decompressed {} to {} in {:.1}s",
+            "{kind}-decompressed {} to {}{place} in {:.1}s",
             human(self.stored),
             human(written),
             started.elapsed().as_secs_f64()
         ));
         Ok(())
+    }
+}
+
+/// Where a decompressed input goes.
+enum Sink {
+    Memory(File),
+    Disk(BufWriter<crate::memory::WriteBehind>, PathBuf),
+}
+
+impl Sink {
+    fn disk(temps: &mut Vec<PathBuf>) -> Result<Sink> {
+        let (path, file) = temp_file("plain")?;
+        temps.push(path.clone());
+        let out = BufWriter::with_capacity(1 << 20, crate::memory::WriteBehind::new(file));
+        Ok(Sink::Disk(out, path))
+    }
+
+    /// A temporary file holding what the in-memory one does, which it
+    /// replaces.
+    fn spill(memory: &mut File, temps: &mut Vec<PathBuf>) -> Result<Sink> {
+        use std::io::{Seek, SeekFrom};
+        let mut disk = Sink::disk(temps)?;
+        memory.seek(SeekFrom::Start(0))?;
+        std::io::copy(memory, &mut disk)?;
+        Ok(disk)
+    }
+}
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Sink::Memory(file) => file.write(buf),
+            Sink::Disk(out, _) => out.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Sink::Memory(file) => file.flush(),
+            Sink::Disk(out, _) => out.flush(),
+        }
+    }
+}
+
+/// Files in memory, which the engines map as they would any other file
+/// (through `/proc/self/fd`). Linux only; elsewhere [`create`] says no.
+mod memfd {
+    use std::fs::File;
+    use std::path::PathBuf;
+
+    #[cfg(target_os = "linux")]
+    pub fn create() -> Option<File> {
+        use std::os::fd::FromRawFd;
+        unsafe extern "C" {
+            fn memfd_create(
+                name: *const std::ffi::c_char,
+                flags: std::ffi::c_uint,
+            ) -> std::ffi::c_int;
+        }
+        const CLOEXEC: std::ffi::c_uint = 1;
+        if !std::path::Path::new("/proc/self/fd").is_dir() {
+            return None;
+        }
+        // SAFETY: a NUL-terminated name; the descriptor returned is new and
+        // owned by the File from here on.
+        let fd = unsafe { memfd_create(c"compara-plain".as_ptr(), CLOEXEC) };
+        (fd >= 0).then(|| unsafe { File::from_raw_fd(fd) })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn create() -> Option<File> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn path(file: &File) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn path(_: &File) -> PathBuf {
+        unreachable!("no in-memory files here")
     }
 }
 
@@ -630,6 +743,7 @@ mod tests {
             stored: 0,
             temps: Vec::new(),
             steps: Vec::new(),
+            held: None,
         };
         assert_eq!(s("s3://b/dir/a.csv").name(), "a.csv");
         assert_eq!(
