@@ -17,8 +17,8 @@ Parquet a warehouse emits, a migration's source against its target.
   Parquet**, and the two sides need not be in the same format.
 - Ten million rows × 20 columns in about a second on four cores
   ([numbers below](#speed)).
-- Reads and writes **object storage and the web** directly -- `s3://`,
-  `gs://`, `az://`, `https://` -- with each cloud's own credentials, and
+- Reads and writes **object storage and the web** directly (`s3://`,
+  `gs://`, `az://`, `https://`), with each cloud's own credentials, and
   fetches only the Parquet columns it compares
   ([cloud and containers](#cloud-and-containers)).
 - One static binary, and a distroless container image; the report is a
@@ -130,7 +130,7 @@ aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
   their credentials), by address, by name or by a redirect, is refused;
   `COMPARA_ALLOW_LINK_LOCAL=1` allows it. Redirects stop after 10.
 - **A table of many files is one side**: a directory, a quoted glob, or an
-  object storage prefix is its files read as one table, in path order --
+  object storage prefix is its files read as one table, in path order:
   Spark and Hive output (`date=2026-10-01/part-00000.snappy.parquet`), a
   warehouse unload (`unload/0000_part_00.csv.gz`). CSV parts must share a
   header and Parquet parts a schema, and the error names the part that does
@@ -142,9 +142,9 @@ aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
   partitioned table compares with a flat export that has those columns.
   Names starting with `.` or `_` (`_SUCCESS`, `.crc`) are passed over.
 - **A Delta table is read at a version**: `s3://lake/orders/` is its latest
-  version, `s3://lake/orders@v41` the forty-first -- the files its log
+  version, `s3://lake/orders@v41` the forty-first: the files its log
   (`_delta_log/`, checkpoint and commits) says make that version, and no
-  others -- so two versions compare like two tables:
+  others, so two versions compare like two tables:
   `compara compare s3://lake/orders@v41 s3://lake/orders -k order_id`.
   Deletion vectors and column mapping are refused rather than read wrong; an
   Iceberg table is refused.
@@ -155,8 +155,8 @@ aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
   export. `--json -` prints the summary on stdout and the counts on stderr.
 
 Against DuckDB 2.0.0 reading the same objects over S3 (`httpfs`), on one
-keyed comparison of 10M rows a side, both tools giving the same four counts
--- an S3 server (SeaweedFS) on the same 4-core runner, best of three (CI run
+keyed comparison of 10M rows a side, both tools giving the same four counts,
+an S3 server (SeaweedFS) on the same 4-core runner, best of three (CI run
 39793328982):
 
 | input on S3 | compara | DuckDB | peak RSS, compara / DuckDB |
@@ -181,7 +181,7 @@ In a container:
   needed how much (exit 2), and under `--engine auto` a CSV pair is compared
   by the engine that spills to disk instead, with the same answer.
 - A read-only root filesystem works; standard input, compressed and remote
-  inputs and the spilling engine need a writable `TMPDIR` -- in Kubernetes an
+  inputs and the spilling engine need a writable `TMPDIR`; in Kubernetes an
   `emptyDir` (disk-backed: a `medium: Memory` one counts against the memory
   limit).
 - `compara env` prints what the process sees: CPUs, memory, the container's

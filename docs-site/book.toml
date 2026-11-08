@@ -1,0 +1,12 @@
+[book]
+title = "compara"
+authors = ["andrey-usa"]
+language = "en"
+description = "Extremely fast table comparison — CSV, TSV, Parquet and NDJSON on a composite key, with counts, per-column statistics and a self-contained HTML report."
+
+[build]
+build-dir = "book"
+
+[output.html]
+site-url = "/compara/"
+git-repository-url = "https://github.com/andrey-usa/compara"
