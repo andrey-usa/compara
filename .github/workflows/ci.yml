@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      perf_base:
+        description: "a release tag: run perf-gate against it (the release gate does, on the commit to release)"
+        default: ""
 
 permissions:
   contents: read
@@ -97,9 +101,10 @@ jobs:
   # The work a comparison takes, held to the base branch's: instructions
   # counted by valgrind (exact, so a busy runner can't move them) on fixed
   # files at two sizes, for each engine. Fails on more than 5% over the base,
-  # or on a cost that grows faster than the rows (scripts/perf_gate.py).
+  # or on a cost that grows faster than the rows (scripts/perf_gate.py). The
+  # base is the pull request's, or on a dispatch the release in perf_base.
   perf-gate:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || inputs.perf_base != ''
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -113,7 +118,7 @@ jobs:
       - run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends valgrind
       - name: Build the head and the base
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.perf_base }}
         run: |
           cargo build --locked --release --bin compara --bin compara-gen-data
           mkdir -p gate
