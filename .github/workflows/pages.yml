@@ -1,9 +1,10 @@
 name: Deploy docs to GitHub Pages
 
+# docs-site/build.py writes most pages from README.md, the example files and
+# `compara --help`, so any push to main can change the site.
 on:
   push:
     branches: ["main"]
-    paths: ["docs-site/**"]
   workflow_dispatch:
 
 permissions:
@@ -20,6 +21,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: stable
+      - name: Build compara (for `--help`)
+        run: cargo build --release --locked
+      - name: Write the pages from their sources
+        run: python3 docs-site/build.py target/release/compara
       - name: Install mdBook
         run: |
           mkdir -p /tmp/mdbook
