@@ -2,7 +2,7 @@
 
 One pair of files holding every shape that has broken an engine in this project, or plausibly
 could. Both wrong answers this tool has shipped needed neither an unusual option nor a malformed
-file — one wanted a key in the last eight bytes of the file, the other a key outside ASCII — so the
+file. One wanted a key in the last eight bytes of the file, the other a key outside ASCII, so the
 generated benchmark data, which is uniform and pure ASCII, could never have found either.
 
 | Row | What it is there for |
@@ -51,8 +51,8 @@ CSV, as newline-delimited JSON, or as any of the Parquet encodings a writer migh
 
 They are written by pyarrow (`scripts/make_parquet_fixtures.py`), not by this project: a reader
 tested only against files its own writer produced tests nothing. `typed.csv` is the stated
-expectation for how a typed column becomes text — integers and decimals in full, floats in the
-shortest round-trip form, dates `YYYY-MM-DD`, timestamps ISO 8601 — so a change to that rule fails
+expectation for how a typed column becomes text (integers and decimals in full, floats in the
+shortest round-trip form, dates `YYYY-MM-DD`, timestamps ISO 8601), so a change to that rule fails
 a test rather than passing quietly.
 
 # Fold
