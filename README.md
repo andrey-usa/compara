@@ -156,8 +156,8 @@ aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
 
 Against DuckDB 2.0.0 reading the same objects over S3 (`httpfs`), on one
 keyed comparison of 10M rows a side, both tools giving the same four counts,
-an S3 server (SeaweedFS) on the same 4-core runner, best of three (CI run
-39793328982):
+an S3 server (SeaweedFS) on the same 4-core runner, best of three
+([CI run 39793328982](https://github.com/andrey-usa/compara-polyglot-experiments/actions/runs/39793328982)):
 
 | input on S3 | compara | DuckDB | peak RSS, compara / DuckDB |
 |---|---:|---:|---:|
@@ -237,7 +237,8 @@ spec:
 Ten million rows × 20 columns, keyed on `(account_id, txn_id)`, `--ignore
 updated_at`, four threads on a 4 vCPU / 16 GB GitHub Actions runner, best of
 five. Each format ran on a runner of its own, named below (CI runs
-39728430053 and 39729034092 in
+[39728430053](https://github.com/andrey-usa/compara-polyglot-experiments/actions/runs/39728430053) for CSV and Parquet and
+[39729034092](https://github.com/andrey-usa/compara-polyglot-experiments/actions/runs/39729034092) for ndjson, in
 [compara-polyglot-experiments](https://github.com/andrey-usa/compara-polyglot-experiments)).
 Each cell is wall time · CPU time · memory above the mapped input.
 
@@ -248,7 +249,7 @@ Each cell is wall time · CPU time · memory above the mapped input.
 | Parquet | 1,535 MB | Intel Xeon 6973P-C | 1.17 s · 3.8 s · 1,174 MB |
 
 Two Parquet files against DuckDB and Polars, on the same kind of runner
-(CI run 39468615515: a 5M-row pair written by pyarrow, counts only, median
+([CI run 39468615515](https://github.com/andrey-usa/compara-polyglot-experiments/actions/runs/39468615515): a 5M-row pair written by pyarrow, counts only, median
 of three): compara 1.26 s at one thread and 0.56 s at four, DuckDB 6.73 s and
 3.13 s, Polars 4.98 s and 2.73 s. With the changed, added and removed rows
 written out, compara 0.72 s at four threads, DuckDB 4.00 s, Polars 2.74 s.

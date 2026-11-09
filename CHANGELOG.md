@@ -10,11 +10,13 @@ All notable changes to this project are documented here. The format follows
 
 - Keys built to share one hash made a compare quadratic: every engine
   hashed keys with a fixed FNV, and a file whose keys cancel each other's
-  words put every row in one probe chain (40,000 such rows, 0.9 MB: 40 s
-  instead of 10 ms). Keys are now hashed by a full 64x64-bit multiply,
+  words put every row in one probe chain, so the work grew with the square of
+  the rows (`tests/hostile.rs` builds such keys). Keys are now hashed by a full 64x64-bit multiply,
   folded, by a multiplier and from a start chosen at random for each run,
   so they can't be built to collide. Results are the same as before, byte
-  for byte, and as fast. `COMPARA_HASH_SEED` fixes the keys for a run that
+  for byte, and no slower: turbo takes 3.0% fewer instructions at 50k rows
+  and 2.4% fewer at 200k than 0.6.0 does with this and the 32-bit hash
+  below (cachegrind, [run 42703350843](https://github.com/andrey-usa/compara/actions/runs/42703350843)). `COMPARA_HASH_SEED` fixes the keys for a run that
   must repeat exactly (a benchmark).
 
 ### Changed
@@ -22,22 +24,26 @@ All notable changes to this project are documented here. The format follows
 - A gzip or zstd input is expanded into memory on Linux while it fits a
   quarter of the memory free (inside a container, a sixth of the heap
   limit, which it then comes out of), and to `TMPDIR` past that. A 10M-row
-  `.csv.zst` pair: 10.3 to 5.8 s (median of 3, 4 cores), the same counts and
-  peak memory; on a VM whose disk writes 150 MB/s, each side took 8 to 30 s
-  to expand to a file and takes 3.5 to 4 s in memory.
+  `.csv.zst` pair compares in 3.03 s on a 4-core runner, with the same
+  counts as DuckDB (best of 3, the `zstd` job of bench-contenders, [run
+  41494922719](https://github.com/andrey-usa/compara/actions/runs/41494922719)).
 - The sortmerge engine sorts each batch by an eight-byte key prefix held
-  beside the row number, reading the key text only on a tie: 1M rows 5.9 s
-  -> 4.35 s on one core, 2M rows 7.7 s -> 6.7 s on two; same output.
+  beside the row number, reading the key text only on a tie; same output.
+  With the spill record below, sortmerge takes 30.9% fewer instructions at
+  50k rows and 30.1% fewer at 200k than 0.6.0 (cachegrind, [run
+  42703350843](https://github.com/andrey-usa/compara/actions/runs/42703350843)).
 - The turbo engine keeps each row's key hash in 32 bits rather than 64 (it
   only ever filtered candidates; the key bytes decide), and frees the
-  duplicate-key counts once the duplicate sections are written: 10M rows
-  take about 79 MB less memory (700 -> 625 MB of heap), 2M rows 161 -> 132
-  MB, with 1.3% fewer instructions; same output.
+  duplicate-key counts once the duplicate sections are written: 1.9% fewer
+  instructions at 50k rows and 0.9% fewer at 200k (cachegrind, [run
+  40973415500](https://github.com/andrey-usa/compara/actions/runs/40973415500)); same output.
 - The sortmerge engine's spilled runs hold each row as one record (its
   length, a length per cell, then its text), read back in two reads and
   checked once, where each cell was read and checked on its own: about a
-  quarter fewer instructions, 2M rows 5.8 s -> 4.6 s on two cores, runs on
-  disk the same size within 3%; same output. A damaged run (cut short,
+  quarter fewer instructions: 24.3% fewer at 50k rows and 23.4% fewer at
+  200k with runs forced to spill (cachegrind, [run
+  40996649319](https://github.com/andrey-usa/compara/actions/runs/40996649319)); runs on disk about the same size; same
+  output. A damaged run (cut short,
   lengths that don't add up, text that isn't UTF-8) is an error.
 
 ### Fixed
@@ -61,8 +67,10 @@ All notable changes to this project are documented here. The format follows
 - At a tight heap limit (a container's, or `ulimit -d`) a run could abort
   (SIGABRT) instead of refusing with exit 2: while one side's checked
   allocation met the ceiling, the other side's thread could meet it with a
-  small one. The reserve kept for the refusal now covers that too (on ARM,
-  6 aborts in 4,800 runs at 4 MB before, none after).
+  small one. The reserve kept for the refusal now covers that too; a test
+  holds it (`the_band_where_it_aborts_does_not_grow`, green on Linux, ARM,
+  macOS and Windows in [run
+  40372192496](https://github.com/andrey-usa/compara/actions/runs/40372192496)).
 
 ### Changed
 
