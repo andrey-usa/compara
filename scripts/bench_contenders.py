@@ -32,6 +32,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import platform
 import subprocess
 import sys
@@ -184,7 +185,18 @@ def env():
     cpu = next((line.split(":", 1)[1].strip() for line in open("/proc/cpuinfo") if line.startswith("model name")),
                platform.processor())
     mem = next((int(line.split()[1]) // 1024 // 1024 for line in open("/proc/meminfo") if line.startswith("MemTotal")), 0)
-    return {"cpu": cpu, "cores": os.cpu_count(), "memory_gb": mem, "os": platform.platform(terse=True)}
+    return {"cpu": cpu, "cores": os.cpu_count(), "memory_gb": mem, "os": platform.platform(terse=True),
+            "runner": runner_image()}
+
+
+def runner_image():
+    """The runner image this run is on, as GitHub's image names it
+    (ImageOS ubuntu24 -> ubuntu-24.04, plus ImageVersion), or None off
+    GitHub. The docs print it: `ubuntu-latest` moves between images."""
+    name, version = os.environ.get("ImageOS", ""), os.environ.get("ImageVersion", "")
+    m = re.fullmatch(r"ubuntu(\d\d)", name)
+    name = f"ubuntu-{m.group(1)}.04" if m else name
+    return f"{name}, image {version}" if name and version else name or None
 
 
 def notices(doc, title="bench json"):

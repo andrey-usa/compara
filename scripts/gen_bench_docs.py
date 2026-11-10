@@ -88,6 +88,8 @@ def main():
     head = [f"{NAMES[n]} {ver[n]}".strip() for n in names]
     date = doc["generated_utc"][:10]
     machine = f"{env['cpu']}, {env['cores']} cores, {env['memory_gb']} GB"
+    # Runs from before the image was recorded ran on the moving label.
+    runner = env.get("runner") or "ubuntu-latest"
     what = (f"Two tables of {doc['columns']} columns compared on a composite key "
             f"(`-k {','.join(doc['key'])} -i {doc['ignore']}`), every tool's unchanged, changed, added "
             f"and removed counts checked identical")
@@ -115,7 +117,7 @@ def main():
             "lack of memory says so.").format(runs=doc["runs"])
 
     readme = ["## Benchmarks", "",
-              f"{what}, on GitHub's `ubuntu-latest` ({machine}), {link}, {date}:", ""] + table + [
+              f"{what}, on GitHub's `{runner}` ({machine}), {link}, {date}:", ""] + table + [
               "", note, "", loss_line, "",
               f"The method, every run and object storage: [Benchmarks]({SITE}benchmarks/results.html).", ""]
     if "--readme" in opts:
@@ -137,7 +139,7 @@ def main():
         f"{label(inp)}: " + ", ".join(f"{v_:,} {k}" for k, v_ in inp["tools"]["compara"]["counts"].items())
         for inp in inputs)
     page = ["# Benchmarks", "", f"Numbers: {link}, {date}.", "",
-            f"{what}. Run on GitHub's `ubuntu-latest`: {machine}, {env['os']}.", ""] + table + ["", note, "",
+            f"{what}. Run on GitHub's `{runner}`: {machine}, {env['os']}.", ""] + table + ["", note, "",
             "## Every run", "",
             f"The runs go round the tools in turn ({doc['runs']} rounds), so a slow minute on the runner "
             "falls on all of them.", ""] + runs + ["",
