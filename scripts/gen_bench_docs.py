@@ -23,6 +23,7 @@ REPO = "andrey-usa/compara"
 SITE = "https://andrey-usa.github.io/compara/"
 NAMES = {"compara": "compara", "duckdb": "DuckDB", "polars": "Polars"}
 FORMATS = {"csv": "CSV", "parquet": "Parquet", "ndjson": "NDJSON"}
+TIE = 0.02  # closer than 2% is a tie, not a loss: about what one run varies by
 
 
 def fetch(run):
@@ -104,10 +105,10 @@ def main():
                                 ("peak_rss_mb", "peak memory", lambda x: f"{x:,} MB")):
             mine = rs["compara"][key]
             for n in done[1:] if done and done[0] == "compara" else []:
-                if rs[n][key] < mine:
+                if rs[n][key] < mine * (1 - TIE):
                     losses.append(f"{what_} on {label(inp)}: {NAMES[n]} {fmt(rs[n][key])}, compara {fmt(mine)}")
-    loss_line = ("Where another tool did better in this run: " + "; ".join(losses) + "."
-                 if losses else "No other tool did better than compara on any measure in this run.")
+    loss_line = ("Where another tool did better in this run (by more than 2%): " + "; ".join(losses) + "."
+                 if losses else "No other tool did better than compara by more than 2% on any measure in this run.")
     note = ("Each cell: wall time, best of {runs} · CPU time (user and system) · peak memory, of the best "
             "run; fastest in bold. DuckDB and Polars run from Python, and their time starts at their first "
             "read, after the interpreter's start and the import. A tool the runner's kernel stopped for "
@@ -161,8 +162,9 @@ def main():
     if "--page" in opts:
         open(opts["--page"], "w").write("\n".join(page))
     lose = ["# Where compara is not ahead", "", f"Numbers: {link}, {date}.", "",
-            "Each measure of the benchmarks on which another tool beat compara in this run, read from its "
-            "results: wall time, CPU time and peak memory, on each input.", ""]
+            "Each measure of the benchmarks on which another tool beat compara in this run by more than "
+            "2%, read from its results: wall time, CPU time and peak memory, on each input. Closer than "
+            "that is a tie.", ""]
     lose += [f"- {x[0].upper() + x[1:]}." for x in losses] or ["- None in this run."]
     if "--losses" in opts:
         open(opts["--losses"], "w").write("\n".join(lose) + "\n")
