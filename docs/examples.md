@@ -6,7 +6,7 @@ A recurring comparison gets a name in `compara.toml`; every field is
 optional and the command line overrides the profile.
 
 ```toml
-{{#include ../../compara.example.toml}}
+{{#include ../compara.example.toml}}
 ```
 
 ## The shipped example pair
@@ -22,12 +22,12 @@ compara compare examples/orders_2026-08.csv examples/orders_2026-09.csv \
 First rows of `orders_2026-08.csv`:
 
 ```csv
-{{#include ../../examples/orders_2026-08.csv:1:5}}
+{{#include ../examples/orders_2026-08.csv:1:5}}
 ```
 
 First rows of `orders_2026-09.csv` (note the extra `carrier` column and
 the changed `status` values):
 
 ```csv
-{{#include ../../examples/orders_2026-09.csv:1:5}}
+{{#include ../examples/orders_2026-09.csv:1:5}}
 ```
