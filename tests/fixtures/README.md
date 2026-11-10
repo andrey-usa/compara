@@ -78,3 +78,6 @@ footers small enough to write inline.
 | `zstd_bomb.parquet` | one zstd page whose header says 36 KB and whose stream inflates to 256 MB of zeros (written by pyarrow, then the page body swapped) |
 | `negative_page_size.parquet` | a mutant of `formats/b_dict_snappy.parquet` with a negative compressed page size |
 | `delta_header.parquet` | a mutant of `formats/a_delta_v2.parquet` whose `DELTA_BINARY_PACKED` header asks for a 10^16-value miniblock |
+| `page_values_bomb.parquet` | found by fuzzing: a data page that claims 1.47 billion values in 1.5 KB |
+| `bit_width_overflow.parquet` | found by fuzzing: a page whose packed values claim 110 bits each |
+| `snappy_length.parquet` | found by fuzzing: a snappy page of 11 bytes by its header whose stream opens with a length of 11.5 GB |

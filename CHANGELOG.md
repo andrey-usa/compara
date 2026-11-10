@@ -15,6 +15,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- A snappy page in a Parquet file is held to the size its page header
+  gives before any room is made for it. The stream opens with a length
+  of its own, and the columnar reader took that length's word: a 2.8 KB
+  file whose 11-byte page opened with "11.5 GB follow" had that much
+  address space reserved, and was then refused as out of memory, or as
+  a page that would not decompress, depending on the machine. It is now
+  refused at once as what it is (`a snappy Parquet page declares
+  11542724607 bytes where its header says 11`), and a length that the
+  stream's bytes could not expand to (64 bytes from every three is the
+  format's most) is refused before the header is asked. Found by the
+  nightly fuzz job ([run
+  42802471876](https://github.com/andrey-usa/compara/actions/runs/42802471876));
+  the file is `tests/fixtures/hostile/snappy_length.parquet`.
 - Keys built to share one hash made a compare quadratic: every engine
   hashed keys with a fixed FNV, and a file whose keys cancel each other's
   words put every row in one probe chain, so the work grew with the square of

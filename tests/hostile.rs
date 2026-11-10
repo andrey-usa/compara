@@ -242,6 +242,34 @@ fn a_page_that_claims_more_values_than_its_bytes_hold_is_refused() {
 }
 
 #[test]
+fn a_snappy_stream_is_held_to_the_size_its_page_header_gives() {
+    // Found by fuzzing: 2.8 KB with a snappy page of 11 bytes, by its header,
+    // whose stream opens with "11.5 GB follow". The columnar reader took the
+    // stream's word and asked for the room: an abort under a memory limit,
+    // "out of memory" where the machine refused, and where it did not, 11 GB
+    // of address space on the way to "will not decompress".
+    // Compared with itself, so that every column is read: the page is not in
+    // the key column, and a mate without that column never opens it.
+    let file = fixture("hostile/snappy_length.parquet");
+    let limit = Duration::from_secs(20);
+    refused(&[Path::new("head"), &file], &[], limit);
+    refused(
+        &[Path::new("compare"), &file, &file],
+        &["-k", "id", "--summary", "--engine", "turbo"],
+        limit,
+    );
+    let stderr = refused(
+        &[Path::new("compare"), &file, &file],
+        &["-k", "id", "--summary"],
+        limit,
+    );
+    assert!(
+        stderr.contains("declares 11542724607 bytes where its header says 11"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn a_bit_width_wider_than_its_values_is_refused() {
     // Found by fuzzing: a page whose packed values claim 110 bits each. The
     // shift past 64 panicked in a debug build and, in a release one, read

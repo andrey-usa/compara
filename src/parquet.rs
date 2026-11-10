@@ -1171,7 +1171,22 @@ fn expand_append(
     out: &mut Vec<u8>,
     path: &str,
 ) -> Result<()> {
+    let Ok(expected) = usize::try_from(expected) else {
+        return fail("a parquet page has a negative size", path);
+    };
     if codec == Codec::Snappy {
+        // The stream opens with a length of its own, and that is the file's
+        // word as much as the header's is: held to the header's here, which
+        // `page_bomb` has bounded, before it sizes the room for the page.
+        match snappy_length(stored) {
+            Some((declared, _)) if declared != expected => {
+                return Err(Error::new(format!(
+                    "a snappy Parquet page declares {declared} bytes where its header says \
+                     {expected}: {path}"
+                )));
+            }
+            _ => {}
+        }
         if !snappy_append(stored, out)? {
             return fail(
                 "a snappy page in the parquet file will not decompress",
@@ -1180,9 +1195,6 @@ fn expand_append(
         }
         return Ok(());
     }
-    let Ok(expected) = usize::try_from(expected) else {
-        return fail("a parquet page has a negative size", path);
-    };
     let page =
         decompress(codec, stored, expected).map_err(|e| Error::new(format!("{e}: {path}")))?;
     alloc::room(out, page.len(), "the uncompressed column")?;
@@ -1207,6 +1219,13 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> Result<bool> {
     let Some((want, at)) = snappy_length(input) else {
         return Ok(false);
     };
+    // A length the elements cannot reach is a malformed stream, and is said
+    // to be before the room for it is asked for: 2.8 KB that opened with
+    // "11.5 GB follow" had that much reserved, then turned out to be short
+    // (found by fuzzing).
+    if want > snappy_most(input.len() - at) {
+        return Ok(false);
+    }
     let base = out.len();
     // The room past the page lets a short literal or copy move as one or two
     // fixed-width words, spilling up to SNAPPY_SLACK - 1 bytes past its end:
@@ -1245,6 +1264,14 @@ fn snappy_length(input: &[u8]) -> Option<(usize, usize)> {
             return None;
         }
     }
+}
+
+/// The most that `elements` bytes of a snappy stream can expand to. The
+/// densest element is a copy of 64 bytes written in three (a tag and a
+/// two-byte offset); a literal gives back less than it takes, and the other
+/// two copies are 11 bytes from two and 64 from five.
+fn snappy_most(elements: usize) -> usize {
+    (elements / 3 + 1).saturating_mul(64)
 }
 
 /// Bytes `snappy_body` may write past the end of the page it is expanding.
@@ -3268,6 +3295,54 @@ mod tests {
         }
     }
 
+    /// The varint a stream opens with.
+    fn length_prefix(mut n: u64) -> Vec<u8> {
+        let mut s = Vec::new();
+        while n >= 0x80 {
+            s.push((n as u8) | 0x80);
+            n >>= 7;
+        }
+        s.push(n as u8);
+        s
+    }
+
+    #[test]
+    fn snappy_refuses_a_length_its_elements_cannot_reach_before_sizing_anything() {
+        // The fuzzer's file in small: a few bytes that open with "11.5 GB
+        // follow". The room for that was reserved before the stream was read.
+        let mut s = length_prefix(11_542_724_607);
+        s.extend_from_slice(&[0x00, b'a', 0xFE, 0x01, 0x00]);
+        let mut out = Vec::new();
+        assert!(!snappy_append(&s, &mut out).unwrap());
+        assert_eq!(
+            out.capacity(),
+            0,
+            "room was reserved for a length never checked"
+        );
+        // A length one byte more than these elements write is inside the
+        // bound: there the element loop is what says no.
+        let mut s = length_prefix(1 + 64 + 1);
+        s.extend_from_slice(&[0x00, b'a', 0xFE, 0x01, 0x00]);
+        assert!(!snappy_append(&s, &mut out).unwrap());
+    }
+
+    #[test]
+    fn snappy_expands_the_densest_stream_there_is() {
+        // One literal byte, then copies of 64 from one byte back, three bytes
+        // each: the bound on a stream's length must not refuse a real one.
+        for copies in [1usize, 2, 3, 100, 5000] {
+            let mut s = length_prefix(1 + 64 * copies as u64);
+            s.extend_from_slice(&[0x00, b'a']);
+            for _ in 0..copies {
+                s.extend_from_slice(&[0xFE, 0x01, 0x00]);
+            }
+            let mut out = Vec::new();
+            assert!(snappy_append(&s, &mut out).unwrap(), "{copies} copies");
+            assert_eq!(out, vec![b'a'; 1 + 64 * copies], "{copies} copies");
+            assert_eq!(reference(&s).as_deref(), Some(&out[..]));
+        }
+    }
+
     #[test]
     fn snappy_refuses_a_copy_from_before_the_page() {
         let mut out = b"prefix".to_vec();
@@ -3453,11 +3528,22 @@ mod tests {
         for round in 0..20000 {
             let elements = 1 + rng.below(30);
             let (mut stream, _) = random_stream(&mut rng, elements);
-            // The length prefix is left alone: a damaged one asks for a page of
-            // any size, and the allocation, not the decoder, answers that.
             let head = stream.iter().position(|&b| b & 0x80 == 0).unwrap() + 1;
-            match rng.below(3) {
+            match rng.below(4) {
                 0 => stream.truncate(head + rng.below(stream.len() - head + 1)),
+                // The length it opens with, replaced by one of any size up to
+                // 2^63: what the elements cannot reach is refused before any
+                // room is asked for, so this neither allocates nor aborts.
+                3 => {
+                    let mut n = rng.next() << rng.below(31);
+                    let mut prefix = Vec::new();
+                    while n >= 0x80 {
+                        prefix.push((n as u8) | 0x80);
+                        n >>= 7;
+                    }
+                    prefix.push(n as u8);
+                    stream.splice(..head, prefix);
+                }
                 1 => {
                     for _ in 0..1 + rng.below(3) {
                         if stream.len() > head {
