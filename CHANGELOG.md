@@ -51,6 +51,12 @@ All notable changes to this project are documented here. The format follows
   42764485535](https://github.com/andrey-usa/compara-polyglot-experiments/actions/runs/42764485535)).
   On two machines where the CPU bounded it, the two CSV sweeps took less
   than half their time before (indicative: measured outside CI).
+- On arm64 the turbo engine's CSV scan packs its 32 compare bytes into a
+  mask with three pairwise adds and one lane read, where it took four
+  horizontal adds; same mask, same output. A 2M-row CSV pair compares in
+  0.172 s against 0.196 s before on GitHub's arm64 runner (median of 7,
+  interleaved), with 11.0% fewer instructions (cachegrind; [run
+  42772693608](https://github.com/andrey-usa/compara-polyglot-experiments/actions/runs/42772693608)).
 - A gzip or zstd input is expanded into memory on Linux while it fits a
   quarter of the memory free (inside a container, a sixth of the heap
   limit, which it then comes out of), and to `TMPDIR` past that. A 10M-row
