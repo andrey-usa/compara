@@ -9,7 +9,8 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_compara");
 
-/// `0.011s` and `(20 KB)` become `<time>` and `(<size> KB)`.
+/// `0.011s` (or `0s`: a run under a millisecond) and `(20 KB)` become
+/// `<time>` and `(<size> KB)`.
 fn mask(line: &str) -> String {
     line.split(' ')
         .map(|word| {
@@ -19,7 +20,6 @@ fn mask(line: &str) -> String {
                 |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.');
             if let Some(n) = bare.strip_suffix('s')
                 && number(n)
-                && n.contains('.')
             {
                 format!("<time>{tail}")
             } else if let Some(n) = bare.strip_prefix('(')
