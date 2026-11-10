@@ -1,0 +1,41 @@
+# compara
+
+> compara compares two tables on a composite key, extremely fast: CSV, TSV, JSON and Parquet, local or in object storage, with counts, per-column statistics, a JSON summary and a self-contained HTML report. One Rust binary.
+
+Each page below is markdown. The whole site in one file: https://andrey-usa.github.io/compara/llms-full.txt
+
+## Start
+
+- [Install](https://andrey-usa.github.io/compara/start/install.md): Every way to install compara: prebuilt binaries, package managers and the container image.
+- [Quick start](https://andrey-usa.github.io/compara/start/quick-start.md): Two example exports compared, from the counts to the HTML report.
+- [Everyday comparisons](https://andrey-usa.github.io/compara/start/tutorial.md): The comparisons people run most, and what compare writes and when.
+
+## Guides
+
+- [Compare tables in object storage and on the web](https://andrey-usa.github.io/compara/guides/cloud.md): Compare tables on S3, GCS, Azure or a web server, with each cloud's own credentials, partitioned tables and Delta versions.
+- [Run compara in a container, in CI or in Kubernetes](https://andrey-usa.github.io/compara/guides/containers.md): The container image, how compara keeps to a container's limits, the GitHub Action and a Kubernetes Job.
+- [Name a recurring comparison](https://andrey-usa.github.io/compara/guides/profiles.md): Give a comparison you run often a name in compara.toml, and the example pair the repository ships.
+
+## Concepts
+
+- [Engines and formats](https://andrey-usa.github.io/compara/concepts/engines.md): The three engines and their shared result contract, and how each input format is read.
+
+## Reference
+
+- [compare options](https://andrey-usa.github.io/compara/reference/options.md): Every option of compare, duplicate keys and profiles.
+- [The JSON summary](https://andrey-usa.github.io/compara/reference/json-summary.md): The shape of the summary `--json` writes, as a JSON Schema.
+- [compara --help](https://andrey-usa.github.io/compara/reference/help.md): The commands and options exactly as this build prints them.
+
+## Agents
+
+- [For AI agents](https://andrey-usa.github.io/compara/agents/overview.md): What an agent gets: a JSON result, exit codes it can branch on, a read-only default, and these docs as markdown.
+
+## Benchmarks
+
+- [Results](https://andrey-usa.github.io/compara/benchmarks/results.md): compara against DuckDB and Polars on the same comparisons, local and on object storage, each number with its CI run.
+
+## Project
+
+- [Changelog](https://andrey-usa.github.io/compara/project/changelog.md): What changed in each release, and what is on the way.
+- [Contributing](https://andrey-usa.github.io/compara/project/contributing.md): How to build, test and benchmark compara, and the performance gate every change passes.
+- [Security](https://andrey-usa.github.io/compara/project/security.md): What compara protects and how, and how to report a problem.

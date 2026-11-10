@@ -4,9 +4,7 @@
 /out/
 /compara.toml
 __pycache__/
-# The docs site's generated pages (docs-site/build.py writes them).
+# The docs site: docs-site/build.py writes every file under src/ from
+# docs-site/site.toml, and mdBook builds book/ from them.
 /docs-site/book/
-/docs-site/src/index.md
-/docs-site/src/cloud.md
-/docs-site/src/speed.md
-/docs-site/src/cli.md
+/docs-site/src/

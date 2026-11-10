@@ -1,0 +1,129 @@
+# The docs site: its parts, its pages, and where each page's text comes from.
+# docs-site/build.py writes every page from this (python3 docs-site/build.py --help).
+# The parts and their order are the same for every tool; the pages in them differ.
+
+name = "compara"
+repo = "andrey-usa/compara"
+branch = "main"
+binary = "compara"
+summary = """
+compara compares two tables on a composite key, extremely fast: CSV, TSV, JSON
+and Parquet, local or in object storage, with counts, per-column statistics, a
+JSON summary and a self-contained HTML report. One Rust binary.
+"""
+
+[coverage.ignore]
+# README sections that point at the site rather than hold text of their own.
+"README.md" = ["Documentation", "Contributing", "License"]
+
+[[part]]
+title = "Start"
+
+[[part.page]]
+title = "Install"
+path = "start/install.md"
+about = "Every way to install compara: prebuilt binaries, package managers and the container image."
+source = { file = "README.md", section = "Install" }
+
+[[part.page]]
+title = "Quick start"
+path = "start/quick-start.md"
+about = "Two example exports compared, from the counts to the HTML report."
+source = { file = "README.md", section = "Quick start" }
+
+[[part.page]]
+title = "Everyday comparisons"
+path = "start/tutorial.md"
+about = "The comparisons people run most, and what compare writes and when."
+source = { file = "docs/tutorial.md" }
+
+[[part]]
+title = "Guides"
+
+[[part.page]]
+title = "Compare tables in object storage and on the web"
+path = "guides/cloud.md"
+about = "Compare tables on S3, GCS, Azure or a web server, with each cloud's own credentials, partitioned tables and Delta versions."
+source = { file = "docs/guides/cloud.md" }
+
+[[part.page]]
+title = "Run compara in a container, in CI or in Kubernetes"
+path = "guides/containers.md"
+about = "The container image, how compara keeps to a container's limits, the GitHub Action and a Kubernetes Job."
+source = { file = "docs/guides/containers.md" }
+
+[[part.page]]
+title = "Name a recurring comparison"
+path = "guides/profiles.md"
+about = "Give a comparison you run often a name in compara.toml, and the example pair the repository ships."
+source = { file = "docs/examples.md" }
+
+[[part]]
+title = "Concepts"
+
+[[part.page]]
+title = "Engines and formats"
+path = "concepts/engines.md"
+about = "The three engines and their shared result contract, and how each input format is read."
+source = { file = "docs/engines.md" }
+
+[[part]]
+title = "Reference"
+
+[[part.page]]
+title = "compare options"
+path = "reference/options.md"
+about = "Every option of compare, duplicate keys and profiles."
+source = { file = "docs/options.md" }
+
+[[part.page]]
+title = "The JSON summary"
+path = "reference/json-summary.md"
+about = "The shape of the summary `--json` writes, as a JSON Schema."
+source = { file = "docs/json-summary.md" }
+
+[[part.page]]
+title = "compara --help"
+path = "reference/help.md"
+about = "The commands and options exactly as this build prints them."
+source = { run = ["--help"] }
+
+[[part]]
+title = "Agents"
+
+[[part.page]]
+title = "For AI agents"
+path = "agents/overview.md"
+about = "What an agent gets: a JSON result, exit codes it can branch on, a read-only default, and these docs as markdown."
+source = { file = "README.md", section = "For AI agents" }
+
+[[part]]
+title = "Benchmarks"
+
+[[part.page]]
+title = "Results"
+path = "benchmarks/results.md"
+about = "compara against DuckDB and Polars on the same comparisons, local and on object storage, each number with its CI run."
+source = [{ file = "README.md", section = "Benchmarks" }, { file = "docs/benchmarks.md", demote = true }]
+
+[[part]]
+title = "Project"
+
+[[part.page]]
+title = "Changelog"
+path = "project/changelog.md"
+about = "What changed in each release, and what is on the way."
+source = { file = "CHANGELOG.md" }
+long = true
+
+[[part.page]]
+title = "Contributing"
+path = "project/contributing.md"
+about = "How to build, test and benchmark compara, and the performance gate every change passes."
+source = { file = "CONTRIBUTING.md" }
+
+[[part.page]]
+title = "Security"
+path = "project/security.md"
+about = "What compara protects and how, and how to report a problem."
+source = { file = "SECURITY.md" }

@@ -1,12 +1,16 @@
+# mdBook settings, the same in every product but for the names. Its pages are
+# written by docs-site/build.py from docs-site/site.toml.
 [book]
 title = "compara"
 authors = ["andrey-usa"]
 language = "en"
-description = "Extremely fast table comparison — CSV, TSV, Parquet and NDJSON on a composite key, with counts, per-column statistics and a self-contained HTML report."
+description = "Extremely fast table comparison on a composite key: CSV, TSV, JSON and Parquet, local or in object storage. One Rust binary."
 
 [build]
 build-dir = "book"
+create-missing = false
 
 [output.html]
 site-url = "/compara/"
 git-repository-url = "https://github.com/andrey-usa/compara"
+no-section-label = true
