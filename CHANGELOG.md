@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `compara skill` prints the agent skill this version carries: how an
+  agent finds the key, reads the counts and the changed columns as JSON,
+  and gets the rows, with the options that change the answer. A test
+  holds every option it names to one `compara --help` lists.
+
 ### Security
 
 - Keys built to share one hash made a compare quadratic: every engine

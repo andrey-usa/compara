@@ -97,6 +97,12 @@ path = "agents/overview.md"
 about = "What an agent gets: a JSON result, exit codes it can branch on, a read-only default, and these docs as markdown."
 source = { file = "README.md", section = "For AI agents" }
 
+[[part.page]]
+title = "Skill"
+path = "agents/skill.md"
+about = "The guide `compara skill` gives an agent, as this version prints it."
+source = { file = "skills/compara/SKILL.md" }
+
 [[part]]
 title = "Benchmarks"
 

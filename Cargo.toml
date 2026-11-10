@@ -6,11 +6,12 @@ rust-version = "1.90"
 description = "Compare two tables (CSV, NDJSON, Parquet) on a composite key: counts, per-column statistics and a self-contained HTML report."
 license = "MIT"
 repository = "https://github.com/andrey-usa/compara"
-homepage = "https://github.com/andrey-usa/compara"
+homepage = "https://andrey-usa.github.io/compara/"
+documentation = "https://andrey-usa.github.io/compara/"
 readme = "README.md"
 keywords = ["csv", "parquet", "diff", "compare", "data-quality"]
 categories = ["command-line-utilities", "parser-implementations", "development-tools::testing"]
-include = ["/src/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/CHANGELOG.md", "/compara.example.toml"]
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/CHANGELOG.md", "/compara.example.toml", "/skills/**"]
 default-run = "compara"
 
 [lib]

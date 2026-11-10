@@ -210,6 +210,27 @@ fn an_option_compara_does_not_have_is_named() {
     assert_eq!(code, 0, "{stderr}");
 }
 
+/// `compara skill` prints the agent skill this build carries: its front
+/// matter names it, and every option it tells an agent to use is one that
+/// `compara --help` lists.
+#[test]
+fn the_skill_is_printed_and_names_only_real_options() {
+    let out = Command::new(BIN).arg("skill").output().expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let skill = String::from_utf8_lossy(&out.stdout);
+    assert!(skill.starts_with("---\nname: compara\n"), "{skill}");
+    let help = Command::new(BIN).arg("--help").output().expect("runs");
+    let help = String::from_utf8_lossy(&help.stdout);
+    for word in skill.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+        if word.starts_with("--") && word.as_bytes().get(2).is_some_and(u8::is_ascii_alphabetic) {
+            assert!(
+                help.contains(word),
+                "the skill names {word}, which --help does not list"
+            );
+        }
+    }
+}
+
 /// A command compara doesn't have is named in one line with the ones it
 /// does, not followed by sixty lines of usage; a file given where the command
 /// goes gets the line that compares it.
@@ -220,7 +241,7 @@ fn an_unknown_command_lists_the_commands() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("unknown command \"diff\""), "{stderr}");
     assert!(
-        stderr.contains("compare, columns, head, env and version"),
+        stderr.contains("compare, columns, head, env, skill and version"),
         "{stderr}"
     );
     assert_eq!(stderr.lines().count(), 1, "{stderr}");

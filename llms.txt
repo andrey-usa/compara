@@ -29,6 +29,7 @@ Each page below is markdown. The whole site in one file: https://andrey-usa.gith
 ## Agents
 
 - [For AI agents](https://andrey-usa.github.io/compara/agents/overview.md): What an agent gets: a JSON result, exit codes it can branch on, a read-only default, and these docs as markdown.
+- [Skill](https://andrey-usa.github.io/compara/agents/skill.md): The guide `compara skill` gives an agent, as this version prints it.
 
 ## Benchmarks
 

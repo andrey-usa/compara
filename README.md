@@ -60,6 +60,8 @@ and every option of `compare`: [compare options](https://andrey-usa.github.io/co
 
 ## For AI agents
 
+- **Skill:** `compara skill` prints the guide an agent reads to use this
+  version of compara.
 - **Machine-readable result:** `--json summary.json` (or `--json -` for
   standard output) writes the counts and per-column statistics, in the shape
   [docs/contract.schema.json](https://github.com/andrey-usa/compara/blob/main/docs/contract.schema.json)
@@ -114,7 +116,7 @@ The docs site, https://andrey-usa.github.io/compara/, has the same parts for eve
 - **Guides:** [Compare tables in object storage and on the web](https://andrey-usa.github.io/compara/guides/cloud.html) · [Run compara in a container, in CI or in Kubernetes](https://andrey-usa.github.io/compara/guides/containers.html) · [Name a recurring comparison](https://andrey-usa.github.io/compara/guides/profiles.html)
 - **Concepts:** [Engines and formats](https://andrey-usa.github.io/compara/concepts/engines.html)
 - **Reference:** [compare options](https://andrey-usa.github.io/compara/reference/options.html) · [The JSON summary](https://andrey-usa.github.io/compara/reference/json-summary.html) · [compara --help](https://andrey-usa.github.io/compara/reference/help.html)
-- **Agents:** [For AI agents](https://andrey-usa.github.io/compara/agents/overview.html)
+- **Agents:** [For AI agents](https://andrey-usa.github.io/compara/agents/overview.html) · [Skill](https://andrey-usa.github.io/compara/agents/skill.html)
 - **Benchmarks:** [Results](https://andrey-usa.github.io/compara/benchmarks/results.html)
 - **Project:** [Changelog](https://andrey-usa.github.io/compara/project/changelog.html) · [Contributing](https://andrey-usa.github.io/compara/project/contributing.html) · [Security](https://andrey-usa.github.io/compara/project/security.html)
 

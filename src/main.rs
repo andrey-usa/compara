@@ -20,6 +20,9 @@ static ALLOCATOR: compara::hugepages::HugePages = compara::hugepages::HugePages;
 use compara::source::{Source, Want};
 use compara::{Options, compare, parse_list, profiles, render};
 
+/// The agent skill: what an agent reads to use compara (`compara skill`).
+const SKILL_MD: &str = include_str!("../skills/compara/SKILL.md");
+
 const USAGE: &str = "\
 usage: compara <command> [options]
 
@@ -31,6 +34,7 @@ commands:
   version         Print the version (also --version)
   env             Print what this process sees: CPUs, memory and its limits,
                   the temporary directory, and whether URLs can be read
+  skill           Print the agent skill: how an agent uses compara
 
 A, B and FILE are paths, `-` for standard input, or with cloud support s3://,
 gs://, az:// and https:// URLs. Gzip and zstd files are read as what they hold.
@@ -214,6 +218,10 @@ fn run(args: &[String]) -> u8 {
             print_env();
             0
         }
+        "skill" => {
+            print!("{SKILL_MD}");
+            0
+        }
         "head" => match cmd_head(&args[1..]) {
             Ok(status) => status,
             Err(e) => {
@@ -231,7 +239,7 @@ fn run(args: &[String]) -> u8 {
             };
             eprintln!(
                 "error: unknown command {other:?}{hint}; the commands are compare, columns, \
-                 head, env and version (compara --help)"
+                 head, env, skill and version (compara --help)"
             );
             2
         }
