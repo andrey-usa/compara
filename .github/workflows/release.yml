@@ -41,7 +41,7 @@ permissions:
 
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.p.outputs.tag }}
       ref: ${{ steps.p.outputs.ref }}
@@ -93,7 +93,7 @@ jobs:
           # glibc rather than musl: musl's allocator makes the report path
           # 1.7x slower. cargo-zigbuild links against glibc 2.28, so the
           # binaries run on every distribution from 2018 on.
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, glibc: "2.28" }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, glibc: "2.28" }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, glibc: "2.28" }
           - { os: macos-15, target: aarch64-apple-darwin }
           - { os: macos-15, target: x86_64-apple-darwin }
@@ -165,7 +165,7 @@ jobs:
   publish:
     needs: [plan, build]
     if: needs.plan.outputs.publish == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       id-token: write
@@ -206,7 +206,7 @@ jobs:
   # an SBOM. A dry run builds and tests it without pushing.
   image:
     needs: [plan, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -296,7 +296,7 @@ jobs:
 
   packages:
     needs: [plan, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.meta.outputs.version }}
     steps:
@@ -357,7 +357,7 @@ jobs:
   crates:
     needs: [plan, publish, packages]
     if: needs.plan.outputs.publish == 'true' && vars.PUBLISH_CRATES == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
@@ -385,7 +385,7 @@ jobs:
   npm:
     needs: [plan, publish, packages]
     if: needs.plan.outputs.publish == 'true' && vars.PUBLISH_NPM == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
@@ -415,7 +415,7 @@ jobs:
   pypi:
     needs: [plan, publish, packages]
     if: needs.plan.outputs.publish == 'true' && vars.PUBLISH_PYPI == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: release
     permissions:
       contents: read
@@ -433,7 +433,7 @@ jobs:
   taps:
     needs: [plan, publish, packages]
     if: needs.plan.outputs.publish == 'true' && needs.plan.outputs.prerelease != 'true' && (vars.HOMEBREW_TAP != '' || vars.SCOOP_BUCKET != '')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:

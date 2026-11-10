@@ -25,7 +25,7 @@ env:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, windows-latest]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-latest]
     runs-on: ${{ matrix.os }}
     # About four times the slowest of them (Windows, 6 minutes).
     timeout-minutes: 25
@@ -60,7 +60,7 @@ jobs:
   # require identical counts and column statistics, and check the report
   # needs nothing from the network.
   end-to-end:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -113,7 +113,7 @@ jobs:
   # shows at the commit that brought it; on a dispatch the tag in perf_base.
   perf-gate:
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_name == 'next') || inputs.perf_base != ''
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -154,7 +154,7 @@ jobs:
 
   # Known-vulnerable dependencies (RustSec advisory database).
   audit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -167,7 +167,7 @@ jobs:
 
   # The oldest Rust that builds compara (rust-version in Cargo.toml).
   msrv:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
