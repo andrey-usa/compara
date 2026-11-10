@@ -21,6 +21,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- On a CPU with AVX-512BW the turbo engine's CSV scan steps 64 bytes at a
+  time instead of 32, chosen at run time, so the released binaries reach
+  it without being built for it; AVX2, NEON and the portable scan stay as
+  they were, and the output is the same byte for byte. Where memory
+  bounds the scan it changes nothing: on a GitHub runner with a Xeon
+  Platinum 8573C a 2M-row CSV pair compares in 0.215 s against 0.211 s
+  before (median of 7, [run
+  42764485535](https://github.com/andrey-usa/compara-polyglot-experiments/actions/runs/42764485535)).
+  On two machines where the CPU bounded it, the two CSV sweeps took less
+  than half their time before (indicative: measured outside CI).
 - A gzip or zstd input is expanded into memory on Linux while it fits a
   quarter of the memory free (inside a container, a sixth of the heap
   limit, which it then comes out of), and to `TMPDIR` past that. A 10M-row
