@@ -91,13 +91,20 @@ process.exit(result.status ?? 1);
 """
 
 
+
+def site(args) -> str:
+    """The docs site, every registry's homepage: https://<owner>.github.io/<repo>/."""
+    owner, name = args.repo.split("/", 1)
+    return f"https://{owner}.github.io/{name}/"
+
 def npm(args) -> None:
     root = Path(args.out) / "npm"
     common = {
         "version": args.version,
         "license": args.license,
         "repository": {"type": "git", "url": f"git+https://github.com/{args.repo}.git"},
-        "homepage": f"https://github.com/{args.repo}#readme",
+        "homepage": site(args),
+        "bugs": {"url": f"https://github.com/{args.repo}/issues"},
     }
     optional = {}
     for target, archive, _ in archives(Path(args.dist), args.name):
@@ -147,8 +154,10 @@ def wheel(args) -> None:
         f"Name: {args.name}",
         f"Version: {args.version}",
         f"Summary: {args.description}",
-        f"Home-page: https://github.com/{args.repo}",
+        f"Home-page: {site(args)}",
+        f"Project-URL: Documentation, {site(args)}",
         f"Project-URL: Source, https://github.com/{args.repo}",
+        f"Project-URL: Issues, https://github.com/{args.repo}/issues",
         f"Project-URL: Changelog, https://github.com/{args.repo}/blob/HEAD/CHANGELOG.md",
         f"License: {args.license}",
         *[f"Keywords: {args.keywords}"] * bool(args.keywords),
@@ -202,7 +211,7 @@ def homebrew(args) -> None:
     blocks = "".join(f"  on_{os_} do\n{''.join(arms)}  end\n\n" for os_, arms in by_os.items() if arms)
     formula = (f"class {klass} < Formula\n"
                f"  desc \"{args.description}\"\n"
-               f"  homepage \"https://github.com/{args.repo}\"\n"
+               f"  homepage \"{site(args)}\"\n"
                f"  version \"{args.version}\"\n"
                f"  license \"{args.license}\"\n\n"
                f"{blocks}"
@@ -221,7 +230,7 @@ def scoop(args) -> None:
     manifest = {
         "version": args.version,
         "description": args.description,
-        "homepage": f"https://github.com/{args.repo}",
+        "homepage": site(args),
         "license": args.license,
         "architecture": {"64bit": {"url": url, "hash": sha}},
         "bin": f"{args.name}.exe",
