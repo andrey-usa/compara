@@ -1,8 +1,9 @@
 name: ci
 
 on:
+  # next is where the work lands; main moves at a release.
   push:
-    branches: [main]
+    branches: [main, next]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -13,8 +14,10 @@ on:
 permissions:
   contents: read
 
+# A newer push to a branch replaces the run of the one before it; a
+# dispatch on the same commit runs beside it.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -23,6 +26,7 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -41,6 +45,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, windows-latest]
     runs-on: ${{ matrix.os }}
+    # About four times the slowest of them (Windows, 6 minutes).
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -55,6 +61,7 @@ jobs:
   # needs nothing from the network.
   end-to-end:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -98,13 +105,14 @@ jobs:
       - name: Benchmark harness, 10k rows
         run: ./target/release/compara-bench --rows 10k --engine turbo --out-dir bench
 
-  # The work a comparison takes, held to the base branch's: instructions
-  # counted by valgrind (exact, so a busy runner can't move them) on fixed
-  # files at two sizes, for each engine. Fails on more than 5% over the base,
-  # or on a cost that grows faster than the rows (scripts/perf_gate.py). The
-  # base is the pull request's, or on a dispatch the release in perf_base.
+  # The work a comparison takes, held to a base: instructions counted by
+  # valgrind (exact, so a busy runner can't move them) on fixed files at two
+  # sizes, for each engine. Fails on more than 5% over the base, or on a cost
+  # that grows faster than the rows (scripts/perf_gate.py). The base is the
+  # pull request's; on a push to next the latest release, so a slowdown
+  # shows at the commit that brought it; on a dispatch the tag in perf_base.
   perf-gate:
-    if: github.event_name == 'pull_request' || inputs.perf_base != ''
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_name == 'next') || inputs.perf_base != ''
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -119,7 +127,12 @@ jobs:
       - name: Build the head and the base
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.perf_base }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          if [ -z "$BASE_SHA" ]; then
+            BASE_SHA=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          fi
+          echo "base: $BASE_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
           cargo build --locked --release --bin compara --bin compara-gen-data
           mkdir -p gate
           cp target/release/compara gate/head
@@ -142,6 +155,7 @@ jobs:
   # Known-vulnerable dependencies (RustSec advisory database).
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -154,6 +168,7 @@ jobs:
   # The oldest Rust that builds compara (rust-version in Cargo.toml).
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

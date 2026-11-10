@@ -6,7 +6,7 @@ name: codeql
 
 on:
   push:
-    branches: [main]
+    branches: [main, next]
   pull_request:
   schedule:
     - cron: "37 4 * * 2"
@@ -19,6 +19,7 @@ jobs:
   analyze:
     name: analyze (${{ matrix.language }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
       security-events: write

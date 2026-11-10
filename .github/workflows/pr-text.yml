@@ -1,7 +1,7 @@
 name: pr-text
 
-# A pull request's title, description and commits, and what lands on main,
-# carry the author's words only: no footer or trailer a tool appends, no
+# A pull request's title, description and commits, and what lands on main
+# or on next, carry the author's words only: no footer or trailer a tool appends, no
 # identity other than the maintainer's (and GitHub's own merge commits and
 # dependency bumps). A squash merge turns the description into main's
 # commit message, so the description is checked like a commit, on every edit.
@@ -10,7 +10,7 @@ on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
   push:
-    branches: [main]
+    branches: [main, next]
 
 permissions:
   contents: read
