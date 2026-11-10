@@ -294,11 +294,21 @@ unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
     _mm256_movemask_epi8(equal) as u32 as u64
 }
 
-/// The top bit of each byte of `v`, packed into bit `i` of the result for
-/// byte `i`. NEON has no movemask instruction, so the bits are packed by
-/// weight: byte `i` is weighted by `2^(i % 8)`, and the eight weights of each
-/// half are added. The weights are distinct powers of two, so the sum is the
-/// mask, not an approximation.
+/// The top bit of each byte of the 32 bytes in `lo` and `hi`, packed into
+/// bit `i` of the result for byte `i`. NEON has no movemask instruction, so
+/// the bits are packed by weight: byte `i` is weighted by `2^(i % 8)`, and
+/// the weighted bytes are summed. The weights are distinct powers of two,
+/// so every partial sum is a piece of the mask, not an approximation.
+///
+/// The sum is a pairwise reduction, not a horizontal add: `vaddv_u8`
+/// collapses eight bytes in one slow cross-lane step, while `vpaddq_u8`
+/// adds neighbours in their own lanes. Three pairwise adds take the 32
+/// weighted bytes down to the 4 mask bytes -- pairs sum to two-bit pieces,
+/// those to four-bit pieces, those to whole mask bytes -- and no step can
+/// carry into the next piece, because the weights summed at each step are
+/// distinct powers of two whose total fits the byte (the last step's total
+/// is at most 255, exactly a full mask byte). One lane extract reads the
+/// finished mask out.
 ///
 /// The weight has to meet a full byte, not a single bit: a compare byte is
 /// `0xFF` for a match and `0x00` otherwise, so ANDing it with its weight
@@ -317,14 +327,20 @@ unsafe fn avx2_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
 /// memory is touched.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn neon_movemask(v: std::arch::aarch64::uint8x16_t) -> u32 {
+unsafe fn neon_movemask(
+    lo: std::arch::aarch64::uint8x16_t,
+    hi: std::arch::aarch64::uint8x16_t,
+) -> u32 {
     use std::arch::aarch64::*;
-    // Safety: the lanes are plain arithmetic on a value the caller built.
+    // Safety: the lanes are plain arithmetic on values the caller built.
     const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-    let weighted = unsafe { vandq_u8(v, vld1q_u8(WEIGHTS.as_ptr())) };
-    let lo = unsafe { vaddv_u8(vget_low_u8(weighted)) };
-    let hi = unsafe { vaddv_u8(vget_high_u8(weighted)) };
-    (lo as u32) | ((hi as u32) << 8)
+    let weights = unsafe { vld1q_u8(WEIGHTS.as_ptr()) };
+    let w_lo = unsafe { vandq_u8(lo, weights) };
+    let w_hi = unsafe { vandq_u8(hi, weights) };
+    let pairs = unsafe { vpaddq_u8(w_lo, w_hi) };
+    let quads = unsafe { vpaddq_u8(pairs, pairs) };
+    let bytes = unsafe { vpaddq_u8(quads, quads) };
+    unsafe { vgetq_lane_u32(vreinterpretq_u32_u8(bytes), 0) }
 }
 
 /// The NEON compare of two registers' worth: one bit per byte of `x` at `xi`
@@ -346,9 +362,8 @@ unsafe fn neon_same(x: &[u8], xi: usize, y: &[u8], yi: usize) -> u64 {
             vld1q_u8(y.as_ptr().add(yi + 16)),
         )
     };
-    let lo = unsafe { neon_movemask(vceqq_u8(a_lo, b_lo)) };
-    let hi = unsafe { neon_movemask(vceqq_u8(a_hi, b_hi)) };
-    (lo as u64) | ((hi as u64) << 16)
+    let mask = unsafe { neon_movemask(vceqq_u8(a_lo, b_lo), vceqq_u8(a_hi, b_hi)) };
+    mask as u64
 }
 
 /// The NEON compare.
@@ -374,9 +389,8 @@ unsafe fn neon_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
     let (ba, bb) = (vdupq_n_u8(a), vdupq_n_u8(b));
     let eq_lo = vorrq_u8(vceqq_u8(lo, ba), vceqq_u8(lo, bb));
     let eq_hi = vorrq_u8(vceqq_u8(hi, ba), vceqq_u8(hi, bb));
-    let lo = unsafe { neon_movemask(eq_lo) };
-    let hi = unsafe { neon_movemask(eq_hi) };
-    (lo as u64) | ((hi as u64) << 16)
+    let mask = unsafe { neon_movemask(eq_lo, eq_hi) };
+    mask as u64
 }
 
 const ONES: u64 = 0x0101_0101_0101_0101;
