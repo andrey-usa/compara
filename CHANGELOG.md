@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-10
+
 ### Added
 
 - `compara skill` prints the agent skill this version carries: how an
