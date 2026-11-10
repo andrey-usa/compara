@@ -2,7 +2,8 @@
 """compara against DuckDB and Polars on one keyed comparison: every number from this run.
 
     bench_contenders.py --compara BIN --gen BIN [--rows 1m,10m] [--formats csv,parquet]
-                        [--runs 3] [--work DIR] [--delete] [--json OUT] [--notices]
+                        [--runs 3] [--work DIR] [--delete] [--memory-max 13G]
+                        [--json OUT] [--notices]
 
 Two generated tables of 20 columns a side (compara-gen-data, seed 7), keyed
 on (account_id, txn_id), updated_at ignored, in each format asked for. Every
@@ -20,7 +21,8 @@ beat here); their wall is timed
 inside the process from the first read to the counts, so the interpreter's
 start and the import are not charged to them. compara's is the whole process.
 A tool the kernel kills for memory is recorded as out of memory, with what
-it held, and the run goes on.
+it held, and the run goes on; --memory-max gives each tool a cgroup with
+that ceiling, so it is the tool that is stopped and not the machine.
 
 --json writes the results; --notices also prints them as `bench json i/N`
 notices (3,500 characters each), so the docs can be written from a run with
@@ -110,13 +112,18 @@ def compara_cmd(binary, a, b, out_json):
     return [binary, "compare", a, b, "-k", ",".join(KEY), "-i", IGNORE, "--json", out_json]
 
 
-def contender(name, binary, a, b, fmt, work):
+def contender(name, binary, a, b, fmt, work, memory_max=None):
     if name == "compara":
         out_json = os.path.join(work, "compara-counts.json")
         cmd = compara_cmd(binary, a, b, out_json)
     else:
         code = DUCKDB if name == "duckdb" else POLARS
         cmd = [sys.executable, "-c", code, a, b, fmt, ",".join(KEY), IGNORE]
+    if memory_max:
+        # A cgroup of its own with a memory ceiling: a tool that needs more
+        # is stopped by the kernel alone, and the machine (a CI runner) goes on.
+        cmd = ["sudo", "-n", "systemd-run", "--scope", "--quiet", "-p", f"MemoryMax={memory_max}",
+               "-p", "MemorySwapMax=0", "--"] + cmd
     return cmd, (out_json if name == "compara" else None)
 
 
@@ -125,7 +132,7 @@ def bench(args, fmt, a, b):
     for memory (SIGKILL) is recorded as out of memory, with how much it held,
     and left out of the later rounds; any other failure stops the run."""
     names = ["compara", "duckdb", "polars"]
-    cmds = {n: contender(n, args.compara, a, b, fmt, args.work) for n in names}
+    cmds = {n: contender(n, args.compara, a, b, fmt, args.work, args.memory_max) for n in names}
     runs = {n: [] for n in names}
     counts, failed = {}, {}
     for i in range(args.runs):  # interleaved: each round runs every tool once
@@ -135,7 +142,7 @@ def bench(args, fmt, a, b):
             cmd, out_json = cmds[n]
             code, wall, cpu, rss, out = run_one(cmd, args.work)
             err = open(os.path.join(args.work, "run.err")).read()[-2000:]
-            if code == -9 and n != "compara":
+            if code in (-9, 137) and n != "compara":
                 failed[n] = {"failed": "out of memory", "peak_rss_mb": round(rss), "wall_s": round(wall, 3)}
                 print(f"{fmt} run {i + 1} {n}: killed for memory after {wall:.1f} s at {rss:.0f} MB", flush=True)
                 continue
@@ -204,6 +211,7 @@ def main():
     ap.add_argument("--gen", required=True, help="compara-gen-data")
     ap.add_argument("--rows", default="1m,10m", help="sizes, smallest first: 1m,10m")
     ap.add_argument("--delete", action="store_true", help="delete each pair once measured")
+    ap.add_argument("--memory-max", help="run every tool in a cgroup with this MemoryMax (e.g. 13G; needs sudo and systemd)")
     ap.add_argument("--formats", default="csv,parquet")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--work", default="bench-data")

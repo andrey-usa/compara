@@ -43,11 +43,13 @@ jobs:
           pip install --upgrade duckdb polars
           python3 -c "import duckdb, polars; print('duckdb', duckdb.__version__, 'polars', polars.__version__)"
 
+      # Each tool in a cgroup of 13 GB of the runner's 16: a tool that needs
+      # more is stopped and recorded as out of memory, and the runner lives.
       - name: Benchmark (1M and 10M rows, CSV and Parquet, three rounds)
         run: |
           python3 scripts/bench_contenders.py --compara target/release/compara \
             --gen target/release/compara-gen-data --rows 1m,10m --runs 3 \
-            --work "$RUNNER_TEMP/bench" --delete --json bench-results.json --notices
+            --work "$RUNNER_TEMP/bench" --delete --memory-max 13G --json bench-results.json --notices
 
       - name: Publish table
         run: |
