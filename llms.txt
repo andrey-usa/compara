@@ -34,6 +34,7 @@ Each page below is markdown. The whole site in one file: https://andrey-usa.gith
 ## Benchmarks
 
 - [Results](https://andrey-usa.github.io/compara/benchmarks/results.md): compara against DuckDB and Polars on the same comparisons, local and on object storage, each number with its CI run.
+- [Where compara is not ahead](https://andrey-usa.github.io/compara/benchmarks/losses.md): Each measure on which another tool beat compara in the same run.
 
 ## Project
 

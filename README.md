@@ -15,7 +15,7 @@ Parquet a warehouse emits, a migration's source against its target.
 
 - Reads **CSV, TSV, JSON (newline-delimited or one array of objects) and
   Parquet**, and the two sides need not be in the same format.
-- Ten million rows × 20 columns in about a second on four cores
+- Ten million rows × 20 columns in under a second on four cores, CSV or Parquet
   ([benchmarks](https://andrey-usa.github.io/compara/benchmarks/results.html)).
 - Reads and writes **object storage and the web** directly (`s3://`,
   `gs://`, `az://`, `https://`), with each cloud's own credentials, and
@@ -80,31 +80,20 @@ changed and `--export-dir` for the rows.
 
 ## Benchmarks
 
-Ten million rows × 20 columns, keyed on `(account_id, txn_id)`, `--ignore
-updated_at`, four threads on a 4 vCPU / 16 GB GitHub Actions runner, best of
-five. Each format ran on a runner of its own, named below (CI runs
-[39728430053](https://github.com/andrey-usa/compara-polyglot-experiments/actions/runs/39728430053) for CSV and Parquet and
-[39729034092](https://github.com/andrey-usa/compara-polyglot-experiments/actions/runs/39729034092) for ndjson, in
-[compara-polyglot-experiments](https://github.com/andrey-usa/compara-polyglot-experiments)).
-Each cell is wall time · CPU time · memory above the mapped input.
+Two tables of 20 columns compared on a composite key (`-k account_id,txn_id -i updated_at`), every tool's unchanged, changed, added and removed counts checked identical, on GitHub's `ubuntu-latest` (AMD EPYC 9V45 96-Core Processor, 4 cores, 15 GB), [bench-contenders run 42782167828](https://github.com/andrey-usa/compara/actions/runs/42782167828), 2026-11-10:
 
-| Format | Input, both files | Runner CPU | compara |
-|---|---:|---|---|
-| CSV | 3,509 MB | AMD EPYC 7763 | 1.08 s · 3.5 s · 591 MB |
-| ndjson | 8,488 MB | AMD EPYC 9V45 | 1.26 s · 3.9 s · 592 MB |
-| Parquet | 1,535 MB | Intel Xeon 6973P-C | 1.17 s · 3.8 s · 1,174 MB |
+| input, both files | compara 0.6.0 | DuckDB 2.0.0 | Polars 2.1.0 |
+|---|---|---|---|
+| 1M rows, CSV, 368 MB | **0.08 s** · 0.2 s · 411 MB | 1.90 s · 5.3 s · 1,213 MB | 2.10 s · 8.3 s · 2,262 MB |
+| 1M rows, Parquet, 161 MB | **0.11 s** · 0.3 s · 317 MB | 1.10 s · 1.9 s · 1,358 MB | 2.11 s · 7.4 s · 2,430 MB |
+| 10M rows, CSV, 3,679 MB | **0.74 s** · 2.2 s · 4,031 MB | 14.59 s · 53.7 s · 8,797 MB | out of memory after 12 s, at 13,345 MB |
+| 10M rows, Parquet, 1,609 MB | **0.85 s** · 2.7 s · 2,739 MB | 6.40 s · 23.9 s · 7,001 MB | out of memory after 9 s, at 13,345 MB |
 
-Two Parquet files against DuckDB and Polars, on the same kind of runner
-([CI run 39468615515](https://github.com/andrey-usa/compara-polyglot-experiments/actions/runs/39468615515): a 5M-row pair written by pyarrow, counts only, median
-of three): compara 1.26 s at one thread and 0.56 s at four, DuckDB 6.73 s and
-3.13 s, Polars 4.98 s and 2.73 s. With the changed, added and removed rows
-written out, compara 0.72 s at four threads, DuckDB 4.00 s, Polars 2.74 s.
+Each cell: wall time, best of 3 · CPU time (user and system) · peak memory, of the best run; fastest in bold. DuckDB and Polars run from Python, and their time starts at their first read, after the interpreter's start and the import. A tool the runner's kernel stopped for lack of memory says so.
 
-Contender benchmarks rerun weekly
-([`bench-contenders.yml`](https://github.com/andrey-usa/compara/blob/main/.github/workflows/bench-contenders.yml)) against the
-latest DuckDB.
+No other tool did better than compara by more than 2% on any measure in this run.
 
-Object storage, containers and every table: [Benchmarks](https://andrey-usa.github.io/compara/benchmarks/results.html).
+The method, every run and object storage: [Benchmarks](https://andrey-usa.github.io/compara/benchmarks/results.html).
 
 ## Documentation
 
@@ -117,7 +106,7 @@ The docs site, https://andrey-usa.github.io/compara/, has the same parts for eve
 - **Concepts:** [Engines and formats](https://andrey-usa.github.io/compara/concepts/engines.html)
 - **Reference:** [compare options](https://andrey-usa.github.io/compara/reference/options.html) · [The JSON summary](https://andrey-usa.github.io/compara/reference/json-summary.html) · [compara --help](https://andrey-usa.github.io/compara/reference/help.html)
 - **Agents:** [For AI agents](https://andrey-usa.github.io/compara/agents/overview.html) · [Skill](https://andrey-usa.github.io/compara/agents/skill.html)
-- **Benchmarks:** [Results](https://andrey-usa.github.io/compara/benchmarks/results.html)
+- **Benchmarks:** [Results](https://andrey-usa.github.io/compara/benchmarks/results.html) · [Where compara is not ahead](https://andrey-usa.github.io/compara/benchmarks/losses.html)
 - **Project:** [Changelog](https://andrey-usa.github.io/compara/project/changelog.html) · [Contributing](https://andrey-usa.github.io/compara/project/contributing.html) · [Security](https://andrey-usa.github.io/compara/project/security.html)
 
 For agents: [llms.txt](https://andrey-usa.github.io/compara/llms.txt) lists every page as markdown, and [llms-full.txt](https://andrey-usa.github.io/compara/llms-full.txt) is the whole site in one file.

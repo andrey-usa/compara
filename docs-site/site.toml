@@ -14,7 +14,7 @@ JSON summary and a self-contained HTML report. One Rust binary.
 
 [coverage.ignore]
 # README sections that point at the site rather than hold text of their own.
-"README.md" = ["Documentation", "Contributing", "License"]
+"README.md" = ["Benchmarks", "Documentation", "Contributing", "License"]
 
 [[part]]
 title = "Start"
@@ -110,7 +110,13 @@ title = "Benchmarks"
 title = "Results"
 path = "benchmarks/results.md"
 about = "compara against DuckDB and Polars on the same comparisons, local and on object storage, each number with its CI run."
-source = [{ file = "README.md", section = "Benchmarks" }, { file = "docs/benchmarks.md", demote = true }]
+source = [{ file = "docs/benchmarks.md" }, { file = "docs/benchmarks-s3.md", demote = true }]
+
+[[part.page]]
+title = "Where compara is not ahead"
+path = "benchmarks/losses.md"
+about = "Each measure on which another tool beat compara in the same run."
+source = { file = "docs/losses.md" }
 
 [[part]]
 title = "Project"
