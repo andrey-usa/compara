@@ -35,6 +35,13 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+          # No cache from a job that stopped early. A key, once saved, is
+          # kept until the dependencies change, so a job cancelled by a newer
+          # push or failed mid-build would leave a target with nothing in it
+          # for every later run of that key: the Windows test job rebuilt
+          # its 151 dependencies on every push, 8 min of its 9, under a
+          # 70 MB "cache hit" (ci 42918357807, 43070419956).
+          cache-on-failure: false
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: python3 -m py_compile scripts/*.py packaging/*.py
@@ -45,7 +52,8 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-latest]
     runs-on: ${{ matrix.os }}
-    # About four times the slowest of them (Windows, 6 minutes).
+    # About four times the slowest of them (Windows, 6 minutes with a cache
+    # of the dependencies, 9 without).
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -54,6 +62,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
           toolchain: stable
+          cache-on-failure: false
+          # The keys from before cache-on-failure may hold that partial build.
+          cache-key: whole
       - run: cargo test --locked --release
 
   # A small end-to-end run: generate a pair, compare it with every engine,
@@ -69,6 +80,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
           toolchain: stable
+          cache-on-failure: false
       - run: cargo build --locked --release --all-features
       - name: Generate 200k rows a side
         run: ./target/release/compara-gen-data --rows 200k --out-dir data
@@ -123,6 +135,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
           toolchain: stable
+          cache-on-failure: false
       - uses: ./.github/actions/apt-install
         with:
           packages: valgrind
@@ -180,4 +193,5 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
+          cache-on-failure: false
       - run: cargo check --locked --all-targets
