@@ -123,7 +123,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
           toolchain: stable
-      - run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends valgrind
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: valgrind
       - name: Build the head and the base
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.perf_base }}
