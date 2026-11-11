@@ -151,3 +151,101 @@ mod tests {
         assert_eq!(t.join().unwrap(), 7);
     }
 }
+
+/// The failure a run reports when lanes take numbered jobs in order (from a
+/// shared counter) and any of them may fail: the one with the lowest job
+/// number, as a single lane taking the jobs in that order would meet first.
+/// Without it the error depends on which lane failed first, so one input
+/// gave different errors from run to run on a machine with more cores.
+///
+/// A lane asks [`FirstFailure::wanted`] before each job: jobs after a known
+/// failure are skipped, jobs before it still run (one of them may fail
+/// first, by number). Every job before the reported one has run to the end.
+pub struct FirstFailure<E> {
+    first: std::sync::atomic::AtomicUsize,
+    error: std::sync::Mutex<Option<E>>,
+}
+
+impl<E> Default for FirstFailure<E> {
+    fn default() -> Self {
+        FirstFailure {
+            first: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            error: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl<E> FirstFailure<E> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether job `at` can still change the outcome: no job before it has
+    /// failed.
+    pub fn wanted(&self, at: usize) -> bool {
+        at < self.first.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Job `at` failed with `error`; kept if no earlier job has failed.
+    pub fn note(&self, at: usize, error: E) {
+        let mut kept = self.error.lock().unwrap_or_else(|e| e.into_inner());
+        if at < self.first.load(std::sync::atomic::Ordering::Acquire) {
+            self.first.store(at, std::sync::atomic::Ordering::Release);
+            *kept = Some(error);
+        }
+    }
+
+    /// `Err` with the first failure by job number, if any job failed.
+    pub fn into_result(self) -> Result<(), E> {
+        match self.error.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod first_failure_tests {
+    use super::FirstFailure;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Lanes racing through jobs where several fail: the lowest-numbered
+    /// failure wins, every time, however many lanes run.
+    #[test]
+    fn the_lowest_numbered_failure_wins_whatever_the_timing() {
+        let failing = [7usize, 3, 12];
+        for lanes in [1, 2, 4, 8] {
+            for _ in 0..50 {
+                let (next, failed) = (AtomicUsize::new(0), FirstFailure::new());
+                let ran: Vec<AtomicUsize> = (0..20).map(|_| AtomicUsize::new(0)).collect();
+                std::thread::scope(|scope| {
+                    for _ in 0..lanes {
+                        scope.spawn(|| {
+                            loop {
+                                let at = next.fetch_add(1, Ordering::Relaxed);
+                                if at >= 20 || !failed.wanted(at) {
+                                    return;
+                                }
+                                // Later jobs finish sooner, so a later failure
+                                // is often met first.
+                                std::thread::sleep(std::time::Duration::from_micros(
+                                    ((20 - at) * 50) as u64,
+                                ));
+                                ran[at].store(1, Ordering::Relaxed);
+                                if failing.contains(&at) {
+                                    failed.note(at, at);
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                });
+                assert_eq!(failed.into_result(), Err(3), "{lanes} lanes");
+                assert!(
+                    ran[..3].iter().all(|r| r.load(Ordering::Relaxed) == 1),
+                    "jobs before it ran"
+                );
+            }
+        }
+    }
+}

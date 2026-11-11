@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A Parquet compare whose files fail in more than one column says the
+  same error on every run and every machine: the first failing column in
+  the order the columns are read, the one `--threads 1` reports. The
+  columns are read on several threads, and the error was whichever thread
+  failed first, so one fuzzed file gave "a snappy Parquet page declares
+  11542724607 bytes" on one run and "unknown type in the parquet
+  metadata" on another (15 of 25 runs at 8 threads; the test that holds
+  it failed on a macOS runner). Columns after a known failure are no
+  longer read.
+
 ## [0.6.1] - 2026-11-10
 
 ### Added

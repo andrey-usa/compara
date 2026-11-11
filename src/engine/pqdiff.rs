@@ -1780,14 +1780,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     };
 
     let phase_start = std::time::Instant::now();
-    let work = || -> Result<Vec<(usize, ColOut)>> {
-        let mut mine = Vec::new();
-        loop {
-            let at = next.fetch_add(1, AtomicOrdering::Relaxed);
-            if at >= nc {
-                return Ok(mine);
-            }
-            let c = order[at];
+    // One column, read and compared.
+    let column = |c: usize| -> Result<ColOut> {
+        {
             let mut out = ColOut {
                 bits: alloc::filled(0u64, words, "one bit per pair in the column")?,
                 ..ColOut::default()
@@ -2041,21 +2036,40 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             out.began = (began - phase_start).as_secs_f64();
             out.read = (read_done - began).as_secs_f64();
             out.compare = read_done.elapsed().as_secs_f64();
-            mine.push((c, out));
+            Ok(out)
+        }
+    };
+    // The lanes take the columns in `order`. A failure stops the columns
+    // after it, not those before, so the error reported is the first in that
+    // order (the one `--threads 1` reports) whichever lane met it first.
+    let failed = parallel::FirstFailure::new();
+    let work = || -> Vec<(usize, ColOut)> {
+        let mut mine = Vec::new();
+        loop {
+            let at = next.fetch_add(1, AtomicOrdering::Relaxed);
+            if at >= nc || !failed.wanted(at) {
+                return mine;
+            }
+            let c = order[at];
+            match column(c) {
+                Ok(out) => mine.push((c, out)),
+                Err(e) => {
+                    failed.note(at, e);
+                    return mine;
+                }
+            }
         }
     };
 
     let mut cols: Vec<ColOut> = (0..nc).map(|_| ColOut::default()).collect();
     {
-        let gathered: Vec<Result<Vec<(usize, ColOut)>>> = std::thread::scope(|scope| {
+        let gathered: Vec<Option<Vec<(usize, ColOut)>>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..lanes).map(|_| parallel::spawn(scope, &work)).collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
-                .collect()
+            handles.into_iter().map(|h| h.join().ok()).collect()
         });
+        failed.into_result()?;
         for got in gathered {
-            for (c, out) in got? {
+            for (c, out) in got.ok_or_else(panicked)? {
                 cols[c] = out;
             }
         }
@@ -2146,29 +2160,39 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 // lanes as the first pass had, and written out at the changed
                 // pairs alone.
                 let next = AtomicUsize::new(0);
-                let again = || -> Result<Vec<(usize, Sides)>> {
+                // As in the first pass: the first failure in column order
+                // is the one reported, whatever the lanes' timing.
+                let failed = parallel::FirstFailure::new();
+                let cells = |c: usize| -> Result<Sides> {
+                    let (a_col, b_col) = read_pair(c)?;
+                    let a = changed_list.cells(&a_col, |p| pa[p] as usize, opt)?;
+                    let b = changed_list.cells(&b_col, |p| pb[p] as usize, opt)?;
+                    Ok((a, b))
+                };
+                let again = || -> Vec<(usize, Sides)> {
                     let mut mine = Vec::new();
                     loop {
                         let c = next.fetch_add(1, AtomicOrdering::Relaxed);
-                        if c >= nc {
-                            return Ok(mine);
+                        if c >= nc || !failed.wanted(c) {
+                            return mine;
                         }
-                        let (a_col, b_col) = read_pair(c)?;
-                        let a = changed_list.cells(&a_col, |p| pa[p] as usize, opt)?;
-                        let b = changed_list.cells(&b_col, |p| pb[p] as usize, opt)?;
-                        mine.push((c, (a, b)));
+                        match cells(c) {
+                            Ok(pair) => mine.push((c, pair)),
+                            Err(e) => {
+                                failed.note(c, e);
+                                return mine;
+                            }
+                        }
                     }
                 };
-                let gathered: Vec<Result<Vec<(usize, Sides)>>> = std::thread::scope(|scope| {
+                let gathered: Vec<Option<Vec<(usize, Sides)>>> = std::thread::scope(|scope| {
                     let handles: Vec<_> =
                         (0..lanes).map(|_| parallel::spawn(scope, &again)).collect();
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
-                        .collect()
+                    handles.into_iter().map(|h| h.join().ok()).collect()
                 });
+                failed.into_result()?;
                 for got in gathered {
-                    for (c, pair) in got? {
+                    for (c, pair) in got.ok_or_else(panicked)? {
                         sides[c] = pair;
                     }
                 }
