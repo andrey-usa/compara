@@ -52,8 +52,9 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-latest]
     runs-on: ${{ matrix.os }}
-    # About four times the slowest of them (Windows, 6 minutes with a cache
-    # of the dependencies, 9 without).
+    # About four times the slowest of them (Windows, 6.5 minutes with the
+    # dependencies cached under [profile.release]; the `ci` profile in
+    # Cargo.toml is measured by the first runs of this job).
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -65,7 +66,7 @@ jobs:
           cache-on-failure: false
           # The keys from before cache-on-failure may hold that partial build.
           cache-key: whole
-      - run: cargo test --locked --release
+      - run: cargo test --locked --profile ci
 
   # A small end-to-end run: generate a pair, compare it with every engine,
   # require identical counts and column statistics, and check the report
