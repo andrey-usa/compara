@@ -153,7 +153,10 @@ jobs:
           mkdir -p gate
           cp target/release/compara gate/head
           git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
-          cargo build --locked --release --bin compara \
+          # The base is a released tree: a warning a newer cargo has for
+          # it (1.100: `homepage` repeating `documentation`) can't be
+          # fixed there, so it is not denied there.
+          CARGO_BUILD_WARNINGS=warn cargo build --locked --release --bin compara \
             --manifest-path "$RUNNER_TEMP/base/Cargo.toml" --target-dir target
           cp target/release/compara gate/base
       - name: Files of 50k and 200k rows a side
