@@ -41,7 +41,7 @@ mod slab;
 mod text;
 mod thrift;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -50,8 +50,8 @@ use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 pub(crate) use text::refuse_non_text;
 use text::{
     RowParser, Runs, csv_header, detect_delimiter, guard_span, json_array_row_starts, json_header,
-    json_is_array, json_row_indent, json_rows_match, json_rows_match_at, shared_tail,
-    sniff_dialect,
+    json_is_array, json_later_keys, json_row_indent, json_rows_match, json_rows_match_at,
+    shared_tail, sniff_dialect,
 };
 
 use crate::alloc;
@@ -3679,8 +3679,52 @@ enum Input {
     },
 }
 
+/// The keys a JSON file's later objects carry and its first does not, over the
+/// first `rows` rows: every row for a comparison, and the rows shown for a
+/// preview, which must not pay for the file.
+///
+/// The whole file is walked on every thread, each over its own run of rows;
+/// the runs are taken in file order, so the names come out in the order a
+/// reader of the file would meet them, whatever the thread count.
+fn json_keys_after_the_first(
+    slab: &Slab,
+    first: &[String],
+    rows: usize,
+    opt: &Options,
+) -> Vec<String> {
+    let data = slab.data();
+    let array = json_is_array(data);
+    if rows != usize::MAX {
+        return json_later_keys(slab, 0, data.len(), array, first, rows);
+    }
+    let bounds = chunk_bounds(data, 0, opt.thread_budget(), Dialect::Json, true);
+    let found = in_parallel(bounds.len() - 1, |i| {
+        Ok(json_later_keys(
+            slab,
+            bounds[i],
+            bounds[i + 1],
+            array,
+            first,
+            usize::MAX,
+        ))
+    });
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut later: Vec<String> = Vec::new();
+    for name in found.into_iter().flatten().flatten() {
+        if seen.insert(name.clone()) {
+            later.push(name);
+        }
+    }
+    later
+}
+
 impl Input {
     fn open(path: &Path, opt: &Options) -> Result<Input> {
+        Input::open_rows(path, opt, usize::MAX)
+    }
+
+    /// [`Input::open`] for a reader of the first `rows` rows only.
+    fn open_rows(path: &Path, opt: &Options, rows: usize) -> Result<Input> {
         // The format is decided by what is in the file, not by its name: a file
         // called `.parquet` that is really a CSV is read as a CSV.
         let probe = Slab::map(path)?;
@@ -3704,7 +3748,14 @@ impl Input {
         let dialect = sniff_dialect(slab.data());
         slab.set_dialect(dialect);
         if dialect == Dialect::Json {
-            let header = json_header(&slab, path)?;
+            let mut header = json_header(&slab, path)?;
+            header.extend(json_keys_after_the_first(&slab, &header, rows, opt));
+            if header.is_empty() {
+                return Err(Error::new(format!(
+                    "no JSON object in the file has a key: {}",
+                    path.display()
+                )));
+            }
             return Ok(Input::Text {
                 slab,
                 delimiter: b',',
@@ -3969,7 +4020,7 @@ pub fn shape(path: &Path, opt: &Options) -> Result<Shape> {
 /// unquote it, and a `\u` escape in ndjson is decoded the same way. A preview
 /// that disagreed with the comparison would be worse than none.
 pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec<Vec<String>>)> {
-    let input = Input::open(path, opt)?;
+    let input = Input::open_rows(path, opt, want.max(1))?;
     let header: Vec<String> = input.header().to_vec();
     let width = header.len();
     if want == 0 || width == 0 {

@@ -18,6 +18,7 @@ use super::field::{
 };
 use super::slab::{Dialect, Slab, text_of};
 use crate::error::{Error, Result};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Newline-delimited JSON if the first thing that is not whitespace is a brace
@@ -139,9 +140,10 @@ pub(super) fn csv_header(slab: &Slab, delimiter: u8, path: &Path) -> Result<(Vec
     }
 }
 
-/// A JSON file has no header row, so the column names are the keys of the first
-/// object, in the order it lists them. A top-level array of objects answers
-/// the same way; an empty one has no object to take the names from.
+/// A JSON file has no header row, so the column names start with the keys of
+/// the first object, in the order it lists them; [`json_later_keys`] adds the
+/// keys only later objects carry. A top-level array of objects answers the
+/// same way; an empty one has no object to take the names from.
 pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
     let data = slab.data();
     let end = data.len();
@@ -215,13 +217,157 @@ pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
             }
         };
     }
-    if names.is_empty() {
-        return Err(Error::new(format!(
-            "the first JSON object has no keys: {}",
-            path.display()
-        )));
-    }
+    // An empty first object names no column, and is no error yet: the
+    // objects after it may (`json_later_keys`).
     Ok(names)
+}
+
+/// `data.starts_with(text)` for a `text` of a few bytes, as two loads of eight
+/// that overlap rather than a call: it is asked once a member of every row.
+#[inline(always)]
+fn starts_with_short(data: &[u8], text: &[u8]) -> bool {
+    let n = text.len();
+    if data.len() < n {
+        return false;
+    }
+    if !(8..=16).contains(&n) {
+        return data[..n] == *text;
+    }
+    let word = |s: &[u8], at: usize| u64::from_le_bytes(s[at..at + 8].try_into().unwrap());
+    word(data, 0) == word(text, 0) && word(data, n - 8) == word(text, n - 8)
+}
+
+/// The keys that objects in `data[lo..hi]` carry and `known` does not hold,
+/// in the order they are first met, looking at no more than `max_rows` rows.
+///
+/// A JSON table has no header: [`json_header`] takes the first object's keys,
+/// and a writer that leaves a null field out of its object (Spark does, and
+/// Go's `omitempty`) leaves a column out of that object whenever its first
+/// row has no value there. Taking the first object's word alone, a column
+/// absent from the first row was no column at all, and two files that
+/// differed only in it compared as identical. So every object is asked for
+/// its keys, and the columns are all of them.
+///
+/// The walk is the row parser's without its fields: a key is skipped as a
+/// string, compared with the name the first object had at that place (the
+/// common case, and then nothing more is asked of it), and its value is
+/// skipped whatever it is. `lo` must be the start of a row.
+pub(super) fn json_later_keys(
+    slab: &Slab,
+    lo: usize,
+    hi: usize,
+    array: bool,
+    known: &[String],
+    max_rows: usize,
+) -> Vec<String> {
+    let data = slab.data();
+    let scan = Swar;
+    let end = hi.min(data.len());
+    // Each of the first object's members as a compact writer spells it,
+    // `"name":`, so the common row is asked one comparison a member. A name
+    // that needs an escape has no such spelling and takes the walk below.
+    let spelled: Vec<Vec<u8>> = known
+        .iter()
+        .map(|name| {
+            if name.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20) {
+                return Vec::new();
+            }
+            let mut text = Vec::with_capacity(name.len() + 3);
+            text.push(b'"');
+            text.extend_from_slice(name.as_bytes());
+            text.extend_from_slice(b"\":");
+            text
+        })
+        .collect();
+    // Names are looked up, not searched for: a file built to carry a new key
+    // in every row would otherwise cost the square of its rows.
+    let seen: HashSet<&str> = known.iter().map(String::as_str).collect();
+    let mut later: Vec<String> = Vec::new();
+    let mut later_seen: HashSet<String> = HashSet::new();
+    let mut rows = 0usize;
+    let mut pos = lo;
+    while pos < end && rows < max_rows {
+        while pos < end && json_space(data[pos]) {
+            pos += 1;
+        }
+        if array && pos < end && data[pos] == b'[' {
+            pos += 1;
+            while pos < end && json_space(data[pos]) {
+                pos += 1;
+            }
+        }
+        if pos >= end {
+            break;
+        }
+        if data[pos] != b'{' {
+            // Not an object: the comparison passes over the line too.
+            let next = end_of_json_row(scan, data, pos, end, array, false);
+            pos = if next > pos { next } else { pos + 1 };
+            continue;
+        }
+        rows += 1;
+        pos += 1;
+        let mut member = 0usize; // the place of this key in the first object
+        loop {
+            while pos < end && (json_space(data[pos]) || data[pos] == b',') {
+                pos += 1;
+            }
+            if pos >= end {
+                break;
+            }
+            if data[pos] == b'}' {
+                pos += 1;
+                break;
+            }
+            if data[pos] != b'"' {
+                break; // malformed: the comparison stops reading the object here too
+            }
+            if let Some(text) = spelled.get(member)
+                && !text.is_empty()
+                && pos + text.len() < end
+                && starts_with_short(&data[pos..end], text)
+                && !json_space(data[pos + text.len()])
+            {
+                member += 1;
+                pos = json_value_end(scan, data, pos + text.len(), end);
+                continue;
+            }
+            let key_from = pos + 1;
+            let (key_end, escaped) = skip_json_string(scan, data, pos, end);
+            if key_end > end || key_end <= key_from {
+                break;
+            }
+            let key = &data[key_from..key_end - 1];
+            if known.get(member).map(String::as_bytes) != Some(key) {
+                let name = text_of(
+                    slab,
+                    pack(key_from as u64, (key_end - 1 - key_from) as u64, escaped),
+                );
+                if !seen.contains(name.as_str()) && later_seen.insert(name.clone()) {
+                    later.push(name);
+                }
+            }
+            member += 1;
+            pos = key_end;
+            while pos < end && json_space(data[pos]) {
+                pos += 1;
+            }
+            if pos >= end || data[pos] != b':' {
+                break;
+            }
+            pos += 1;
+            while pos < end && json_space(data[pos]) {
+                pos += 1;
+            }
+            if pos >= end {
+                break;
+            }
+            pos = json_value_end(scan, data, pos, end);
+        }
+        let next = end_of_json_row(scan, data, pos.min(end), end, array, false);
+        pos = if next > pos { next } else { pos + 1 };
+    }
+    later
 }
 
 /// Skips one JSON string starting at its opening quote, returning the offset one

@@ -28,7 +28,7 @@ magic number, a leading `{` or `[`, or a CSV header.
 |---|---|
 | CSV | mapped, scanned eight bytes at a time; a field is an offset and a length; a UTF-8 byte order mark is skipped; the separator (comma, semicolon, tab or pipe) is read from the header line unless `--delimiter` names it |
 | TSV | the CSV reader with a tab for the separator, found in the header line like any other; the same rows as TSV and as CSV give the same answer and the same export |
-| JSON | one object per line (NDJSON), or one top-level array of objects; the columns are the keys of the first object, and a value is found by its key rather than its position; `\uXXXX` is decoded, so an escaped and a literal character compare equal; `null` and a missing key are both absent |
+| JSON | one object per line (NDJSON), or one top-level array of objects; the columns are the keys of every object, in the order the file first shows them, so a field a writer leaves out of its first row is still a column; a value is found by its key rather than its position; `\uXXXX` is decoded, so an escaped and a literal character compare equal; `null` and a missing key are both absent |
 | Parquet | pages decoded into an arena; dictionary-encoded columns point at the dictionary entry, so a repeated value costs eight bytes a row |
 
 **Nested JSON.** A value that is an object or an array is compared as its

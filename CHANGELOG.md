@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A JSON file's columns are the keys of every object in it, not of the
+  first. A writer that leaves a null field out of its object (Spark's
+  does, and Go's `omitempty`) leaves the column out of the first object
+  whenever the first row has no value there; that column was then no
+  column, and two files that differed only in it were reported identical,
+  with exit code 0. Newline-delimited JSON and a top-level array are both
+  read so, `compara columns` lists the same columns, in the order the file
+  first shows them on any number of threads, and `compara head` lists
+  those of the rows it shows. Every object's keys are now read once
+  before the compare, which a JSON compare pays for in time; CSV and
+  Parquet are untouched. A file in which no object has a key is refused
+  as that.
 - `--delimiter '\t'` and `--delimiter tab` are a tab, on the command line
   and as a profile's `delimiter`. Only the first character of the value was
   taken, so `'\t'` split every row on a backslash and `tab` on the letter

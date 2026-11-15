@@ -417,3 +417,23 @@ fn head_keeps_a_row_with_a_line_break_on_one_line() {
     let (_, csv, _) = run(&["head", "--csv"], &path);
     assert!(csv.contains("\"two\nlines\""), "{csv}");
 }
+
+/// `columns` lists a JSON file's columns as `compare` finds them, the keys of
+/// every object; `head` lists those of the rows it shows, and reads no more.
+#[test]
+fn columns_of_a_json_file_are_every_object_s_keys() {
+    let f = Fixture::new(1);
+    let path = f.path("later.ndjson");
+    std::fs::write(
+        &path,
+        "{\"id\":1}\n{\"id\":2,\"v\":\"x\"}\n{\"w\":3,\"id\":3}\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run(&["columns"], &path);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "id\nv\nw\n");
+    let (_, one, _) = run(&["head", "-n", "1", "--csv"], &path);
+    assert_eq!(one, "id\n1\n");
+    let (_, two, _) = run(&["head", "-n", "2", "--csv"], &path);
+    assert_eq!(two, "id,v\n1,\n2,x\n");
+}

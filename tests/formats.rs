@@ -782,3 +782,114 @@ fn a_nested_json_value_is_compared_as_its_text() {
     }
     fs::remove_dir_all(&dir).ok();
 }
+
+/// A JSON table's columns are the keys of all its objects, not of the first.
+///
+/// A writer that leaves a null field out of its object (Spark's does, and
+/// Go's `omitempty`) leaves the column out of the first object whenever the
+/// first row has no value there. The columns were once the first object's
+/// keys alone: `v` below was then no column, the two files compared as
+/// identical, and the exit code said so.
+#[test]
+fn a_json_column_missing_from_the_first_object_is_still_compared() {
+    let dir = std::env::temp_dir().join(format!("compara-later-keys-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("a temp dir");
+    let csv = |name: &str, text: &str| {
+        let path = dir.join(name);
+        fs::write(&path, text).unwrap();
+        path
+    };
+    let a_rows = [
+        r#"{"id":"1"}"#,
+        r#"{"id":"2","v":"x","w":"p"}"#,
+        r#"{"id":"3","w":"q","va":"e"}"#,
+        r#"{}"#,
+    ];
+    let b_rows = [
+        r#"{"id":"1"}"#,
+        r#"{"id":"2","v":"y","w":"p"}"#,
+        r#"{"w":"q","id":"3","va":"e"}"#,
+    ];
+    let a_csv = csv("a.csv", "id,v,w,va\n1,,,\n2,x,p,\n3,,q,e\n,,,\n");
+    let b_csv = csv("b.csv", "id,v,w,va\n1,,,\n2,y,p,\n3,,q,e\n");
+    let from_csv = answer(&run(&a_csv, &b_csv, &mut options(&["id"])));
+
+    let lines = |rows: &[&str]| rows.join("\n") + "\n";
+    let array = |rows: &[&str]| format!("[\n  {}\n]\n", rows.join(",\n  "));
+    for (a_text, b_text) in [
+        (lines(&a_rows), lines(&b_rows)),
+        (array(&a_rows), array(&b_rows)),
+        (lines(&a_rows), array(&b_rows)),
+    ] {
+        let a = csv("a.json", &a_text);
+        let b = csv("b.json", &b_text);
+        let result = run(&a, &b, &mut options(&["id"]));
+        assert_eq!(result.counts.changed, 1, "{}", answer(&result));
+        assert_eq!(answer(&result), from_csv);
+        let v = result.columns.iter().find(|c| c.name == "v").unwrap();
+        assert_eq!(v.changed, 1, "{}", answer(&result));
+    }
+
+    // An object with no key at all is not the end of the columns either, and
+    // a file with no key anywhere is refused by what is wrong with it.
+    let a = csv("a.json", "{}\n{\"id\":\"1\",\"v\":\"x\"}\n");
+    let b = csv("b.json", "{}\n{\"id\":\"1\",\"v\":\"y\"}\n");
+    assert_eq!(run(&a, &b, &mut options(&["id"])).counts.changed, 1);
+    let empty = csv("empty.json", "{}\n{}\n");
+    let refused = compare(&empty, &empty, &mut options(&["id"])).expect_err("no columns");
+    assert!(
+        refused
+            .to_string()
+            .contains("no JSON object in the file has a key"),
+        "{refused}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// The columns found past the first object come out in the order the file
+/// holds them, on any number of threads: the file is walked in pieces, and a
+/// key first met in the last piece must not move ahead of one met in the
+/// first.
+#[test]
+fn json_columns_found_later_keep_the_file_s_order_on_every_thread_count() {
+    let dir = std::env::temp_dir().join(format!("compara-later-order-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("a temp dir");
+    // Past the size a file is split at, with one new key early and one late.
+    let rows = 120_000;
+    let table = |changed: &str| {
+        let mut text = String::with_capacity(rows * 64);
+        for i in 0..rows {
+            let extra = match i {
+                5 => ",\"early\":\"e\"".to_string(),
+                n if n == rows - 5 => format!(",\"late\":\"{changed}\""),
+                _ => String::new(),
+            };
+            text.push_str(&format!(
+                "{{\"id\":\"{i}\",\"note\":\"a row of some length to fill the file\"{extra}}}\n"
+            ));
+        }
+        text
+    };
+    let a = dir.join("a.ndjson");
+    let b = dir.join("b.ndjson");
+    fs::write(&a, table("x")).unwrap();
+    fs::write(&b, table("y")).unwrap();
+    assert!(fs::metadata(&a).unwrap().len() > 4 << 20);
+
+    let mut first = None;
+    for threads in [1, 2, 3, 8] {
+        let mut opt = options(&["id"]);
+        opt.threads = Some(threads);
+        let result = run(&a, &b, &mut opt);
+        let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["note", "early", "late"], "threads {threads}");
+        assert_eq!(result.counts.changed, 1, "threads {threads}");
+        let said = answer(&result);
+        assert_eq!(
+            first.get_or_insert_with(|| said.clone()),
+            &said,
+            "threads {threads}"
+        );
+    }
+    fs::remove_dir_all(&dir).ok();
+}
