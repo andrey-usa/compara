@@ -32,6 +32,16 @@ All notable changes to this project are documented here. The format follows
   last byte, which was dropped as if it were the closing quote.
 - `--delimiter` refuses a quote or a line break, which no reader could
   split a row on.
+- A file whose lines end in a carriage return alone is compared: the
+  classic Mac line ending, which Excel still writes as "CSV (Macintosh)".
+  The turbo engine ends a row at a line feed, so it read such a file as
+  one long header line and no rows, and two of them that differed came
+  out as `A 0 rows | B 0 rows`, exit 0. It now declines the file by its
+  first line, and `auto` compares the pair with `sortmerge` (`native`
+  where there is no room for it), which read either line ending, and
+  says so in a note that names the input as it was given. `--engine
+  turbo` says what it met and what reads it. `columns` and `head` read
+  such a file as well.
 - A JSON file's columns are the keys of every object in it, not of the
   first. A writer that leaves a null field out of its object (Spark's
   does, and Go's `omitempty`) leaves the column out of the first object

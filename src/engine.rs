@@ -172,6 +172,41 @@ handles more of the format, could not read them either: {turbo_err}"
         Engine::Auto => unreachable!("auto is resolved before this point"),
     };
     match result {
+        // A text file `turbo` declines for what it is -- lines that end in a
+        // carriage return alone -- is read by the engines built on the `csv`
+        // crate, which end a row at either line ending. Under `auto` one of
+        // them answers: the one that spills to disk where there is room for
+        // it, since nothing here says the pair fits in memory. A named
+        // `turbo` says what it met and what reads it.
+        Err(e)
+            if requested == Engine::Auto
+                && engine == Engine::Turbo
+                && e.is_unsupported()
+                && !turbo::only_this_engine_reads(a)
+                && !turbo::only_this_engine_reads(b) =>
+        {
+            let other = if sortmerge::available()
+                && crate::memory::heap_limit().is_none_or(|h| h >= SORTMERGE_FLOOR)
+            {
+                Engine::SortMerge
+            } else {
+                Engine::Native
+            };
+            let said = [a, b].into_iter().fold(e.without_hint(), |e, path| {
+                e.renamed(
+                    &path.display().to_string(),
+                    &crate::source::given_name(path),
+                )
+            });
+            eprintln!("note: {said}; comparing with the {other} engine");
+            let result = match other {
+                Engine::SortMerge => sortmerge::compare(a, b, opt),
+                _ => native::compare(a, b, opt),
+            };
+            result
+                .map(|r| (r, other.label().to_string()))
+                .map_err(|e| e.context_unless_input(format!("the {other} engine failed: ")))
+        }
         // `turbo` holds its indexes in memory; a CSV pair whose indexes do not
         // fit what this process may have -- a container's limit, or
         // `--memory` -- is compared by the engine that sorts and spills to
@@ -220,6 +255,29 @@ handles more of the format, could not read them either: {turbo_err}"
         result => result
             .map(|r| (r, engine.label().to_string()))
             .map_err(|e| e.context_unless_input(format!("the {engine} engine failed: "))),
+    }
+}
+
+/// What one file says about itself: its columns, and its rows where the
+/// format records them. `turbo` reads it, and where it declines a text file
+/// for what it is (see [`Error::declined`]), `native` does.
+pub fn shape(path: &Path, opt: &Options) -> Result<turbo::Shape> {
+    match turbo::shape(path, opt) {
+        Err(e) if e.is_unsupported() && e.is_input() => Ok(turbo::Shape {
+            format: "csv",
+            rows: None,
+            columns: native::header(path, opt)?,
+        }),
+        other => other,
+    }
+}
+
+/// The column names and the first `want` rows of one file, by the reader
+/// [`shape`] would use.
+pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    match turbo::head(path, want, opt) {
+        Err(e) if e.is_unsupported() && e.is_input() => native::head(path, want, opt),
+        other => other,
     }
 }
 

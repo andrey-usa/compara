@@ -745,8 +745,7 @@ fn cmd_columns(argv: &[String]) -> Result<u8> {
 
     let source = Source::open(first, &Want::footer_only())?;
     delimiter_note(&source, &opt);
-    let shape =
-        compara::engine::turbo::shape(source.path(), &opt).map_err(|e| as_given(e, &[&source]))?;
+    let shape = compara::engine::shape(source.path(), &opt).map_err(|e| as_given(e, &[&source]))?;
     for name in &shape.columns {
         println!("{name}");
     }
@@ -789,8 +788,8 @@ fn cmd_head(argv: &[String]) -> Result<u8> {
 
     let source = Source::open(first, &Want::all())?;
     delimiter_note(&source, &opt);
-    let (columns, rows) = compara::engine::turbo::head(source.path(), want, &opt)
-        .map_err(|e| as_given(e, &[&source]))?;
+    let (columns, rows) =
+        compara::engine::head(source.path(), want, &opt).map_err(|e| as_given(e, &[&source]))?;
     if args.flag("csv") {
         println!("{}", csv_line(&columns));
         for row in &rows {

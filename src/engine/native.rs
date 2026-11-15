@@ -139,6 +139,33 @@ fn read_store(
     Ok(store)
 }
 
+/// One file's column names, as this engine reads its header.
+pub fn header(path: &Path, opt: &Options) -> Result<Vec<String>> {
+    read_header(path, opt)
+}
+
+/// The column names and the first `want` rows of a file, each cell as its
+/// text and an absent one empty: what `head` shows of a file `turbo`
+/// declines.
+pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    let header = read_header(path, opt)?;
+    let mut rdr = reader(path, opt)?;
+    let mut record = csv::StringRecord::new();
+    let mut rows = Vec::new();
+    while rows.len() < want
+        && rdr
+            .read_record(&mut record)
+            .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?
+    {
+        rows.push(
+            (0..header.len())
+                .map(|i| record.get(i).unwrap_or_default().to_string())
+                .collect(),
+        );
+    }
+    Ok((header, rows))
+}
+
 /// The native engine is always available; it has no optional dependency.
 pub fn available() -> bool {
     true

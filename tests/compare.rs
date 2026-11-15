@@ -282,6 +282,64 @@ fn the_thread_budget_is_the_flag_when_the_flag_is_set() {
     assert_eq!(opt.thread_budget(), 3);
 }
 
+/// Lines that end in a carriage return alone -- the classic Mac ending, which
+/// Excel still writes as "CSV (Macintosh)" -- are rows. `turbo` ends a row at
+/// a line feed only: it read such a file as one long header and no rows, and
+/// a pair of them compared as identical whatever they held. It now declines
+/// the file, and `auto` hands the pair to an engine that reads it.
+#[test]
+fn lines_ended_by_a_carriage_return_alone_are_rows() {
+    let a = "id,name,qty\r1,ann,5\r2,bob,7\r3,cid,9\r";
+    let b = "id,name,qty\r1,ann,5\r2,bob,8\r4,dee,1\r";
+    for (a_body, b_body) in [
+        (a.to_string(), b.to_string()),
+        (a.to_string(), b.replace('\r', "\n")),
+        (a.replace('\r', "\n"), b.to_string()),
+    ] {
+        let f = Fixture::new(&a_body, &b_body);
+        for engine in [Engine::Auto, Engine::Native, Engine::SortMerge] {
+            let mut opt = options(&["id"], engine);
+            let result = compare(&f.a, &f.b, &mut opt).expect("compare");
+            let c = result.counts;
+            assert_eq!(
+                (c.a_rows, c.b_rows, c.changed, c.added, c.removed),
+                (3, 3, 1, 1, 1),
+                "{engine}"
+            );
+            assert_ne!(
+                result.meta.engine, "turbo",
+                "{engine}: turbo cannot have read it"
+            );
+        }
+        let mut opt = options(&["id"], Engine::Turbo);
+        let err = compare(&f.a, &f.b, &mut opt).expect_err("turbo does not read it");
+        assert!(err.is_unsupported() && err.is_input());
+        let text = err.to_string();
+        assert!(
+            text.contains("carriage return alone") && text.contains("--engine native"),
+            "{text}"
+        );
+        assert!(!text.contains("engine failed"), "{text}");
+    }
+
+    // CRLF, and a last line ended by a carriage return, are turbo's as before.
+    for body in ["id,v\r\n1,a\r\n2,b\r\n", "id,v\r\n1,a\r\n2,b\r", "id,v\r"] {
+        let f = Fixture::new(body, body);
+        let mut opt = options(&["id"], Engine::Auto);
+        let result = compare(&f.a, &f.b, &mut opt).expect("compare");
+        assert_eq!(result.meta.engine, "turbo", "{body:?}");
+        assert!(result.identical());
+    }
+    // And a carriage return inside a quoted header name is a character.
+    let quoted = "\"i\rd\",v\n1,a\n";
+    let f = Fixture::new(quoted, quoted);
+    let mut opt = options(&["i\rd"], Engine::Auto);
+    assert_eq!(
+        compare(&f.a, &f.b, &mut opt).expect("compare").meta.engine,
+        "turbo"
+    );
+}
+
 #[test]
 fn bad_options_are_rejected() {
     type Mutate = fn(&mut Options);

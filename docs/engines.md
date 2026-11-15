@@ -31,6 +31,16 @@ magic number, a leading `{` or `[`, or a CSV header.
 | JSON | one object per line (NDJSON), or one top-level array of objects; the columns are the keys of every object, in the order the file first shows them, so a field a writer leaves out of its first row is still a column; a value is found by its key rather than its position; `\uXXXX` is decoded, so an escaped and a literal character compare equal; `null` and a missing key are both absent |
 | Parquet | pages decoded into an arena; dictionary-encoded columns point at the dictionary entry, so a repeated value costs eight bytes a row |
 
+**CSV as files have it.** Every engine reads a CSV file the same way,
+the files that are not quite CSV included. A quote means something only as
+the first byte of a field, so `5" nail` is the text it looks like. Text
+after a closing quote stays in the value: `"ab"cd` is `abcd`. A quote that
+is never closed takes the rest of the file as its field. Lines end in a
+line feed, with or without a carriage return before it. A file whose lines
+end in a carriage return alone (the classic Mac ending, Excel's "CSV
+(Macintosh)") is read by `sortmerge` and `native`: `auto` compares it with
+one of them and says so, and `--engine turbo` declines it.
+
 **Nested JSON.** A value that is an object or an array is compared as its
 JSON text, as written: any difference inside it is a change to that column,
 and the report and export show the text. The same object written with its

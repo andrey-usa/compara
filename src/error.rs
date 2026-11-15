@@ -27,6 +27,9 @@ pub struct Error {
     /// that isn't there, two columns of one name): the user's to fix, said
     /// as it is, not as an engine failing.
     input: bool,
+    /// What to do about it, shown after the message. Kept apart so a caller
+    /// that does something about it itself can say the first half alone.
+    hint: String,
 }
 
 impl Error {
@@ -36,6 +39,7 @@ impl Error {
             unsupported: false,
             out_of_memory: false,
             input: false,
+            hint: String::new(),
         }
     }
 
@@ -50,20 +54,44 @@ impl Error {
     /// A reader declining a file it does not handle. See [`Error::unsupported`].
     pub fn unsupported(message: impl Into<String>) -> Self {
         Error {
-            message: message.into(),
             unsupported: true,
-            out_of_memory: false,
-            input: false,
+            ..Error::new(message)
+        }
+    }
+
+    /// A reader declining a file for what the file is, with what to do
+    /// about it: an input the user can change, and one another reader may
+    /// take. Both [`Error::is_unsupported`] and [`Error::is_input`].
+    pub fn declined(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Error {
+            unsupported: true,
+            input: true,
+            hint: hint.into(),
+            ..Error::new(message)
+        }
+    }
+
+    /// The same error without its hint, for a caller about to act on it.
+    pub fn without_hint(self) -> Self {
+        Error {
+            hint: String::new(),
+            ..self
+        }
+    }
+
+    /// The same error with `hint` in place of its own.
+    pub fn with_hint(self, hint: impl Into<String>) -> Self {
+        Error {
+            hint: hint.into(),
+            ..self
         }
     }
 
     /// An allocation the comparison could not have. See [`Error::out_of_memory`].
     pub fn out_of_memory(message: impl Into<String>) -> Self {
         Error {
-            message: message.into(),
-            unsupported: false,
             out_of_memory: true,
-            input: false,
+            ..Error::new(message)
         }
     }
 
@@ -110,6 +138,7 @@ impl Error {
         }
         Error {
             message: self.message.replace(from, to),
+            hint: self.hint.replace(from, to),
             ..self
         }
     }
@@ -125,7 +154,8 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(&self.message)?;
+        f.write_str(&self.hint)
     }
 }
 

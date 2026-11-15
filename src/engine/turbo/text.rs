@@ -111,6 +111,12 @@ pub(crate) fn refuse_non_text(head: &[u8], path: &Path) -> Result<()> {
 }
 
 /// The CSV header row's names, and where the first data row starts.
+///
+/// A file whose lines end in a carriage return alone is declined here, by
+/// its first line: every scan in this engine ends a row at a line feed, so
+/// such a file read as one long header and no rows, and a pair of them
+/// compared as identical whatever they held. The `csv` crate's readers end
+/// a row at either, so another engine can take it.
 pub(super) fn csv_header(slab: &Slab, delimiter: u8, path: &Path) -> Result<(Vec<String>, usize)> {
     let data = slab.data();
     let end = data.len();
@@ -118,7 +124,7 @@ pub(super) fn csv_header(slab: &Slab, delimiter: u8, path: &Path) -> Result<(Vec
     let mut names = Vec::new();
     let mut pos = 0usize;
     loop {
-        let (field, next) = if pos < end && data[pos] == b'"' {
+        let (field, next, unquoted_from) = if pos < end && data[pos] == b'"' {
             let close = skip_quoted(data, pos + 1, end);
             let next = next_of2(data, close, end, delimiter, b'\n');
             let field = quoted_cell(Swar, data, pos, close, next);
@@ -127,11 +133,28 @@ pub(super) fn csv_header(slab: &Slab, delimiter: u8, path: &Path) -> Result<(Vec
                     .filter(|_| next >= end)
                     .unwrap_or(field),
                 next,
+                close,
             )
         } else {
             let next = next_of2(data, pos, end, delimiter, b'\n');
-            (plain_field(data, pos, next), next)
+            (plain_field(data, pos, next), next, pos)
         };
+        // A carriage return outside quotes belongs to a line ending: the
+        // last byte before the line feed, or before the end of the file.
+        let ends_line = next >= end || data[next] == b'\n';
+        if let Some(at) = data[unquoted_from..next].iter().position(|&b| b == b'\r')
+            && !(ends_line && unquoted_from + at + 1 == next)
+        {
+            return Err(Error::declined(
+                format!(
+                    "{} ends its lines with a carriage return alone (the classic Mac line \
+                     ending), which the turbo engine does not read",
+                    path.display()
+                ),
+                "; --engine native reads such a CSV, or give the file line feeds \
+                 (tr '\\r' '\\n' < file > copy)",
+            ));
+        }
         names.push(text_of(slab, field));
         if next >= end {
             return Ok((names, end));

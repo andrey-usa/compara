@@ -58,7 +58,30 @@ impl Drop for Source {
         for path in &self.temps {
             let _ = std::fs::remove_file(path);
         }
+        if let Ok(mut given) = GIVEN.lock() {
+            given.retain(|(path, _)| *path != self.path);
+        }
     }
+}
+
+/// The local files that stand for something else, with what the user gave:
+/// standard input, a compressed file, a URL. An engine is handed the local
+/// file, and a note it prints should name the input.
+static GIVEN: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// What the user called the input `path` holds: `standard input`, the file
+/// or URL given, or the path itself for a file read where it is.
+pub fn given_name(path: &Path) -> String {
+    GIVEN
+        .lock()
+        .ok()
+        .and_then(|given| {
+            given
+                .iter()
+                .find(|(local, _)| local == path)
+                .map(|(_, name)| name.clone())
+        })
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// Which columns a comparison reads, so a remote Parquet object is fetched
@@ -161,6 +184,16 @@ impl Source {
             }
         };
         source.decompress()?;
+        if source.path != Path::new(&source.spec)
+            && let Ok(mut given) = GIVEN.lock()
+        {
+            let name = if source.spec == "-" {
+                "standard input".to_string()
+            } else {
+                source.spec.clone()
+            };
+            given.push((source.path.clone(), name));
+        }
         Ok(source)
     }
 

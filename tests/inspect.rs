@@ -297,6 +297,53 @@ fn inputs_are_named_as_given() {
     assert!(stderr.contains("--delimiter ';' is not in"), "{stderr}");
 }
 
+/// A file whose lines end in a carriage return alone is looked at by the
+/// reader that takes it, and compared by an engine that reads it, with a
+/// note that names the input as it was given.
+#[test]
+fn a_file_of_carriage_return_lines_is_read() {
+    use std::io::Write;
+    let f = Fixture::new(1);
+    let cr = f.path("mac.csv");
+    std::fs::write(&cr, "id,v\r1,a\r2,b\r").unwrap();
+    let lf = f.path("unix.csv");
+    std::fs::write(&lf, "id,v\n1,a\n2,B\n").unwrap();
+
+    let (code, stdout, stderr) = run(&["columns"], &cr);
+    assert_eq!((code, stdout.as_str()), (0, "id\nv\n"), "{stderr}");
+    let (code, stdout, stderr) = run(&["head", "--csv"], &cr);
+    assert_eq!((code, stdout.as_str()), (0, "id,v\n1,a\n2,b\n"), "{stderr}");
+
+    let mut child = Command::new(BIN)
+        .args(["compare", "-", lf.to_str().unwrap(), "-k", "id"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("runs");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"id,v\r1,a\r2,b\r")
+        .unwrap();
+    let out = child.wait_with_output().expect("runs");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stdout.starts_with("A 2 rows | B 2 rows | matched 2 (changed 1)"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("note: standard input ends its lines with a carriage return alone"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("compara-"), "a temporary path: {stderr}");
+}
+
 /// `--fail-on-dups` names itself when it sets the exit code.
 #[test]
 fn exit_3_says_it_came_from_fail_on_dups() {
