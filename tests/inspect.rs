@@ -344,6 +344,157 @@ fn a_file_of_carriage_return_lines_is_read() {
     assert!(!stderr.contains("compara-"), "a temporary path: {stderr}");
 }
 
+/// `compara` with these arguments: its exit code, stdout and stderr.
+fn cli(args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(BIN).args(args).output().expect("compara runs");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// An option given more than once is not half ignored. The first value was
+/// the whole answer: `-k id -k v` compared on `id` alone, and a second `-o`
+/// was a report nobody wrote.
+#[test]
+fn an_option_given_twice_adds_up_or_is_refused() {
+    let f = Fixture::new(1);
+    let (a, b) = (f.path("x.csv"), f.path("y.csv"));
+    std::fs::write(&a, "id,v,w\n1,a,x\n2,b,y\n3,c,z\n").unwrap();
+    std::fs::write(&b, "id,v,w\n1,a,x\n2,B,Y\n4,d,z\n").unwrap();
+    let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+    let counts = |args: &[&str]| {
+        let (code, stdout, stderr) = cli(&[&["compare", a, b], args].concat());
+        assert!(code == 0 || code == 1, "{args:?}: {stderr}");
+        stdout
+            .split(" | engine")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // A list adds up, in either spelling.
+    assert_eq!(counts(&["-k", "id", "-k", "v"]), counts(&["-k", "id,v"]));
+    assert_ne!(counts(&["-k", "id", "-k", "v"]), counts(&["-k", "id"]));
+    assert_eq!(
+        counts(&["-k", "id", "-i", "v", "--ignore=w"]),
+        counts(&["-k", "id", "-i", "v,w"])
+    );
+    assert!(counts(&["-k", "id", "-i", "v", "--ignore=w"]).contains("(changed 0)"));
+
+    // One value, given as two: refused, and by the option's name.
+    let out = f.path("r.html");
+    let (code, _, stderr) = cli(&[
+        "compare",
+        a,
+        b,
+        "-k",
+        "id",
+        "-o",
+        "one.html",
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("--out is given twice, as one.html and as"),
+        "{stderr}"
+    );
+    assert!(!out.exists(), "nothing is written by a refused run");
+    let (code, _, stderr) = cli(&[
+        "compare",
+        a,
+        b,
+        "-k",
+        "id",
+        "--max-rows",
+        "5",
+        "--max-rows=50",
+    ]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("--max-rows is given twice, as 5 and as 50"),
+        "{stderr}"
+    );
+    // The same value twice is one value.
+    assert_eq!(
+        counts(&["-k", "id", "--threads", "2", "--threads", "2"]),
+        counts(&["-k", "id"])
+    );
+}
+
+/// `--delimiter` is one character, and a tab can be typed.
+#[test]
+fn a_tab_delimiter_can_be_named() {
+    let f = Fixture::new(5);
+    let (a, b) = (f.path("a.tsv"), f.path("b.tsv"));
+    let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+    let plain = cli(&[
+        "compare",
+        a,
+        b,
+        "-k",
+        "account_id,txn_id",
+        "-i",
+        "updated_at",
+    ]);
+    for tab in ["\\t", "tab", "TAB", "\t"] {
+        let named = cli(&[
+            "compare",
+            a,
+            b,
+            "-k",
+            "account_id,txn_id",
+            "-i",
+            "updated_at",
+            "--delimiter",
+            tab,
+        ]);
+        assert_eq!(named.0, plain.0, "{tab:?}: {}", named.2);
+        assert_eq!(
+            named.1.split(" | engine").next(),
+            plain.1.split(" | engine").next(),
+            "{tab:?}"
+        );
+        assert!(!named.2.contains("is not in"), "{tab:?}: {}", named.2);
+    }
+    let (code, _, stderr) = cli(&["compare", a, b, "-k", "account_id", "--delimiter", ";;"]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("--delimiter must be one character, or `tab`"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = cli(&["compare", a, b, "-k", "account_id", "--delimiter", "\""]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("cannot be a quote or a line break"),
+        "{stderr}"
+    );
+}
+
+/// The elapsed time is always written to the millisecond: a run under one
+/// printed `0s`.
+#[test]
+fn the_time_is_written_to_the_millisecond() {
+    let f = Fixture::new(3);
+    let a = f.path("a.csv");
+    let (code, stdout, stderr) = cli(&[
+        "compare",
+        a.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "-k",
+        "account_id,txn_id",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let time = stdout.trim_end().rsplit(", ").next().unwrap_or_default();
+    let digits = time.strip_suffix('s').and_then(|t| t.split_once('.'));
+    assert!(
+        matches!(digits, Some((whole, ms)) if !whole.is_empty() && ms.len() == 3),
+        "{stdout}"
+    );
+}
+
 /// `--fail-on-dups` names itself when it sets the exit code.
 #[test]
 fn exit_3_says_it_came_from_fail_on_dups() {
@@ -422,6 +573,17 @@ fn both_commands_need_a_file() {
     let out = Command::new(BIN).arg("head").output().expect("runs");
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("head needs a file"));
+    // And one file only: a second was passed over without a word.
+    for command in ["columns", "head"] {
+        let (code, stdout, stderr) = cli(&[command, "a.csv", "b.csv"]);
+        assert_eq!((code, stdout.as_str()), (2, ""), "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "{command} looks at one file, and was given 2: a.csv, b.csv"
+            )),
+            "{stderr}"
+        );
+    }
 }
 
 /// `--delimiter '\t'` and `--delimiter tab` are a tab, and a longer value is

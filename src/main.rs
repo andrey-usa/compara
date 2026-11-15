@@ -300,9 +300,26 @@ const VALUED: [&str; 22] = [
     "n",
 ];
 
+/// The options that take a list of names. Given more than once they add
+/// up: `-k id -k region` is `-k id,region`.
+const LISTS: [&str; 3] = ["key", "compare", "ignore"];
+
+/// An option's long name, whichever way it was written.
+fn long_name(name: &str) -> &str {
+    match name {
+        "k" => "key",
+        "c" => "compare",
+        "i" => "ignore",
+        "p" => "profile",
+        "o" => "out",
+        "n" => "rows",
+        other => other,
+    }
+}
+
 impl Args {
     fn parse(argv: &[String]) -> Result<Self> {
-        let mut values = Vec::new();
+        let mut values: Vec<(String, Option<String>)> = Vec::new();
         let mut positional = Vec::new();
         let mut i = 0;
         while i < argv.len() {
@@ -324,27 +341,57 @@ impl Args {
                     if token.starts_with("--") { "--" } else { "-" }
                 )));
             }
-            match rest.split_once('=') {
-                Some((name, value)) => values.push((name.to_string(), Some(value.to_string()))),
-                None if FLAGS.contains(&rest) => values.push((rest.to_string(), None)),
+            let (name, value) = match rest.split_once('=') {
+                Some((name, value)) => (long_name(name), Some(value.to_string())),
+                None if FLAGS.contains(&rest) => (rest, None),
                 None => {
                     let value = argv
                         .get(i + 1)
                         .ok_or_else(|| Error::new(format!("{token} needs a value")))?;
-                    values.push((rest.to_string(), Some(value.clone())));
                     i += 1;
+                    (long_name(rest), Some(value.clone()))
                 }
+            };
+            // An option that holds one value, given two: the first was
+            // used and the second dropped without a word, so `-o a -o b`
+            // wrote one report and `--max-rows 5 --max-rows 50` kept 5.
+            if let (Some(new), false) = (&value, LISTS.contains(&name))
+                && let Some(old) = values
+                    .iter()
+                    .find(|(n, v)| n == name && v.as_ref() != Some(new))
+                    .and_then(|(_, v)| v.as_ref())
+            {
+                return Err(Error::new(format!(
+                    "--{name} is given twice, as {old} and as {new}: it takes one value"
+                )));
             }
+            values.push((name.to_string(), value));
             i += 1;
         }
         Ok(Args { values, positional })
     }
 
-    fn get(&self, long: &str, short: Option<&str>) -> Option<&str> {
+    /// An option's value. `short` is for the reader: every name is held
+    /// by its long form.
+    fn get(&self, long: &str, _short: Option<&str>) -> Option<&str> {
         self.values
             .iter()
-            .find(|(name, _)| name == long || Some(name.as_str()) == short)
+            .find(|(name, _)| name == long)
             .and_then(|(_, value)| value.as_deref())
+    }
+
+    /// A list option's names, from every time it was given. The first was
+    /// the whole answer, so `-k id -k region` compared on `id` alone.
+    fn list(&self, long: &str) -> Option<Vec<String>> {
+        let mut names: Option<Vec<String>> = None;
+        for (name, value) in &self.values {
+            if name == long {
+                names
+                    .get_or_insert_with(Vec::new)
+                    .extend(parse_list(value.as_deref().unwrap_or_default()));
+            }
+        }
+        names
     }
 
     fn flag(&self, long: &str) -> bool {
@@ -402,14 +449,14 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     }
 
     // Only options actually given override the profile, hence the `if let`s.
-    if let Some(v) = args.get("key", Some("k")) {
-        opt.key = parse_list(v);
+    if let Some(names) = args.list("key") {
+        opt.key = names;
     }
-    if let Some(v) = args.get("compare", Some("c")) {
-        opt.compare = Some(parse_list(v));
+    if let Some(names) = args.list("compare") {
+        opt.compare = Some(names);
     }
-    if let Some(v) = args.get("ignore", Some("i")) {
-        opt.ignore = parse_list(v);
+    if let Some(names) = args.list("ignore") {
+        opt.ignore = names;
     }
     opt.trim |= args.flag("trim");
     opt.ignore_case |= args.flag("ignore-case");
@@ -554,7 +601,7 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     let c = &result.counts;
     let line = format!(
         "A {} | B {} | matched {} (changed {}) | added {} | removed {} | \
-         duplicate keys A {}, B {} | engine {}, {}s",
+         duplicate keys A {}, B {} | engine {}, {:.3}s",
         rows(c.a_rows),
         rows(c.b_rows),
         comma(c.matched),
@@ -743,9 +790,7 @@ fn cmd_columns(argv: &[String]) -> Result<u8> {
         print!("{USAGE}");
         return Ok(0);
     }
-    let Some(first) = args.positional.first() else {
-        return Err(Error::new("columns needs a file: compara columns data.csv"));
-    };
+    let first = one_file(&args, "columns")?;
     let mut opt = Options::default();
     apply_read_options(&args, &mut opt)?;
 
@@ -772,6 +817,22 @@ fn cmd_columns(argv: &[String]) -> Result<u8> {
     Ok(0)
 }
 
+/// The one file `columns` or `head` looks at. A second was passed over in
+/// silence, so `compara columns a.csv b.csv` answered for `a.csv` alone.
+fn one_file<'a>(args: &'a Args, command: &str) -> Result<&'a String> {
+    match args.positional.as_slice() {
+        [file] => Ok(file),
+        [] => Err(Error::new(format!(
+            "{command} needs a file: compara {command} data.csv"
+        ))),
+        many => Err(Error::new(format!(
+            "{command} looks at one file, and was given {}: {}",
+            many.len(),
+            many.join(", ")
+        ))),
+    }
+}
+
 /// `compara head FILE [-n N]` — the first rows, aligned, or `--csv` for a
 /// machine.
 fn cmd_head(argv: &[String]) -> Result<u8> {
@@ -780,9 +841,7 @@ fn cmd_head(argv: &[String]) -> Result<u8> {
         print!("{USAGE}");
         return Ok(0);
     }
-    let Some(first) = args.positional.first() else {
-        return Err(Error::new("head needs a file: compara head data.csv"));
-    };
+    let first = one_file(&args, "head")?;
     let want = match args.get("rows", Some("n")) {
         Some(text) => text
             .parse::<usize>()

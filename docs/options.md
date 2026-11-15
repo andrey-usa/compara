@@ -21,6 +21,10 @@
 | `--fail-on-dups` | exit 3 when either file has duplicate keys |
 | `--exit-zero` | exit 0 when the tables differ: for a scheduled job whose output is the report (a Kubernetes Job, an Airflow task) |
 
+An option that names columns (`-k`, `-c`, `-i`) may be given more than once,
+and the names add up: `-k order_id -k line_no` is `-k order_id,line_no`. Any
+other option given twice with two values is refused.
+
 Duplicate keys are counted and listed per file; the first occurrence of each
 key takes part in the join.
 

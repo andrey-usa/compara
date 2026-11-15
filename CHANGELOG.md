@@ -94,6 +94,15 @@ All notable changes to this project are documented here. The format follows
   profile name that is not in the file is answered with the names that
   are, and `--config` without `--profile`, which used nothing from the
   file, is refused.
+- An option given more than once is no longer half ignored. The first
+  value was the whole answer: `-k order_id -k line_no` compared on
+  `order_id` alone, and the second of two `-o` was a report nobody
+  wrote. The options that name columns (`-k`, `-c`, `-i`) now add up,
+  and any other option given twice with two values is refused by name.
+- `columns` and `head` look at one file and refuse a second, which was
+  passed over without a word.
+- The time on the counts line is written to the millisecond; a run
+  under one printed `0s`.
 
 ### Security
 
