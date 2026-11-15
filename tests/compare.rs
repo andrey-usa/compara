@@ -295,6 +295,8 @@ fn bad_options_are_rejected() {
         ("zero max rows", |o| o.max_rows = 0),
         ("unknown engine", |o| o.engine = "nope".into()),
         ("zero threads", |o| o.threads = Some(0)),
+        ("a quote for a delimiter", |o| o.delimiter = Some('"')),
+        ("a line break for a delimiter", |o| o.delimiter = Some('\n')),
     ];
     for (name, mutate) in cases {
         let mut opt = Options::with_key(["k"]);

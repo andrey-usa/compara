@@ -214,6 +214,7 @@ impl Options {
             self.engine = Engine::Auto.label().to_string();
         }
         self.engine_name()?;
+        self.delimiter_byte()?;
         Ok(())
     }
 
@@ -229,6 +230,11 @@ impl Options {
     pub fn delimiter_byte(&self) -> Result<Option<u8>> {
         match self.delimiter {
             None => Ok(None),
+            // A quote or a line break is what a delimiter is told apart
+            // from: as the delimiter too, no reader here could split a row.
+            Some(c @ ('"' | '\n' | '\r')) => Err(Error::input(format!(
+                "--delimiter cannot be a quote or a line break, got {c:?}"
+            ))),
             Some(c) if c.is_ascii() => Ok(Some(c as u8)),
             Some(c) => Err(Error::new(format!(
                 "--delimiter must be an ASCII character, got {c:?}"

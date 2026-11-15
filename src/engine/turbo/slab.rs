@@ -129,6 +129,7 @@ impl Slab {
             raw: self.raw(f),
             dialect: if escaped { self.dialect } else { Dialect::Raw },
             at: 0,
+            closed: false,
             pending: [0; 4],
             pending_len: 0,
             pending_at: 0,
@@ -143,6 +144,9 @@ pub(super) struct LogicalBytes<'a> {
     raw: &'a [u8],
     dialect: Dialect,
     at: usize,
+    /// CSV: the field's closing quote has been passed, and what follows it up
+    /// to the delimiter is content as it stands.
+    closed: bool,
     pending: [u8; 4],
     pending_len: u8,
     pending_at: u8,
@@ -208,11 +212,21 @@ impl Iterator for LogicalBytes<'_> {
         match self.dialect {
             Dialect::Raw => Some(b),
             Dialect::Csv => {
-                // A quote inside a quoted body can only be half of a doubled
-                // pair, so the second one is dropped.
-                if b == b'"' && self.raw.get(self.at) == Some(&b'"') {
-                    self.at += 1;
+                if b != b'"' || self.closed {
+                    return Some(b);
                 }
+                // A quote inside a quoted body is half of a doubled pair, and
+                // the second one is dropped.
+                if self.raw.get(self.at) == Some(&b'"') {
+                    self.at += 1;
+                    return Some(b);
+                }
+                // Or it is the closing quote of a field with text after it
+                // (`"ab"cd`, see `text::quoted_with_tail`): the quote goes,
+                // and the text is content, its quotes included.
+                self.closed = true;
+                let b = *self.raw.get(self.at)?;
+                self.at += 1;
                 Some(b)
             }
             Dialect::Json => {

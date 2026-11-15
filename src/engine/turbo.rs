@@ -1627,9 +1627,10 @@ where
 /// on ends at the first real row start past its boundary; if that is where the
 /// next chunk began, the boundary was real, and the same holds down the line.
 /// Only if a guess was wrong -- a quoted newline at the split -- is the sweep
-/// run again on counted bounds, which is exactly what it did before. A chunk
-/// that started on a wrong guess parsed garbage, so its rows *and its errors*
-/// are discarded unread.
+/// run again on counted bounds, which is exactly what it did before, and
+/// those are checked the same way: the count is right only while every quote
+/// in the file opens or closes a field. A chunk that started on a wrong
+/// bound parsed garbage, so its rows *and its errors* are discarded unread.
 ///
 /// A top-level JSON array is checked the same way. Pretty-printed, it spreads
 /// a row over lines, and a line that opens an object may open one nested in a
@@ -1654,35 +1655,44 @@ fn sweep_text(
     }
     let dialect = side.slab.dialect();
     if dialect == Dialect::Csv || (dialect == Dialect::Json && json_is_array(data)) {
-        let bounds = chunk_bounds(data, from, threads, dialect, false);
-        let parts = bounds.len() - 1;
-        let mut swept = sweep_chunks(side, keys, whole, &bounds, key_size, opt, sink).into_iter();
-        let mut chunks = Vec::with_capacity(parts);
-        let mut fparts = Vec::with_capacity(parts);
-        let mut held = true;
-        for i in 0..parts {
-            // Chunk i started at a real row: chunk 0 by construction, and every
-            // later one because the loop only gets here past the check below.
-            let (chunk, end, fpart) = swept.next().expect("one result per chunk")?;
-            chunks.push(chunk);
-            if let Some(p) = fpart {
-                fparts.push(p);
-            }
-            if i + 2 < bounds.len() && end != bounds[i + 1] {
-                held = false;
-                break;
-            }
-        }
-        if held {
-            return Ok((chunks, fparts));
+        let guessed = chunk_bounds(data, from, threads, dialect, false);
+        if let Some(swept) = sweep_checked(side, keys, whole, &guessed, key_size, opt, sink)? {
+            return Ok(swept);
         }
         // A wrong guess joined garbage rows; the garbage parts are dropped and
         // the counted sweep re-joins the real rows into fresh ones.
+        if dialect == Dialect::Csv {
+            // The count is by quote parity, which a quote that is content
+            // (`5" nail`) throws off, so its bounds are checked like the
+            // guess's: a pair with one such quote ahead of a quoted field
+            // of many lines at a split read 203,217 rows of a 200,000-row
+            // file at four threads. Where they don't hold either, the file
+            // is swept as one chunk, which starts at a real row and so
+            // needs no bound.
+            let counted = chunk_bounds(data, from, threads, dialect, true);
+            if let Some(swept) = sweep_checked(side, keys, whole, &counted, key_size, opt, sink)? {
+                return Ok(swept);
+            }
+            return sweep_all(side, keys, whole, &[from, data.len()], key_size, opt, sink);
+        }
     }
     let bounds = chunk_bounds(data, from, threads, dialect, true);
+    sweep_all(side, keys, whole, &bounds, key_size, opt, sink)
+}
+
+/// Sweeps the chunks `bounds` gives, taking each bound as a real row start.
+fn sweep_all(
+    side: &Side,
+    keys: &RowParser,
+    whole: &RowParser,
+    bounds: &[usize],
+    key_size: usize,
+    opt: &Options,
+    sink: Option<&RowSink<'_>>,
+) -> Result<(Vec<Chunk>, Vec<Part>)> {
     let mut chunks = Vec::new();
     let mut fparts = Vec::new();
-    for r in sweep_chunks(side, keys, whole, &bounds, key_size, opt, sink) {
+    for r in sweep_chunks(side, keys, whole, bounds, key_size, opt, sink) {
         let (chunk, _, fpart) = r?;
         chunks.push(chunk);
         if let Some(p) = fpart {
@@ -1690,6 +1700,40 @@ fn sweep_text(
         }
     }
     Ok((chunks, fparts))
+}
+
+/// Sweeps the chunks `bounds` gives and checks each bound was a real row
+/// start: the first chunk starts at one, so the row it finishes on ends at
+/// the first real row start past its boundary, and if that is where the next
+/// chunk began, that bound was real too, and so on down the line. `None`
+/// when one was not: a chunk that started there parsed garbage, so its rows
+/// *and its errors* are discarded unread.
+fn sweep_checked(
+    side: &Side,
+    keys: &RowParser,
+    whole: &RowParser,
+    bounds: &[usize],
+    key_size: usize,
+    opt: &Options,
+    sink: Option<&RowSink<'_>>,
+) -> Result<Option<(Vec<Chunk>, Vec<Part>)>> {
+    let parts = bounds.len() - 1;
+    let mut swept = sweep_chunks(side, keys, whole, bounds, key_size, opt, sink).into_iter();
+    let mut chunks = Vec::with_capacity(parts);
+    let mut fparts = Vec::with_capacity(parts);
+    for i in 0..parts {
+        // Chunk i started at a real row: chunk 0 by construction, and every
+        // later one because the loop only gets here past the check below.
+        let (chunk, end, fpart) = swept.next().expect("one result per chunk")?;
+        chunks.push(chunk);
+        if let Some(p) = fpart {
+            fparts.push(p);
+        }
+        if i + 2 < bounds.len() && end != bounds[i + 1] {
+            return Ok(None);
+        }
+    }
+    Ok(Some((chunks, fparts)))
 }
 
 /// One chunk per pair of `bounds`, each returned with the offset its sweep
@@ -2438,11 +2482,18 @@ fn join_row(
                 return None;
             }
             let data = ctx.a.slab.data();
-            let to = field::offset_of(f) + field::len_of(f);
+            let at = field::offset_of(f);
+            let to = at + field::len_of(f);
             if to < from || to > data.len() {
                 return None;
             }
             if to < data.len() && data[to] != delimiter && data[to] != b'\n' {
+                return None;
+            }
+            // A quoted field the file ends in was ended by the file, not by
+            // a quote and a delimiter: after the same bytes in B the field
+            // may run on, so they prove nothing about it.
+            if to == data.len() && at > from && data[at - 1] == b'"' {
                 return None;
             }
             Some(Proof::Csv {

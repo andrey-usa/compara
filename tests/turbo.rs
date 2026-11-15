@@ -532,6 +532,189 @@ fn a_wrong_split_guess_cannot_fail_the_run() {
     }
 }
 
+/// A quote opens a quoted field only where a field starts. Anywhere else it
+/// is content -- an inch mark, as in `5" nail` -- and the row ends at its own
+/// newline. The row end was found by counting quotes, so each such quote took
+/// every row up to the next one like it as part of its own: four rows read as
+/// two, and a pair that differed in the swallowed rows compared as identical.
+#[test]
+fn a_quote_that_is_content_does_not_join_rows() {
+    let a = "id,name,x\n1,5\" nail,a\n2,ok,b\n3,3\" bolt,c\n4,ok,d\n";
+    let b = "id,name,x\n1,5\" nail,a\n2,CHANGED,b\n3,3\" bolt,c\n4,ok,d\n";
+    agrees(a, b, &["id"], false, false);
+    // With the column left out its fields are skipped, not walked.
+    agrees_ignoring(a, &b.replace("ok,d", "ok,D"), &["id"], &["name"]);
+    // A field that ends in one, and one in the key itself.
+    agrees(
+        "id,size,x\n1,12\",a\n2,3,b\n3,7\",c\n",
+        "id,size,x\n1,12\",a\n2,4,b\n3,7\",c\n",
+        &["id"],
+        false,
+        false,
+    );
+    agrees(
+        "size,x\n12\",a\n3,b\n7\",c\n",
+        "size,x\n12\",a\n3,B\n7\",c\n",
+        &["size"],
+        false,
+        false,
+    );
+
+    let f = Fixture::new(a, b);
+    let mut opt = Options::with_key(["id"]);
+    opt.engine = Engine::Turbo.label().to_string();
+    let r = compare(&f.a, &f.b, &mut opt).expect("compare");
+    assert_eq!(
+        (r.counts.a_rows, r.counts.b_rows, r.counts.changed),
+        (4, 4, 1)
+    );
+}
+
+/// Text between a field's closing quote and its delimiter is part of the
+/// value, as the reference engine reads it: `"ab"cd` is `abcd`, and an export
+/// that did not double its inner quotes keeps everything it wrote. Read as
+/// the quoted part alone, two files that differed only after the closing
+/// quote compared as identical.
+#[test]
+fn text_after_a_closing_quote_is_part_of_the_value() {
+    agrees(
+        "id,v\n1,\"ab\"cd\n2,b\n",
+        "id,v\n1,\"ab\"xy\n2,b\n",
+        &["id"],
+        false,
+        false,
+    );
+    agrees(
+        "id,v\n1,\"ab\"cd\n2,b\n",
+        "id,v\n1,abcd\n2,b\n",
+        &["id"],
+        false,
+        false,
+    );
+    let a = "id,name,x\n1,\"John \"Johnny\" Smith\",a\n2,\"5\" nail\",b\n3,\"ok\",c\n";
+    let b = "id,name,x\n1,\"John \"Jack\" Smith\",a\n2,\"5\" bolt\",b\n3,\"ok\",c\n";
+    agrees(a, b, &["id"], false, false);
+    agrees(a, b, &["id"], true, true);
+    // In the key, with CRLF, and as the row's last field.
+    agrees(
+        "k,v\r\n\"a\"1,x\r\n\"a\"2,y\r\n3,\"p\"q\r\n",
+        "k,v\r\n\"a\"1,x\r\n\"a\"2,Y\r\n3,\"p\"r\r\n",
+        &["k"],
+        false,
+        false,
+    );
+
+    let f = Fixture::new(a, b);
+    let mut opt = Options::with_key(["id"]);
+    opt.engine = Engine::Turbo.label().to_string();
+    let r = compare(&f.a, &f.b, &mut opt).expect("compare");
+    assert_eq!((r.counts.a_rows, r.counts.changed), (3, 2));
+    let row = serde_json::to_string(&r.changed.rows[0]).expect("a row");
+    assert_eq!(
+        row,
+        r#"["1",[[0,"John Johnny\" Smith\"","John Jack\" Smith\""]]]"#
+    );
+}
+
+/// A quoted field the file ends in -- its quote never closed -- is everything
+/// after the opening quote, the last byte and a final newline included. The
+/// last byte was taken for the closing quote and dropped.
+#[test]
+fn a_quoted_field_the_file_ends_in_is_read_whole() {
+    for tail in ["", "\n", "\r\n", "\"\"", "\"\"\n"] {
+        agrees(
+            &format!("id,v\n1,a\n2,\"open{tail}"),
+            &format!("id,v\n1,a\n2,\"open{tail}"),
+            &["id"],
+            false,
+            false,
+        );
+        agrees(
+            &format!("id,v\n1,a\n2,\"open{tail}"),
+            "id,v\n1,a\n2,open\n",
+            &["id"],
+            false,
+            false,
+        );
+    }
+    // The same bytes in the other file, where the field runs on: equal bytes
+    // up to the end of the first file say nothing about the rest.
+    agrees(
+        "id,v,w\n1,a,\"",
+        "id,v,w\n1,a,\"\n2,b,c\n",
+        &["id"],
+        false,
+        false,
+    );
+    agrees(
+        "id,v,w\n1,a,\"x",
+        "id,v,w\n1,a,\"x\n2,b,c\n",
+        &["id"],
+        false,
+        false,
+    );
+}
+
+/// The counted split is by quote parity, and one quote that is content puts
+/// the count off by one for the rest of the file. Here the guessed split is
+/// wrong -- the middle of the file is inside a quoted field of many lines --
+/// and the count agrees with the guess, having met an inch mark and the
+/// field's opening quote. Those bounds went unchecked, and the lines of the
+/// field past the split were read as rows: 203,217 of a 200,000-row file at
+/// four threads.
+#[test]
+fn counted_bounds_are_checked_when_a_quote_is_content() {
+    let rows = 150_000;
+    let note: String = (0..12_000)
+        .map(|k| format!("line {k} of the note\n"))
+        .collect();
+    let build = |changed: &str| {
+        let mut s = String::from("k,note,v\n");
+        s.push_str("K0,5\" nail,1\n");
+        let mut placed = false;
+        for i in 1..rows {
+            // The note goes where it will sit across the middle of the file.
+            if !placed && s.len() + note.len() / 2 >= 3 << 20 {
+                s.push_str(&format!("N{i},\"{note}\",1\n"));
+                placed = true;
+            } else {
+                let v = if i == rows - 5 { changed } else { "1" };
+                s.push_str(&format!("P{i},an ordinary row of text to pad,{v}\n"));
+            }
+        }
+        while s.len() < 6 << 20 {
+            let i = s.len();
+            s.push_str(&format!("Q{i},an ordinary row of text to pad,1\n"));
+        }
+        s
+    };
+    let (a, b) = (build("1"), build("2"));
+    let field = a.find(",\"line 0 of").expect("the note") + 2;
+    let mid = a.len() / 2;
+    assert!(
+        field < mid && mid < field + note.len(),
+        "the note must straddle the middle: {field}..{} against {mid}",
+        field + note.len()
+    );
+    let want = a.matches("\nK").count()
+        + a.matches("\nN").count()
+        + a.matches("\nP").count()
+        + a.matches("\nQ").count();
+    let f = Fixture::new(&a, &b);
+
+    for threads in [1usize, 4, 8, 16] {
+        let mut opt = Options::with_key(["k"]);
+        opt.engine = Engine::Turbo.label().to_string();
+        opt.threads = Some(threads);
+        let r = compare(&f.a, &f.b, &mut opt).unwrap_or_else(|e| panic!("threads {threads}: {e}"));
+        assert_eq!(
+            (r.counts.a_rows, r.counts.b_rows, r.counts.changed),
+            (want as i64, want as i64, 1),
+            "threads {threads}"
+        );
+    }
+}
+
 /// One pair of newline-delimited JSON files, since `Fixture` writes `.csv`.
 fn json_fixture(a_body: &str, b_body: &str) -> Fixture {
     let dir = std::env::temp_dir().join(format!(

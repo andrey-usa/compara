@@ -8,6 +8,30 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A quote inside an unquoted field no longer joins rows. CSV gives a quote
+  meaning only as the first byte of a field; anywhere else it is content,
+  as in `5" nail`, and `native` and `sortmerge` have always read it so.
+  The turbo engine found the end of a row by counting quotes, so one such
+  quote took every row up to the next one like it as part of its own: a
+  200,000-row file with an inch mark in every thousandth row was read as
+  100,000 rows, and against a copy that differed in four of the swallowed
+  rows it was reported identical, exit 0. A row with a quote that opens no
+  field is now read field by field, as the other engines read it. The
+  split of a large file across threads fell back on the same count: its
+  bounds are now checked, and a file they are wrong for is read in one
+  piece (one inch mark ahead of a quoted field of many lines gave 203,217
+  rows of a 200,000-row file at four threads). Rows with no quote are
+  scanned as before; a row with quotes takes a few more instructions for
+  the check.
+- Text between a closing quote and the delimiter is part of the value:
+  `"ab"cd` is `abcd`, and `"John "Johnny" Smith"`, from an export that did
+  not double its quotes, is `John Johnny" Smith"`, as `native` and
+  `sortmerge` read them. turbo kept the quoted part and dropped the rest,
+  so two files that differed only after a closing quote compared as
+  identical. A quoted field the file ends in without closing keeps its
+  last byte, which was dropped as if it were the closing quote.
+- `--delimiter` refuses a quote or a line break, which no reader could
+  split a row on.
 - A JSON file's columns are the keys of every object in it, not of the
   first. A writer that leaves a null field out of its object (Spark's
   does, and Go's `omitempty`) leaves the column out of the first object
