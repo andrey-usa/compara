@@ -151,7 +151,10 @@ fn assign(profile: &mut Profile, key: &str, raw: &str) -> Result<()> {
         "empty_is_null" => profile.empty_is_null = Some(raw == "true"),
         "tolerance" => profile.tolerance = Some(raw.parse().map_err(|_| number("tolerance"))?),
         "max_rows" => profile.max_rows = Some(raw.parse().map_err(|_| number("max_rows"))?),
-        "delimiter" => profile.delimiter = toml_string(raw).chars().next(),
+        "delimiter" => {
+            profile.delimiter = crate::options::parse_delimiter(&toml_string(raw))
+                .map_err(|e| Error::new(e.to_string().replace("--delimiter", "delimiter")))?;
+        }
         "encoding" => profile.encoding = Some(toml_string(raw)),
         "engine" => profile.engine = Some(toml_string(raw)),
         _ => {}

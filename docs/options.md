@@ -5,9 +5,9 @@
 | `-k`, `--key` | composite key, required (or from a profile) |
 | `-c`, `--compare` | columns to diff; default every column present in both files except the key |
 | `-i`, `--ignore` | columns to skip (timestamps, run ids) |
-| `--trim`, `--ignore-case`, `--empty-is-null` | normalisation before comparing (applies to key and values) |
+| `--trim`, `--ignore-case`, `--empty-is-null` | normalisation before comparing (applies to key and values); a value of only spaces is still a value under `--trim`, and equal to an empty cell only with `--empty-is-null` too |
 | `--tolerance` | absolute numeric tolerance where both sides parse as numbers |
-| `--delimiter` | override delimiter detection (CSV only); one that isn't in a file's header is noted |
+| `--delimiter` | override delimiter detection (CSV only): one character, or `'\t'` (or `tab`) for a tab; one that isn't in a file's header is noted |
 | `--encoding` | UTF-8 (the default) is read as text; Latin-1 or a Windows code page compares as bytes, with the right counts; UTF-16 and UTF-32 are refused with how to convert |
 | `--threads` | how wide the engines run; the default is every core |
 | `--memory` | memory to plan for (e.g. `8G`); decides when large text files are joined in one pass instead of two, and how many columns of two Parquet files are read at once (a Parquet pair that needs more than a stated budget is refused) |

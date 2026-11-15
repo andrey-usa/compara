@@ -376,3 +376,44 @@ fn both_commands_need_a_file() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("head needs a file"));
 }
+
+/// `--delimiter '\t'` and `--delimiter tab` are a tab, and a longer value is
+/// refused: its first character used to be taken, so `\t` read every row as
+/// one column split on a backslash that was not there.
+#[test]
+fn a_tab_delimiter_can_be_named_and_a_long_one_is_refused() {
+    let f = Fixture::new(10);
+    let (_, plain, _) = run(&["head", "-n", "3"], &f.path("a.tsv"));
+    for tab in ["\\t", "tab", "TAB", "\t"] {
+        let (code, stdout, stderr) =
+            run(&["head", "-n", "3", "--delimiter", tab], &f.path("a.tsv"));
+        assert_eq!(code, 0, "{tab:?}: {stderr}");
+        assert_eq!(stdout, plain, "{tab:?}");
+        assert!(!stderr.contains("is not in"), "{tab:?}: {stderr}");
+    }
+    for command in ["head", "columns"] {
+        let (code, _, stderr) = run(&[command, "--delimiter", ",;"], &f.path("a.csv"));
+        assert_eq!(code, 2, "{stderr}");
+        assert!(
+            stderr.contains("--delimiter must be one character, got \",;\""),
+            "{stderr}"
+        );
+    }
+}
+
+/// A line break inside a value does not break `head`'s table: each row stays
+/// one line, the break shown as its escape, and `--csv` keeps the value.
+#[test]
+fn head_keeps_a_row_with_a_line_break_on_one_line() {
+    let f = Fixture::new(1);
+    let path = f.path("breaks.csv");
+    std::fs::write(&path, "id,note\n1,\"two\nlines\"\n2,\"a\tb\"\n3,plain\n").unwrap();
+    let (code, stdout, stderr) = run(&["head"], &path);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        stdout,
+        "id  note\n--  ----------\n1   two\\nlines\n2   a\\tb\n3   plain\n"
+    );
+    let (_, csv, _) = run(&["head", "--csv"], &path);
+    assert!(csv.contains("\"two\nlines\""), "{csv}");
+}

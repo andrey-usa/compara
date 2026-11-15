@@ -35,8 +35,8 @@ compara compare a.csv b.csv -k account_id,txn_id -i updated_at --json -
 | `-i col,col` | a column always differs (load time, run id) |
 | `-c col,col` | only some columns matter |
 | `--tolerance 0.005` | numbers may differ by rounding; without it `1.0` and `1` differ in CSV |
-| `--trim`, `--ignore-case`, `--empty-is-null` | whitespace, case, or empty against missing should not count |
-| `--delimiter ';'` | the separator is not found from the header |
+| `--trim`, `--ignore-case`, `--empty-is-null` | whitespace, case, or empty against missing should not count; a cell of only spaces equals an empty one with `--trim --empty-is-null` together |
+| `--delimiter ';'` | the separator is not found from the header (`'\t'` for a tab) |
 | `--encoding latin1` | the file is not UTF-8 |
 
 Values compare as text in CSV and JSON; a Parquet column that holds numbers

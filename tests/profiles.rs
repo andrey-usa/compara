@@ -59,3 +59,20 @@ fn parse_list_drops_empty_entries() {
     assert_eq!(compara::parse_list(" a, b ,,c "), vec!["a", "b", "c"]);
     assert!(compara::parse_list("  ").is_empty());
 }
+
+/// A profile's tab delimiter is written `"\t"` or `"tab"`; the escape used to
+/// be read as a backslash, and a longer value as its first character.
+#[test]
+fn a_profile_names_a_tab_delimiter() {
+    for (written, read) in [(r#""\t""#, '\t'), (r#""tab""#, '\t'), (r#"";""#, ';')] {
+        let found = profiles::parse(&format!(
+            "[profiles.p]\nkey = [\"id\"]\ndelimiter = {written}\n"
+        ))
+        .expect("parse");
+        let mut opt = Options::default();
+        found["p"].apply_to(&mut opt);
+        assert_eq!(opt.delimiter, Some(read), "{written}");
+    }
+    let refused = profiles::parse("[profiles.p]\nkey = [\"id\"]\ndelimiter = \"ab\"\n");
+    assert!(refused.is_err(), "a two-character delimiter was accepted");
+}

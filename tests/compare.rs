@@ -288,6 +288,10 @@ fn bad_options_are_rejected() {
     let cases: Vec<(&str, Mutate)> = vec![
         ("no key", |o| o.key.clear()),
         ("negative tolerance", |o| o.tolerance = -1.0),
+        // Infinity made every pair of numbers equal, and NaN was no
+        // tolerance at all; neither said so.
+        ("infinite tolerance", |o| o.tolerance = f64::INFINITY),
+        ("tolerance that is not a number", |o| o.tolerance = f64::NAN),
         ("zero max rows", |o| o.max_rows = 0),
         ("unknown engine", |o| o.engine = "nope".into()),
         ("zero threads", |o| o.threads = Some(0)),

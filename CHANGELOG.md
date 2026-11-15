@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `--delimiter '\t'` and `--delimiter tab` are a tab, on the command line
+  and as a profile's `delimiter`. Only the first character of the value was
+  taken, so `'\t'` split every row on a backslash and `tab` on the letter
+  t, and the run ended on a key column that was "not in A". A value longer
+  than one character is now refused, with the tab's spelling.
+- `--tolerance inf` and `--tolerance nan` are refused. Infinity made every
+  pair of numbers equal and NaN was no tolerance at all, and neither said
+  so.
+- `compara head` keeps a row on one line when a value holds a line break
+  or a tab: the aligned table shows it as `\n`, `\r` or `\t` (`--csv`
+  prints the value as it is). A break used to start a new line in the
+  middle of the table.
 - A Parquet compare whose files fail in more than one column says the
   same error on every run and every machine: the first failing column in
   the order the columns are read, the one `--threads 1` reports. The

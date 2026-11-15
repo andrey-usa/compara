@@ -64,7 +64,8 @@ compare options:
       --empty-is-null     Treat an empty string and null as equal
       --tolerance N       Absolute numeric tolerance
       --max-rows N        Rows embedded per report section (default 50000)
-      --delimiter D       Force the delimiter (default: detected)
+      --delimiter D       Force the delimiter: one character, or '\\t' for a
+                          tab (default: detected)
       --encoding ENC      UTF-8 (the default) is read as text; Latin-1 or a
                           Windows code page compares as bytes (right counts);
                           UTF-16 is refused
@@ -424,7 +425,7 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
         })?);
     }
     if let Some(v) = args.get("delimiter", None) {
-        opt.delimiter = v.chars().next();
+        opt.delimiter = compara::options::parse_delimiter(v)?;
     }
     if let Some(v) = args.get("encoding", None) {
         opt.encoding = v.to_string();
@@ -805,7 +806,7 @@ fn cmd_head(argv: &[String]) -> Result<u8> {
 /// `--encoding` is checked as `compare` checks it.
 fn apply_read_options(args: &Args, opt: &mut Options) -> Result<()> {
     if let Some(v) = args.get("delimiter", None) {
-        opt.delimiter = v.chars().next();
+        opt.delimiter = compara::options::parse_delimiter(v)?;
     }
     if let Some(v) = args.get("encoding", None) {
         opt.encoding = v.to_string();
@@ -876,6 +877,19 @@ fn csv_line(cells: &[String]) -> String {
 fn print_table(columns: &[String], rows: &[Vec<String>]) {
     const CAP: usize = 32;
     let clip = |s: &str| -> String {
+        // One row is one line: a line break or a tab inside a value is shown
+        // as its escape, or the rows after it no longer line up (`--csv`
+        // prints the value as it is).
+        let escaped;
+        let s = if s.contains(['\n', '\r', '\t']) {
+            escaped = s
+                .replace('\r', "\\r")
+                .replace('\n', "\\n")
+                .replace('\t', "\\t");
+            escaped.as_str()
+        } else {
+            s
+        };
         let count = s.chars().count();
         if count <= CAP {
             s.to_string()

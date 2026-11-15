@@ -183,6 +183,12 @@ impl Options {
         if self.key.is_empty() {
             return Err(Error::new("at least one key column is required"));
         }
+        if !self.tolerance.is_finite() {
+            return Err(Error::new(format!(
+                "--tolerance must be a finite number, got {}",
+                self.tolerance
+            )));
+        }
         if self.tolerance < 0.0 {
             return Err(Error::new(format!(
                 "--tolerance must not be negative, got {}",
@@ -228,6 +234,27 @@ impl Options {
                 "--delimiter must be an ASCII character, got {c:?}"
             ))),
         }
+    }
+}
+
+/// `--delimiter`'s value (and a profile's `delimiter`) as the character it
+/// names; an empty value leaves the delimiter to be detected.
+///
+/// A tab cannot be typed into most command lines or a TOML string without an
+/// escape the shell or this parser leaves alone, so `\t` and `tab` name it.
+/// Anything else longer than one character is refused: taking its first
+/// character read `\t` as a backslash and `tab` as the letter t.
+pub fn parse_delimiter(value: &str) -> Result<Option<char>> {
+    if value == "\\t" || value.eq_ignore_ascii_case("tab") {
+        return Ok(Some('\t'));
+    }
+    let mut chars = value.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => Ok(None),
+        (Some(c), None) => Ok(Some(c)),
+        _ => Err(Error::new(format!(
+            "--delimiter must be one character, got {value:?} (a tab is --delimiter '\\t')"
+        ))),
     }
 }
 
