@@ -21,7 +21,7 @@ import urllib.request
 
 REPO = "andrey-usa/compara"
 SITE = "https://andrey-usa.github.io/compara/"
-NAMES = {"compara": "compara", "duckdb": "DuckDB", "polars": "Polars"}
+NAMES = {"compara": "compara", "duckdb": "DuckDB", "polars": "Polars", "qsv": "qsv"}
 FORMATS = {"csv": "CSV", "parquet": "Parquet", "ndjson": "NDJSON"}
 TIE = 0.02  # closer than 2% is a tie, not a loss: about what one run varies by
 
@@ -83,8 +83,11 @@ def main():
         sys.exit("these results name no run: the docs cite one for every number")
     link = f"[bench-contenders run {run}](https://github.com/{REPO}/actions/runs/{run})"
     v, env, inputs = doc["versions"], doc["env"], doc["inputs"]
-    names = [n for n in NAMES if all(n in inp["tools"] for inp in inputs)]
-    ver = {"compara": v["compara"].split()[-1], "duckdb": v.get("duckdb", ""), "polars": v.get("polars", "")}
+    # A tool that reads one format only (qsv: CSV) has a column and "-" where it did not run.
+    names = [n for n in NAMES if any(n in inp["tools"] for inp in inputs)]
+    qv = re.search(r"\d+\.\d+\.\d+\S*", v.get("qsv", ""))
+    ver = {"compara": v["compara"].split()[-1], "duckdb": v.get("duckdb", ""), "polars": v.get("polars", ""),
+           "qsv": qv.group(0) if qv else v.get("qsv", "")}
     head = [f"{NAMES[n]} {ver[n]}".strip() for n in names]
     date = doc["generated_utc"][:10]
     machine = f"{env['cpu']}, {env['cores']} cores, {env['memory_gb']} GB"
@@ -98,10 +101,11 @@ def main():
     losses = []
     for inp in inputs:
         rs = inp["tools"]
-        done = [n for n in names if not rs[n].get("failed")]
+        here = [n for n in names if n in rs]
+        done = [n for n in here if not rs[n].get("failed")]
         fastest = min(rs[n]["wall_s"] for n in done)
         table.append(f"| {label(inp)} | " + " | ".join(cell(rs[n], rs[n].get("wall_s") == fastest and n in done)
-                                                         for n in names) + " |")
+                                                         if n in rs else "not run" for n in names) + " |")
         for key, what_, fmt in (("wall_s", "wall time", lambda x: f"{x:.2f} s"),
                                 ("cpu_s", "CPU time", lambda x: f"{x:.1f} s"),
                                 ("peak_rss_mb", "peak memory", lambda x: f"{x:,} MB")):
@@ -113,7 +117,7 @@ def main():
                  if losses else "No other tool did better than compara by more than 2% on any measure in this run.")
     note = ("Each cell: wall time, best of {runs} · CPU time (user and system) · peak memory, of the best "
             "run; fastest in bold. DuckDB and Polars run from Python, and their time starts at their first "
-            "read, after the interpreter's start and the import. A tool the runner's kernel stopped for "
+            "read, after the interpreter's start and the import; qsv is a binary and is timed as a whole process, like compara, and runs on CSV only. A tool the runner's kernel stopped for "
             "lack of memory says so.").format(runs=doc["runs"])
 
     readme = ["## Benchmarks", "",
@@ -130,7 +134,7 @@ def main():
 
     runs = ["| input | tool | every run: wall · CPU · peak memory |", "|---|---|---|"]
     for inp in inputs:
-        for n in names:
+        for n in (n for n in names if n in inp["tools"]):
             r = inp["tools"][n]
             every = cell(r, False) if r.get("failed") else "; ".join(
                 f"{x['wall_s']:.2f} s · {x['cpu_s']:.1f} s · {x['peak_rss_mb']:,} MB" for x in r["runs"])
@@ -145,7 +149,8 @@ def main():
             "falls on all of them.", ""] + runs + ["",
             "## Versions", "",
             f"compara built from the run's commit ({v['compara']}); DuckDB {v.get('duckdb')} and Polars "
-            f"{v.get('polars')} installed from PyPI at their latest in the run, on Python {v.get('python')}.", "",
+            f"{v.get('polars')} installed from PyPI at their latest in the run, on Python {v.get('python')}."
+            + (f" qsv {ver['qsv']} is its release binary (`{v['qsv']}`)." if v.get("qsv") else ""), "",
             "## Method", "",
             "Each pair is written by `compara-gen-data` (seed 7) in each format, and every tool reads the "
             "same files. Each tool runs in a process of its own; CPU time and peak memory are that "
@@ -153,7 +158,15 @@ def main():
             "by value in Parquet, an empty field equal only to an empty field, and a key that appears "
             "twice in a file compared by its first row. DuckDB reads Parquet where it is (`read_parquet`, "
             "its row numbers from the file) and loads each CSV into a table once, for a row order to take "
-            "the first row by; Polars runs its lazy API, which its streaming engine did not beat. The run "
+            "the first row by; Polars runs its lazy API, which its streaming engine did not beat. "
+            + ("qsv diff reads CSV only, has no option to leave a column out and says its keys must be unique "
+               "(these tables repeat a few): the ignored column is cut from both files with `qsv select` "
+               "and each key's first row is kept with `qsv extdedup`, both before the timing and not "
+               "charged to qsv, and the timed process is "
+               f"`qsv diff -k {','.join(doc['key'])} LEFT RIGHT` on every core, its output written to a file; "
+               "the counts are read back from that output, and unchanged is the left file's rows "
+               "(`qsv count`) less the changed and removed. " if "qsv" in names else "")
+            + "The run "
             f"fails unless every tool that finishes gives the same counts: {gate}.", "",
             "To run it yourself, from a checkout with compara built and `pip install duckdb polars`:", "",
             "```sh",

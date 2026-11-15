@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """compara against DuckDB and Polars on one keyed comparison: every number from this run.
 
-    bench_contenders.py --compara BIN --gen BIN [--rows 1m,10m] [--formats csv,parquet]
-                        [--runs 3] [--work DIR] [--delete] [--memory-max 13G]
-                        [--json OUT] [--notices]
+    bench_contenders.py --compara BIN --gen BIN [--qsv BIN] [--rows 1m,10m]
+                        [--formats csv,parquet] [--runs 3] [--work DIR] [--delete]
+                        [--memory-max 13G] [--json OUT] [--notices]
 
 Two generated tables of 20 columns a side (compara-gen-data, seed 7), keyed
 on (account_id, txn_id), updated_at ignored, in each format asked for. Every
@@ -20,6 +20,15 @@ is and loads CSV once; Polars' lazy API, which its streaming engine did not
 beat here); their wall is timed
 inside the process from the first read to the counts, so the interpreter's
 start and the import are not charged to them. compara's is the whole process.
+--qsv adds qsv (dathere/qsv, its release binary) on the CSV inputs only: `qsv diff`
+reads CSV alone, and has no way to leave a column out, so the ignored column is
+cut from both files first with `qsv select`, outside the timing (the page says
+so). Only the `qsv diff` process is timed, writing its diff to a file as compara
+does not; its counts are read back from that output afterwards (qsv diff lists
+the rows that differ, so unchanged is the left file's rows, from `qsv count`,
+less the changed and removed). qsv requires unique keys and the generated tables
+repeat a few, so the same untimed step keeps each key's first row with
+`qsv extdedup --select`.
 A tool the kernel kills for memory is recorded as out of memory, with what
 it held, and the run goes on; --memory-max gives each tool a cgroup with
 that ceiling, so it is the tool that is stopped and not the machine.
@@ -113,10 +122,64 @@ def compara_cmd(binary, a, b, out_json):
     return [binary, "compare", a, b, "-k", ",".join(KEY), "-i", IGNORE, "--json", out_json]
 
 
+def qsv_diff_cmd(binary, a, b):
+    """qsv diff on two files whose ignored column is already gone. Its options,
+    from `qsv diff --help`: -k names the key columns (the same in both files),
+    -j defaults to every CPU, and the diff goes to stdout (run_one's file)."""
+    return [binary, "diff", "-k", ",".join(KEY), a, b]
+
+
+def qsv_prepare(binary, a, b, work):
+    """Not timed. qsv diff has no option to skip a column and says its keys MUST be
+    unique (the generated tables repeat a few), so each file goes through
+    `qsv select '!IGNORE'` and then `qsv extdedup --select KEY`, which keeps a
+    key's first row, as compara compares it. Returns the two new paths, their
+    row counts and the seconds spent."""
+    t0 = time.perf_counter()
+    outs = []
+    for src in (a, b):
+        base = os.path.join(work, "qsv_" + os.path.basename(src))
+        subprocess.run([binary, "select", f"!{IGNORE}", "-o", base + ".cut", src], check=True)
+        subprocess.run([binary, "extdedup", "--select", ",".join(KEY), base + ".cut", base], check=True)
+        os.remove(base + ".cut")
+        outs.append(base)
+    rows = [int(subprocess.run([binary, "count", p], check=True, capture_output=True, text=True).stdout)
+            for p in outs]
+    return outs[0], outs[1], rows, time.perf_counter() - t0
+
+
+def qsv_counts(out_path, rows_a, rows_b):
+    """Counts from qsv diff's output: a header `diffresult,<columns>`, then `-` (left)
+    and `+` (right) rows. A key with both is changed, only `-` removed, only `+`
+    added; unchanged is what is left of the left file's rows."""
+    import csv
+    seen = {}
+    with open(out_path, newline="") as f:
+        rd = csv.reader(f)
+        head = next(rd, None)
+        if head is None:
+            kx = None
+        else:
+            kx = [head.index(k) for k in KEY]
+        for row in rd:
+            k = tuple(row[i] for i in kx)
+            seen[k] = seen.get(k, 0) | (1 if row[0] == "-" else 2)
+    changed = sum(1 for v in seen.values() if v == 3)
+    removed = sum(1 for v in seen.values() if v == 1)
+    added = sum(1 for v in seen.values() if v == 2)
+    unchanged = rows_a - changed - removed
+    if unchanged + changed + added != rows_b:
+        sys.exit(f"qsv: {unchanged}+{changed}+{added} rows do not add up to the right file's {rows_b}: "
+                 "duplicate keys left after extdedup?")
+    return {"unchanged": unchanged, "changed": changed, "added": added, "removed": removed}
+
+
 def contender(name, binary, a, b, fmt, work, memory_max=None):
     if name == "compara":
         out_json = os.path.join(work, "compara-counts.json")
         cmd = compara_cmd(binary, a, b, out_json)
+    elif name == "qsv":
+        cmd = qsv_diff_cmd(binary, a, b)
     else:
         code = DUCKDB if name == "duckdb" else POLARS
         cmd = [sys.executable, "-c", code, a, b, fmt, ",".join(KEY), IGNORE]
@@ -134,6 +197,12 @@ def bench(args, fmt, a, b):
     and left out of the later rounds; any other failure stops the run."""
     names = ["compara", "duckdb", "polars"]
     cmds = {n: contender(n, args.compara, a, b, fmt, args.work, args.memory_max) for n in names}
+    qsv_prep = None
+    if args.qsv and fmt == "csv":
+        names.append("qsv")
+        qa, qb, qrows, prep_s = qsv_prepare(args.qsv, a, b, args.work)
+        qsv_prep = {"prep_s": round(prep_s, 3)}
+        cmds["qsv"] = contender("qsv", args.qsv, qa, qb, fmt, args.work, args.memory_max)
     runs = {n: [] for n in names}
     counts, failed = {}, {}
     for i in range(args.runs):  # interleaved: each round runs every tool once
@@ -152,6 +221,10 @@ def bench(args, fmt, a, b):
                     sys.exit(f"compara exited {code} on {fmt}: {err}")
                 c = json.load(open(out_json))["counts"]
                 counts[n] = {k: c[k] for k in ("unchanged", "changed", "added", "removed")}
+            elif n == "qsv":
+                if code != 0:
+                    sys.exit(f"qsv failed on {fmt} (exit {code}): {err}")
+                counts[n] = qsv_counts(os.path.join(args.work, "run.out"), qrows[0], qrows[1])
             else:
                 if code != 0:
                     sys.exit(f"{n} failed on {fmt} (exit {code}): {err}")
@@ -169,6 +242,11 @@ def bench(args, fmt, a, b):
             sys.exit(f"correctness gate: {n} counts {counts[n]} on {fmt}, compara {counts['compara']}")
         best = min(runs[n], key=lambda r: r["wall_s"])
         results[n] = {**best, "runs": runs[n], "counts": counts[n]}
+        if n == "qsv":
+            results[n].update(qsv_prep)  # the select and count before the timing, for the record
+    if qsv_prep:
+        for p in (qa, qb):
+            os.remove(p)
     return results
 
 
@@ -177,6 +255,8 @@ def versions(args):
     for mod in ("duckdb", "polars"):
         v[mod] = subprocess.run([sys.executable, "-c", f"import {mod}; print({mod}.__version__)"],
                                 capture_output=True, text=True).stdout.strip()
+    if args.qsv:
+        v["qsv"] = subprocess.run([args.qsv, "--version"], capture_output=True, text=True).stdout.strip()
     v["python"] = platform.python_version()
     return v
 
@@ -221,6 +301,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--compara", required=True)
     ap.add_argument("--gen", required=True, help="compara-gen-data")
+    ap.add_argument("--qsv", help="qsv's release binary: adds qsv diff on the CSV inputs")
     ap.add_argument("--rows", default="1m,10m", help="sizes, smallest first: 1m,10m")
     ap.add_argument("--delete", action="store_true", help="delete each pair once measured")
     ap.add_argument("--memory-max", help="run every tool in a cgroup with this MemoryMax (e.g. 13G; needs sudo and systemd)")
@@ -231,6 +312,8 @@ def main():
     ap.add_argument("--notices", action="store_true")
     args = ap.parse_args()
     args.compara = os.path.abspath(args.compara)
+    if args.qsv:
+        args.qsv = os.path.abspath(args.qsv)
     os.makedirs(args.work, exist_ok=True)
     doc = {"generated_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
            "run_id": os.environ.get("GITHUB_RUN_ID"), "commit": os.environ.get("GITHUB_SHA"),

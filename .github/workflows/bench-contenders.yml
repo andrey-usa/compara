@@ -1,6 +1,6 @@
 name: bench-contenders
 
-# Weekly: compara against DuckDB and Polars at their latest, on one keyed
+# Weekly: compara against DuckDB, Polars and qsv (CSV only) at their latest, on one keyed
 # comparison of two generated 20-column tables (1M and 10M rows, CSV and
 # Parquet), every tool's counts checked identical (correctness gate). The
 # results are printed as `bench json` notices, so the docs are written from
@@ -43,12 +43,27 @@ jobs:
           pip install --upgrade duckdb polars
           python3 -c "import duckdb, polars; print('duckdb', duckdb.__version__, 'polars', polars.__version__)"
 
+      # qsv (dathere/qsv): its release binary at the latest release, the tag and
+      # `qsv --version` printed so the run records what was measured.
+      - name: Install qsv (latest release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo dathere/qsv --json tagName --jq .tagName)
+          mkdir -p "$RUNNER_TEMP/qsv"
+          gh release download "$tag" --repo dathere/qsv --pattern 'qsv-*-x86_64-unknown-linux-gnu.zip' --dir "$RUNNER_TEMP/qsv"
+          ls "$RUNNER_TEMP/qsv"/qsv-*-x86_64-unknown-linux-gnu.zip | wc -l | grep -qx 1
+          unzip -q -o "$RUNNER_TEMP/qsv"/qsv-*-x86_64-unknown-linux-gnu.zip qsv -d "$RUNNER_TEMP/qsv"
+          chmod +x "$RUNNER_TEMP/qsv/qsv"
+          echo "qsv release $tag"
+          "$RUNNER_TEMP/qsv/qsv" --version
+
       # Each tool in a cgroup of 13 GB of the runner's 16: a tool that needs
       # more is stopped and recorded as out of memory, and the runner lives.
       - name: Benchmark (1M and 10M rows, CSV and Parquet, three rounds)
         run: |
           python3 scripts/bench_contenders.py --compara target/release/compara \
-            --gen target/release/compara-gen-data --rows 1m,10m --runs 3 \
+            --gen target/release/compara-gen-data --qsv "$RUNNER_TEMP/qsv/qsv" --rows 1m,10m --runs 3 \
             --work "$RUNNER_TEMP/bench" --delete --memory-max 13G --json bench-results.json --notices
 
       - name: Publish table
