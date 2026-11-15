@@ -80,8 +80,10 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
 
     let key_size = opt.key.len();
     let width = key_size + resolved.compared.len();
-    let work = temp_dir()?;
-    let guard = DirGuard(work.clone());
+    // The runs hold every row of both files: the directory is this user's
+    // alone, and goes with what is in it however the run ends.
+    let guard = crate::source::TempDir::new("sortmerge")?;
+    let work = guard.path().to_path_buf();
 
     let mut phases = Phases::new("");
     let sort = |side: &str, path: &Path, header: &[String]| -> Result<Runs> {
@@ -149,28 +151,6 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     );
     drop(guard);
     out
-}
-
-/// Removes the working directory, spilled runs and all, however the run ended.
-struct DirGuard(PathBuf);
-
-impl Drop for DirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn temp_dir() -> Result<PathBuf> {
-    let base = std::env::temp_dir().join(format!(
-        "compara-sortmerge-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&base)?;
-    Ok(base)
 }
 
 // ---------------------------------------------------------------------------

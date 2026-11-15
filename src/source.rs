@@ -558,32 +558,79 @@ fn read_up_to(f: &mut File, buf: &mut [u8]) -> Result<usize> {
     Ok(n)
 }
 
-/// A new file in the temporary directory, named for this process so a crash
-/// leaves something recognisable behind.
-pub(crate) fn temp_file(tag: &str) -> Result<(PathBuf, File)> {
+/// A name no file in the temporary directory has yet, for this process: its
+/// id, so a crash leaves something recognisable behind, and a number that
+/// cannot be guessed from outside it, so another user of a shared temporary
+/// directory cannot take the names first and stop the run.
+fn temp_path(tag: &str) -> PathBuf {
+    use std::hash::{BuildHasher, Hasher};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir();
+    static SALT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // The standard library seeds each `RandomState` from the system's
+    // randomness.
+    let salt = SALT.get_or_init(|| {
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+    });
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "compara-{}-{:08x}-{n}-{tag}",
+        std::process::id(),
+        salt & 0xffff_ffff
+    ))
+}
+
+fn no_temp(what: &str, e: &std::io::Error) -> Error {
+    Error::new(format!(
+        "cannot create a temporary {what} in {} ({e}); set TMPDIR to a writable directory",
+        std::env::temp_dir().display()
+    ))
+}
+
+/// A new file in the temporary directory, for this user alone.
+///
+/// What goes in one is the data being compared: standard input, a download
+/// made with the caller's credentials, a decompressed copy. The temporary
+/// directory is shared on most machines, so the file is made readable and
+/// writable by its owner only (it was made with the default mode, which
+/// leaves it readable by every user), and only where nothing is: a file or a
+/// link already at the name is not opened.
+pub(crate) fn temp_file(tag: &str) -> Result<(PathBuf, File)> {
     for _ in 0..16 {
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!("compara-{}-{n}-{tag}", std::process::id()));
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        let path = temp_path(tag);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(Error::new(format!(
-                    "cannot create a temporary file in {} ({e}); set TMPDIR to a writable \
-                     directory",
-                    dir.display()
-                )));
-            }
+            Err(e) => return Err(no_temp("file", &e)),
         }
     }
     Err(Error::new("cannot find a free temporary file name"))
+}
+
+/// A new directory in the temporary directory, for this user alone: made
+/// in one step, with no moment at which another user could put something at
+/// its name, and closed to everyone else, so what is written inside it is
+/// too.
+fn temp_dir(tag: &str) -> Result<PathBuf> {
+    for _ in 0..16 {
+        let path = temp_path(tag);
+        let mut builder = std::fs::DirBuilder::new();
+        // This one directory, and only where nothing is.
+        builder.recursive(false);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(no_temp("directory", &e)),
+        }
+    }
+    Err(Error::new("cannot find a free temporary directory name"))
 }
 
 /// Where each cloud's credentials would come from here (scheme, source), by
@@ -614,17 +661,14 @@ pub fn upload(_from: &Path, dest: &str) -> Result<u64> {
     )))
 }
 
-/// A directory for outputs that go somewhere else afterwards, removed with
-/// what is in it when dropped.
+/// A directory of this user's alone for what is written on the way to
+/// somewhere else -- an export bound for object storage, the runs an
+/// external sort spills -- removed with what is in it when dropped.
 pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new(tag: &str) -> Result<TempDir> {
-        let (path, file) = temp_file(tag)?;
-        drop(file);
-        std::fs::remove_file(&path)?;
-        std::fs::create_dir(&path)?;
-        Ok(TempDir(path))
+        temp_dir(tag).map(TempDir)
     }
 
     pub fn path(&self) -> &Path {
@@ -725,6 +769,45 @@ mod tests {
                 "{e}"
             );
         }
+    }
+
+    /// A temporary file holds the data being compared, in a directory most
+    /// machines share between their users: no one else may read it, and the
+    /// same for a directory and what is written inside it. They were made
+    /// with the default mode, readable by every user.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_files_and_directories_are_this_user_s_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let others = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o077;
+        let (path, file) = temp_file("probe").unwrap();
+        assert_eq!(others(&path), 0, "{}", path.display());
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
+
+        let dir = TempDir::new("probe").unwrap();
+        assert_eq!(others(dir.path()), 0, "{}", dir.path().display());
+        // Two of one tag are two directories: neither takes the other's.
+        let second = TempDir::new("probe").unwrap();
+        assert_ne!(dir.path(), second.path());
+        let kept = dir.path().to_path_buf();
+        drop(dir);
+        assert!(!kept.exists(), "the directory goes when it is dropped");
+    }
+
+    /// The name is not one another user could have taken first.
+    #[test]
+    fn a_temporary_name_cannot_be_guessed_from_the_process_id() {
+        let name = temp_path("x")
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let parts: Vec<&str> = name.split('-').collect();
+        assert_eq!(parts[0], "compara");
+        assert_eq!(parts[1], std::process::id().to_string());
+        assert_eq!(parts[2].len(), 8, "{name}");
+        assert!(parts[2].bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
     }
 
     #[test]

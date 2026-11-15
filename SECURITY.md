@@ -24,6 +24,11 @@ or report a wrong count is a bug we want to hear about.
   refused (`COMPARA_ALLOW_LINK_LOCAL=1`), through a proxy too: the name is
   looked up before the request goes to the proxy. Other private and loopback hosts
   stay readable: they are where many tables live.
+- What compara writes to the temporary directory (`TMPDIR`) is for the user
+  who ran it alone: a spooled standard input, a download, a decompressed
+  copy, the runs `sortmerge` spills, an export on its way to object storage.
+  Files are made with mode 0600 and directories 0700, never at a name that
+  already exists, and removed when the run ends.
 - The HTML report shows cell values as text. It loads nothing from the
   network and runs no code from the data.
 - Exported CSVs (`--export-dir`, the report's download) keep values exactly

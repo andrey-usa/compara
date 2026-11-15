@@ -83,6 +83,22 @@ All notable changes to this project are documented here. The format follows
   it failed on a macOS runner). Columns after a known failure are no
   longer read.
 
+### Security
+
+- Temporary files are the user's alone. compara spools standard input,
+  downloads from object storage, decompressed copies and a table read
+  from many files to the temporary directory, which most machines share
+  between their users, and it made them with the default mode: under the
+  usual umask every user of the machine could read them, a table fetched
+  with the caller's cloud credentials included. The directories it made
+  there were open the same way: the runs the `sortmerge` engine spills,
+  which hold every row of both files, and an export or report on its way
+  to object storage. Files are now made readable and writable by their
+  owner only and directories closed to everyone else, each in one step
+  and only where nothing is, under a name that cannot be guessed from the
+  process id. Windows keeps its temporary directory per user and was not
+  affected.
+
 ## [0.6.1] - 2026-11-10
 
 ### Added
