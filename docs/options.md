@@ -28,4 +28,6 @@ key takes part in the join.
 `~/.config/compara/compara.toml`, or `--config PATH`) names recurring
 comparisons: key, compared and ignored columns, normalisation, engine. See
 [`compara.example.toml`](../compara.example.toml). The command line overrides the
-profile.
+profile. A list may run over several lines. A key a profile does not have,
+or a value of the wrong kind (`trim = yes`), is refused with its line, and
+a profile name that is not in the file is answered with the names that are.

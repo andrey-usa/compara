@@ -82,6 +82,18 @@ All notable changes to this project are documented here. The format follows
   metadata" on another (15 of 25 runs at 8 threads; the test that holds
   it failed on a macOS runner). Columns after a known failure are no
   longer read.
+- A profile whose list runs over several lines is read. `key = [` with
+  one name to a line under it, as formatters write a list, was taken a
+  line at a time: an empty key, and the comparison refused for having
+  none.
+- A profile says what it does not understand. A key it does not have
+  (`ignore_cas = true`, `threads = 4`) and a flag that is not `true` or
+  `false` (`trim = yes`) changed nothing and said nothing, so the
+  comparison ran without the option; each is now refused with its line,
+  and a key one or two letters off a real one with the real one. A
+  profile name that is not in the file is answered with the names that
+  are, and `--config` without `--profile`, which used nothing from the
+  file, is refused.
 
 ### Security
 

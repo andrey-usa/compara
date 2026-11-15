@@ -388,11 +388,17 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
 
     let mut opt = Options::default();
     if let Some(name) = args.get("profile", Some("p")) {
-        let found = profiles::load(args.get("config", None))?;
+        let (file, found) = profiles::find(args.get("config", None))?;
         let profile = found
             .get(name)
-            .ok_or_else(|| Error::new(format!("profile not found: {name}")))?;
+            .ok_or_else(|| profiles::not_found(name, file.as_deref(), &found))?;
         profile.apply_to(&mut opt);
+    } else if args.get("config", None).is_some() {
+        // A file of profiles with none named changes nothing: say so, as
+        // for any other flag that would be ignored.
+        return Err(Error::new(
+            "--config names a file of profiles; add --profile NAME to use one of them",
+        ));
     }
 
     // Only options actually given override the profile, hence the `if let`s.
