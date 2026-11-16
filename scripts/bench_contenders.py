@@ -139,9 +139,11 @@ def qsv_prepare(binary, a, b, work):
     outs = []
     for src in (a, b):
         base = os.path.join(work, "qsv_" + os.path.basename(src))
-        subprocess.run([binary, "select", f"!{IGNORE}", "-o", base + ".cut", src], check=True)
-        subprocess.run([binary, "extdedup", "--select", ",".join(KEY), base + ".cut", base], check=True)
-        os.remove(base + ".cut")
+        # qsv reads a file's format from its extension, so the cut keeps `.csv`.
+        cut = os.path.join(work, "qsvcut_" + os.path.basename(src))
+        subprocess.run([binary, "select", f"!{IGNORE}", "-o", cut, src], check=True)
+        subprocess.run([binary, "extdedup", "--select", ",".join(KEY), cut, base], check=True)
+        os.remove(cut)
         outs.append(base)
     rows = [int(subprocess.run([binary, "count", p], check=True, capture_output=True, text=True).stdout)
             for p in outs]
