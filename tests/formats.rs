@@ -835,6 +835,18 @@ fn a_json_column_missing_from_the_first_object_is_still_compared() {
     let a = csv("a.json", "{}\n{\"id\":\"1\",\"v\":\"x\"}\n");
     let b = csv("b.json", "{}\n{\"id\":\"1\",\"v\":\"y\"}\n");
     assert_eq!(run(&a, &b, &mut options(&["id"])).counts.changed, 1);
+    // A key with no value after it ends its object for the row parser, and
+    // names no column: `zz` and `q` below are none.
+    let cut = csv(
+        "cut.json",
+        "{\"id\":\"1\",\"v\":\"x\"}\n{\"id\":\"2\",\"zz\"}\n{\"id\":\"3\",\"q\n",
+    );
+    let names: Vec<String> = run(&cut, &cut, &mut options(&["id"]))
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    assert_eq!(names, ["v"]);
     let empty = csv("empty.json", "{}\n{}\n");
     let refused = compare(&empty, &empty, &mut options(&["id"])).expect_err("no columns");
     assert!(

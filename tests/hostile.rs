@@ -349,3 +349,71 @@ fn keys_built_to_collide_do_not_make_a_compare_quadratic() {
     // old way these rows took about 10 s in a release build.
     assert!(took < Duration::from_secs(5), "took {took:?}");
 }
+
+/// A JSON file whose every object names a column of its own is refused for
+/// what it is, and quickly. Its columns are all its objects' keys, so
+/// 60,000 such objects are 60,001 columns and 3.6 billion cells in two
+/// megabytes of file: the compare took seven seconds, and two minutes at
+/// 400,000. Naming the columns to compare is the way through, and is said.
+#[test]
+fn a_json_file_with_a_key_of_its_own_in_every_object_is_refused() {
+    let table = |value: &str| {
+        let mut text = String::new();
+        for i in 0..60_000 {
+            text.push_str(&format!("{{\"id\":\"{i}\",\"k{i}\":\"{value}\"}}\n"));
+        }
+        text
+    };
+    let a = Scratch::new("scattered-a.ndjson", table("x").as_bytes());
+    let b = Scratch::new("scattered-b.ndjson", table("y").as_bytes());
+    let said = refused(
+        &[Path::new("compare"), &a.0, &b.0],
+        &["-k", "id"],
+        Duration::from_secs(20),
+    );
+    assert!(said.contains("is not one table"), "{said}");
+    assert!(said.contains("--compare"), "{said}");
+
+    // With the columns named there is a table to compare, and it is.
+    let out = Command::new(BIN)
+        .args(["compare", "-k", "id", "-c", "k5,k7"])
+        .args([&a.0, &b.0])
+        .output()
+        .expect("run compara");
+    assert_eq!(out.status.code(), Some(1));
+    let counts = String::from_utf8_lossy(&out.stdout);
+    assert!(counts.contains("(changed 2)"), "{counts}");
+}
+
+/// A table of twenty thousand columns is compared in the time its bytes
+/// take: each column's name used to be searched for in the list of all of
+/// them, at five places, so the time grew with the square of the width (17
+/// seconds at sixty thousand columns and one row).
+#[test]
+fn a_very_wide_table_is_not_quadratic_in_its_columns() {
+    let width = 20_000;
+    let header: Vec<String> = (0..width).map(|i| format!("c{i}")).collect();
+    let row = |v: &str| vec![v; width].join(",");
+    let a = Scratch::new(
+        "wide-a.csv",
+        format!("id,{}\n1,{}\n", header.join(","), row("x")).as_bytes(),
+    );
+    let b = Scratch::new(
+        "wide-b.csv",
+        format!("id,{}\n1,{}\n", header.join(","), row("y")).as_bytes(),
+    );
+    let started = Instant::now();
+    let out = Command::new(BIN)
+        .args(["compare", "-k", "id"])
+        .args([&a.0, &b.0])
+        .output()
+        .expect("run compara");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("(changed 1)"));
+    // Two seconds at the old cost on a fast machine; a tenth of one now.
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+}

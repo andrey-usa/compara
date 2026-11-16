@@ -113,9 +113,13 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
         )));
     }
 
+    // Looked up by name, not searched for: a table of sixty thousand columns
+    // searched a list of sixty thousand for each of them, at every step here.
+    let a_has: std::collections::HashSet<&str> = a_cols.iter().map(String::as_str).collect();
+    let b_has: std::collections::HashSet<&str> = b_cols.iter().map(String::as_str).collect();
     let common: Vec<String> = a_cols
         .iter()
-        .filter(|c| b_cols.contains(c))
+        .filter(|c| b_has.contains(c.as_str()))
         .cloned()
         .collect();
 
@@ -124,7 +128,7 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
         Some(wanted) => {
             let bad: Vec<&str> = wanted
                 .iter()
-                .filter(|c| !common.contains(c))
+                .filter(|c| !(a_has.contains(c.as_str()) && b_has.contains(c.as_str())))
                 .map(String::as_str)
                 .collect();
             if !bad.is_empty() {
@@ -147,12 +151,12 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
         compared,
         only_in_a: a_cols
             .iter()
-            .filter(|c| !b_cols.contains(c))
+            .filter(|c| !b_has.contains(c.as_str()))
             .cloned()
             .collect(),
         only_in_b: b_cols
             .iter()
-            .filter(|c| !a_cols.contains(c))
+            .filter(|c| !a_has.contains(c.as_str()))
             .cloned()
             .collect(),
     })

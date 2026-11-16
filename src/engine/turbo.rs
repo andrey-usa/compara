@@ -3672,6 +3672,9 @@ enum Input {
         delimiter: u8,
         from: usize,
         header: Vec<String>,
+        /// The objects of a JSON file, counted when its keys were read; 0 for
+        /// CSV, whose rows nothing has counted yet.
+        objects: usize,
     },
     Parquet {
         reader: parquet::Reader,
@@ -3691,7 +3694,7 @@ fn json_keys_after_the_first(
     first: &[String],
     rows: usize,
     opt: &Options,
-) -> Vec<String> {
+) -> Result<(Vec<String>, usize)> {
     let data = slab.data();
     let array = json_is_array(data);
     if rows != usize::MAX {
@@ -3699,23 +3702,57 @@ fn json_keys_after_the_first(
     }
     let bounds = chunk_bounds(data, 0, opt.thread_budget(), Dialect::Json, true);
     let found = in_parallel(bounds.len() - 1, |i| {
-        Ok(json_later_keys(
-            slab,
-            bounds[i],
-            bounds[i + 1],
-            array,
-            first,
-            usize::MAX,
-        ))
+        json_later_keys(slab, bounds[i], bounds[i + 1], array, first, usize::MAX)
     });
     let mut seen: HashSet<String> = HashSet::new();
     let mut later: Vec<String> = Vec::new();
-    for name in found.into_iter().flatten().flatten() {
-        if seen.insert(name.clone()) {
-            later.push(name);
+    let mut objects = 0usize;
+    // A piece that failed fails the read: its columns would otherwise be
+    // missing from the comparison without a word.
+    for piece in found {
+        let (names, rows) = piece?;
+        objects += rows;
+        for name in names {
+            if seen.insert(name.clone()) {
+                later.push(name);
+            }
         }
     }
-    later
+    Ok((later, objects))
+}
+
+/// Refuses a JSON file whose objects share so few keys that it is not one
+/// table: `width` columns to read for each of its objects, most of them absent.
+///
+/// A table costs its cells, and a file's cells are in its bytes -- except
+/// here, where every object can name a column of its own for a few bytes: a
+/// 14 MB file of 400,000 such objects is 160 billion cells, and took two
+/// minutes. Wide tables pass (a thousand columns always do), and so does a
+/// sparse one until it is hundreds of times its file's size in cells.
+fn refuse_scattered_json(input: &Input, width: usize, path: &Path) -> Result<()> {
+    let Input::Text {
+        slab,
+        header,
+        objects,
+        ..
+    } = input
+    else {
+        return Ok(());
+    };
+    if slab.dialect() != Dialect::Json || width <= 1024 {
+        return Ok(());
+    }
+    let cells = (*objects as u128) * (width as u128);
+    if cells <= 256 * slab.data().len() as u128 {
+        return Ok(());
+    }
+    Err(Error::input(format!(
+        "{} is not one table: its {} objects hold {} different keys between them, and few in any \
+         one object. Name the columns to compare with --compare (compara columns lists them)",
+        path.display(),
+        objects,
+        header.len()
+    )))
 }
 
 impl Input {
@@ -3749,7 +3786,9 @@ impl Input {
         slab.set_dialect(dialect);
         if dialect == Dialect::Json {
             let mut header = json_header(&slab, path)?;
-            header.extend(json_keys_after_the_first(&slab, &header, rows, opt));
+            let (later, objects) = json_keys_after_the_first(&slab, &header, rows, opt)
+                .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+            header.extend(later);
             if header.is_empty() {
                 return Err(Error::new(format!(
                     "no JSON object in the file has a key: {}",
@@ -3761,6 +3800,7 @@ impl Input {
                 delimiter: b',',
                 from: 0,
                 header,
+                objects,
             });
         }
         let delimiter = match opt.delimiter_byte()? {
@@ -3776,6 +3816,7 @@ impl Input {
             delimiter,
             from,
             header,
+            objects: 0,
         })
     }
 
@@ -3803,8 +3844,16 @@ impl Input {
                 delimiter,
                 from,
                 header,
+                ..
             } => {
-                let has = |n: &String| header.iter().any(|c| c == n);
+                // The first column of each name, found by lookup: a search of
+                // the header for every wanted column is the square of a wide
+                // table's width.
+                let mut place: HashMap<&str, usize> = HashMap::with_capacity(header.len());
+                for (at, name) in header.iter().enumerate() {
+                    place.entry(name.as_str()).or_insert(at);
+                }
+                let has = |n: &String| place.contains_key(n.as_str());
                 let json = slab.dialect() == Dialect::Json;
                 let array = json && json_is_array(slab.data());
                 let build = |names: &[&String]| -> RowParser {
@@ -3819,7 +3868,7 @@ impl Input {
                             delimiter,
                             names
                                 .iter()
-                                .map(|n| header.iter().position(|c| &c == n))
+                                .map(|n| place.get(n.as_str()).copied())
                                 .collect(),
                         )
                     }
@@ -3864,6 +3913,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let a_input = Input::open(a_path, opt)?;
     let b_input = Input::open(b_path, opt)?;
     let resolved = resolve(a_input.header(), b_input.header(), opt)?;
+    let width = opt.key.len() + resolved.compared.len();
+    refuse_scattered_json(&a_input, width, a_path)?;
+    refuse_scattered_json(&b_input, width, b_path)?;
 
     let key_size = opt.key.len();
     let a_cols = a_input.header().len();

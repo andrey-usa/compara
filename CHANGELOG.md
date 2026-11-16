@@ -20,6 +20,13 @@ All notable changes to this project are documented here. The format follows
   before the compare, which a JSON compare pays for in time; CSV and
   Parquet are untouched. A file in which no object has a key is refused
   as that.
+  A file whose objects share almost no keys (every object naming a
+  column of its own) is not one table and is refused as that, in under a
+  second, unless `--compare` names the columns: its cells are the square
+  of its rows.
+- A table with tens of thousands of columns is read in the time its bytes
+  take. Each column's name was searched for in the list of all of them,
+  so the time grew with the square of the width.
 - `--delimiter '\t'` and `--delimiter tab` are a tab, on the command line
   and as a profile's `delimiter`. Only the first character of the value was
   taken, so `'\t'` split every row on a backslash and `tab` on the letter

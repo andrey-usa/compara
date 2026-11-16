@@ -222,6 +222,10 @@ pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// The most the names of the columns found past the first object may come to.
+/// A table's column names are a few kilobytes; this is a file that is not one.
+const LATER_KEYS_BYTES: usize = 64 << 20;
+
 /// `data.starts_with(text)` for a `text` of a few bytes, as two loads of eight
 /// that overlap rather than a call: it is asked once a member of every row.
 #[inline(always)]
@@ -259,10 +263,11 @@ pub(super) fn json_later_keys(
     array: bool,
     known: &[String],
     max_rows: usize,
-) -> Vec<String> {
+) -> Result<(Vec<String>, usize)> {
     let data = slab.data();
     let scan = Swar;
     let end = hi.min(data.len());
+    let mut later_bytes = 0usize;
     // Each of the first object's members as a compact writer spells it,
     // `"name":`, so the common row is asked one comparison a member. A name
     // that needs an escape has no such spelling and takes the walk below.
@@ -338,16 +343,6 @@ pub(super) fn json_later_keys(
                 break;
             }
             let key = &data[key_from..key_end - 1];
-            if known.get(member).map(String::as_bytes) != Some(key) {
-                let name = text_of(
-                    slab,
-                    pack(key_from as u64, (key_end - 1 - key_from) as u64, escaped),
-                );
-                if !seen.contains(name.as_str()) && later_seen.insert(name.clone()) {
-                    later.push(name);
-                }
-            }
-            member += 1;
             pos = key_end;
             while pos < end && json_space(data[pos]) {
                 pos += 1;
@@ -362,12 +357,36 @@ pub(super) fn json_later_keys(
             if pos >= end {
                 break;
             }
+            // Only now is it a member, as it is to the row parser: a key
+            // with no colon or no value after it ends the object there, and
+            // names no column.
+            if known.get(member).map(String::as_bytes) != Some(key) {
+                let name = text_of(
+                    slab,
+                    pack(key_from as u64, (key_end - 1 - key_from) as u64, escaped),
+                );
+                if !seen.contains(name.as_str()) && !later_seen.contains(&name) {
+                    // The names are the one thing here that grows with a
+                    // hostile file, so they have a ceiling of their own.
+                    later_bytes += name.len();
+                    if later_bytes > LATER_KEYS_BYTES {
+                        return Err(Error::new(format!(
+                            "the objects of this JSON file hold more than {} MB of different keys \
+                             between them: they are not the rows of one table",
+                            LATER_KEYS_BYTES >> 20
+                        )));
+                    }
+                    later_seen.insert(name.clone());
+                    later.push(name);
+                }
+            }
+            member += 1;
             pos = json_value_end(scan, data, pos, end);
         }
         let next = end_of_json_row(scan, data, pos.min(end), end, array, false);
         pos = if next > pos { next } else { pos + 1 };
     }
-    later
+    Ok((later, rows))
 }
 
 /// Skips one JSON string starting at its opening quote, returning the offset one
