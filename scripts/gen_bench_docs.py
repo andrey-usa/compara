@@ -85,7 +85,7 @@ def main():
     v, env, inputs = doc["versions"], doc["env"], doc["inputs"]
     # A tool that reads one format only (qsv: CSV) has a column and "-" where it did not run.
     names = [n for n in NAMES if any(n in inp["tools"] for inp in inputs)]
-    qv = re.search(r"\d+\.\d+\.\d+\S*", v.get("qsv", ""))
+    qv = re.search(r"\d+\.\d+\.\d+", v.get("qsv", ""))  # its --version line goes on with its build
     ver = {"compara": v["compara"].split()[-1], "duckdb": v.get("duckdb", ""), "polars": v.get("polars", ""),
            "qsv": qv.group(0) if qv else v.get("qsv", "")}
     head = [f"{NAMES[n]} {ver[n]}".strip() for n in names]
@@ -117,7 +117,7 @@ def main():
                  if losses else "No other tool did better than compara by more than 2% on any measure in this run.")
     note = ("Each cell: wall time, best of {runs} · CPU time (user and system) · peak memory, of the best "
             "run; fastest in bold. DuckDB and Polars run from Python, and their time starts at their first "
-            "read, after the interpreter's start and the import; qsv is a binary and is timed as a whole process, like compara, and runs on CSV only. A tool the runner's kernel stopped for "
+            "read, after the interpreter's start and the import; qsv is a binary and is timed as a whole process, like compara, runs on CSV only, and is given the files with the ignored column and the repeated keys already taken out (the page says how). A tool the runner's kernel stopped for "
             "lack of memory says so.").format(runs=doc["runs"])
 
     readme = ["## Benchmarks", "",
@@ -150,7 +150,7 @@ def main():
             "## Versions", "",
             f"compara built from the run's commit ({v['compara']}); DuckDB {v.get('duckdb')} and Polars "
             f"{v.get('polars')} installed from PyPI at their latest in the run, on Python {v.get('python')}."
-            + (f" qsv {ver['qsv']} is its release binary (`{v['qsv']}`)." if v.get("qsv") else ""), "",
+            + (f" qsv {ver['qsv']} is its release binary, as downloaded in the run." if v.get("qsv") else ""), "",
             "## Method", "",
             "Each pair is written by `compara-gen-data` (seed 7) in each format, and every tool reads the "
             "same files. Each tool runs in a process of its own; CPU time and peak memory are that "
