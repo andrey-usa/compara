@@ -39,8 +39,10 @@ compara compare a.csv b.csv -k account_id,txn_id -i updated_at --json -
 | `--delimiter ';'` | the separator is not found from the header (`'\t'` for a tab) |
 | `--encoding latin1` | the file is not UTF-8 |
 
-Values compare as text in CSV and JSON; a Parquet column that holds numbers
-or dates compares by value. A key that appears twice in a file is counted
+A column only one file has is not compared and does not change the exit
+code: a note on standard error names it, and the JSON lists such columns as
+`meta.only_in_a` and `meta.only_in_b`. Values compare as text in CSV and
+JSON; a Parquet column that holds numbers or dates compares by value. A key that appears twice in a file is counted
 under the duplicate keys, and its first row takes part in the join.
 
 ## Safe by default

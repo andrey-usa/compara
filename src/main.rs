@@ -623,6 +623,31 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
             println!("{text}");
         }
     }
+    // A column only one file has is not compared, and nothing above says
+    // so: a target that lost a column compared as identical to its source,
+    // exit 0. Said last, where it is read. Not for a column the options
+    // leave out themselves: `-i` names it, or `-c` names the others.
+    if opt.compare.is_none() {
+        let meta = &result.meta.engine_meta;
+        for (side, names) in [("A", &meta.only_in_a), ("B", &meta.only_in_b)] {
+            let left: Vec<&str> = names
+                .iter()
+                .filter(|n| !opt.ignore.contains(n))
+                .map(String::as_str)
+                .collect();
+            if left.is_empty() {
+                continue;
+            }
+            let mut list = left.iter().take(12).copied().collect::<Vec<_>>().join(", ");
+            if left.len() > 12 {
+                list.push_str(&format!(", … ({} in all)", left.len()));
+            }
+            eprintln!(
+                "note: {} only in {side}, not compared: {list}",
+                if left.len() == 1 { "column" } else { "columns" }
+            );
+        }
+    }
 
     if args.flag("fail-on-dups") && (c.a_dup_keys > 0 || c.b_dup_keys > 0) {
         // Exit 3 says nothing on its own: name the option that chose it.

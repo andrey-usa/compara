@@ -25,6 +25,12 @@ An option that names columns (`-k`, `-c`, `-i`) may be given more than once,
 and the names add up: `-k order_id -k line_no` is `-k order_id,line_no`. Any
 other option given twice with two values is refused.
 
+A column that only one of the two files has is not compared, and the exit
+code does not answer for it: a note after the counts names it (`note: column
+only in B, not compared: carrier`), unless `-i` names the column or `-c`
+names the ones to compare, and the JSON summary lists such columns as
+`meta.only_in_a` and `meta.only_in_b`.
+
 Duplicate keys are counted and listed per file; the first occurrence of each
 key takes part in the join.
 

@@ -340,6 +340,53 @@ fn lines_ended_by_a_carriage_return_alone_are_rows() {
     );
 }
 
+/// `native` and `sortmerge` hold cells as text and read UTF-8 only: a file
+/// in another encoding is refused as that, with the engine that compares it
+/// by its bytes. They answered with the `csv` crate's parse error ("record
+/// 0 (line 1, field: 1, byte: 0): invalid utf-8"), after the note that
+/// `--encoding latin1` prints to say the counts will be right.
+#[test]
+fn a_file_that_is_not_utf8_is_refused_as_that_by_the_text_engines() {
+    let dir = std::env::temp_dir().join(format!("compara-test-{}", unique()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let (a, b) = (dir.join("a.csv"), dir.join("b.csv"));
+    fs::write(&a, b"id,v\n1,caf\xe9\n2,b\n").expect("write a");
+    fs::write(&b, b"id,v\n1,caf\xe8\n2,b\n").expect("write b");
+    for engine in [Engine::Native, Engine::SortMerge] {
+        let mut opt = options(&["id"], engine);
+        opt.encoding = "latin1".into();
+        let err = compare(&a, &b, &mut opt).expect_err("not UTF-8");
+        let text = err.to_string();
+        assert!(err.is_input(), "{text}");
+        assert!(
+            text.contains("is not UTF-8")
+                && text.contains(&format!("the {engine} engine reads UTF-8 only"))
+                && text.contains("--engine turbo"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("engine failed") && !text.contains("parse error"),
+            "{text}"
+        );
+    }
+    // The header too.
+    fs::write(&a, b"id,caf\xe9\n1,x\n").expect("write a");
+    let mut opt = options(&["id"], Engine::Native);
+    let text = compare(&a, &a, &mut opt)
+        .expect_err("not UTF-8")
+        .to_string();
+    assert!(text.contains("is not UTF-8"), "{text}");
+    // And turbo compares the bytes, as the option says.
+    fs::write(&a, b"id,v\n1,caf\xe9\n2,b\n").expect("write a");
+    let mut opt = options(&["id"], Engine::Turbo);
+    opt.encoding = "latin1".into();
+    assert_eq!(
+        compare(&a, &b, &mut opt).expect("compare").counts.changed,
+        1
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn bad_options_are_rejected() {
     type Mutate = fn(&mut Options);

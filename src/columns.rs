@@ -56,11 +56,19 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
             )));
         }
     }
+    // A name with a space at either end is shown in quotes: `id ` in a
+    // list reads as `id`, the name that was asked for and not found.
     let shown = |cols: &[String]| {
         let mut list = cols
             .iter()
             .take(12)
-            .map(String::as_str)
+            .map(|c| {
+                if c.trim() == c {
+                    c.clone()
+                } else {
+                    format!("{c:?}")
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
         if cols.len() > 12 {
@@ -77,13 +85,14 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
             .collect();
         if !missing.is_empty() {
             return Err(Error::input(format!(
-                "key column {} not in {side} (its columns: {})",
+                "key column {} not in {side} (its columns: {}){}",
                 missing
                     .iter()
                     .map(|k| format!("{k:?}"))
                     .collect::<Vec<_>>()
                     .join(", "),
-                shown(cols)
+                shown(cols),
+                near(&missing, cols)
             )));
         }
     }
@@ -105,11 +114,13 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
         .map(String::as_str)
         .collect();
     if !unknown.is_empty() {
+        let either: Vec<String> = a_cols.iter().chain(b_cols).cloned().collect();
         return Err(Error::input(format!(
-            "ignore column(s) present in neither file: {} (A has: {}; B has: {})",
+            "ignore column(s) present in neither file: {} (A has: {}; B has: {}){}",
             unknown.join(", "),
             shown(a_cols),
-            shown(b_cols)
+            shown(b_cols),
+            near(&unknown, &either)
         )));
     }
 
@@ -133,9 +144,10 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
                 .collect();
             if !bad.is_empty() {
                 return Err(Error::input(format!(
-                    "compare column(s) not present in both files: {} (in both: {})",
+                    "compare column(s) not present in both files: {} (in both: {}){}",
                     bad.join(", "),
-                    shown(&common)
+                    shown(&common),
+                    near(&bad, &common)
                 )));
             }
             wanted.clone()
@@ -160,6 +172,31 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
             .cloned()
             .collect(),
     })
+}
+
+/// For a name that was asked for and is not among `cols`: the column that is
+/// the same but for its case or the spaces around it, which is nearly always
+/// the one that was meant. Names are matched exactly, and a header of `ID`
+/// or `id ` answered a key of `id` with a list in which the name seemed to
+/// be there.
+fn near(missing: &[&str], cols: &[String]) -> String {
+    let fold = |s: &str| s.trim().to_lowercase();
+    let found: Vec<String> = missing
+        .iter()
+        .filter_map(|name| {
+            cols.iter()
+                .find(|c| c.as_str() != *name && fold(c) == fold(name))
+                .map(|c| format!("{c:?} for {name:?}"))
+        })
+        .collect();
+    if found.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; a name is matched exactly, case and spaces included: there is {}",
+            found.join(", ")
+        )
+    }
 }
 
 /// Treats an empty field as absent, quoted or not.
@@ -515,6 +552,45 @@ mod tests {
         assert!(err.to_string().ends_with(", … (20 in all))"), "{err}");
         let err = err.context_unless_input("the turbo engine failed: ");
         assert!(!err.to_string().contains("engine failed"), "{err}");
+    }
+
+    /// A name that differs from a column only by its case or by spaces
+    /// around it gets the column named: in a plain list `id ` reads as `id`.
+    #[test]
+    fn a_name_that_nearly_matches_is_pointed_out() {
+        let padded = names(&["id ", " v"]);
+        let err = resolve(&padded, &names(&["id", "v"]), &opt(&["id"], &[])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "key column \"id\" not in A (its columns: \"id \", \" v\"); a name is matched \
+             exactly, case and spaces included: there is \"id \" for \"id\""
+        );
+        let cased = names(&["ID", "Amount"]);
+        let err = resolve(&cased, &cased, &opt(&["id"], &[])).unwrap_err();
+        assert!(
+            err.to_string().ends_with("there is \"ID\" for \"id\""),
+            "{err}"
+        );
+        let mut o = opt(&["ID"], &[]);
+        o.compare = Some(names(&["amount"]));
+        let err = resolve(&cased, &cased, &o).unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("there is \"Amount\" for \"amount\""),
+            "{err}"
+        );
+        let err = resolve(&cased, &cased, &opt(&["ID"], &["AMOUNT"])).unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("there is \"Amount\" for \"AMOUNT\""),
+            "{err}"
+        );
+        // Nothing like it: nothing more to say.
+        let err = resolve(&cased, &cased, &opt(&["key"], &[])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "key column \"key\" not in A (its columns: ID, Amount)"
+        );
     }
 
     /// The fault this check exists for. `--key` makes the answer impossible and

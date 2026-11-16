@@ -45,17 +45,20 @@ and the same binaries through package managers:
 ```console
 $ compara compare examples/orders_2026-08.csv examples/orders_2026-09.csv -k order_id,line_no -i updated_at
 A 800 rows | B 799 rows | matched 787 (changed 102) | added 10 | removed 12 | duplicate keys A 1, B 1 | engine turbo, 0.011s
+note: column only in B, not compared: carrier
 $ echo $?
 1
 $ compara compare examples/orders_2026-08.csv examples/orders_2026-09.csv -k order_id,line_no -i updated_at -o report.html
 A 800 rows | B 799 rows | matched 787 (changed 102) | added 10 | removed 12 | duplicate keys A 1, B 1 | engine turbo, 0.001s
 Report: report.html (20 KB)
+note: column only in B, not compared: carrier
 ```
 
 Two monthly order exports from the repository's `examples/`, keyed on
 `(order_id, line_no)`, with `updated_at` left out. Exit code 1 says they
 differ; the report holds the counts, per-column statistics and the changed,
-added, removed and duplicate rows. More: [Everyday comparisons](https://andrey-usa.github.io/compara/start/tutorial.html),
+added, removed and duplicate rows. The note names a column only one of the
+files has: it is not compared, and it does not change the exit code. More: [Everyday comparisons](https://andrey-usa.github.io/compara/start/tutorial.html),
 and every option of `compare`: [compare options](https://andrey-usa.github.io/compara/reference/options.html).
 
 ## For AI agents

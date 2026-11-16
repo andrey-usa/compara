@@ -165,12 +165,14 @@ fn reader(path: &Path, opt: &Options) -> Result<csv::Reader<File>> {
     let delimiter = match opt.delimiter_byte()? {
         Some(d) => d,
         None => {
-            let mut line = String::new();
+            // As bytes: a header that is not UTF-8 is for the reader below
+            // to refuse by name, not for this line to fail on.
+            let mut line = Vec::new();
             BufReader::new(&mut file)
-                .read_line(&mut line)
+                .read_until(b'\n', &mut line)
                 .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
             file.seek(SeekFrom::Start(0))?;
-            crate::columns::detect_delimiter(&line)
+            crate::columns::detect_delimiter(&String::from_utf8_lossy(&line))
         }
     };
     Ok(csv::ReaderBuilder::new()
@@ -187,9 +189,10 @@ fn read_header(path: &Path, opt: &Options) -> Result<Vec<String>> {
         .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
     crate::engine::turbo::refuse_non_text(&head, path)?;
     let mut rdr = reader(path, opt)?;
-    let headers = rdr
-        .headers()
-        .map_err(|_| Error::new(format!("file has no header row: {}", path.display())))?;
+    let headers = rdr.headers().map_err(|e| match e.kind() {
+        csv::ErrorKind::Utf8 { .. } => crate::engine::native::read_error(path, e, "sortmerge"),
+        _ => Error::new(format!("file has no header row: {}", path.display())),
+    })?;
     if headers.is_empty() {
         return Err(Error::new(format!(
             "file has no header row: {}",
@@ -249,7 +252,7 @@ fn stream_into(
             let mut record = csv::StringRecord::new();
             while rdr
                 .read_record(&mut record)
-                .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?
+                .map_err(|e| crate::engine::native::read_error(path, e, "sortmerge"))?
             {
                 rows += 1;
                 batch

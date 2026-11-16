@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A column only one of the two files has is named in a note after the
+  counts: `note: column only in B, not compared: carrier`. Such a column
+  is not compared, and nothing on the terminal said so: a target that had
+  lost a column compared as identical to its source, exit 0. The note is
+  on standard error and changes no exit code; `-i` naming the column, or
+  `-c` naming the columns to compare, says it is known. The JSON summary
+  lists such columns as before (`meta.only_in_a`, `meta.only_in_b`).
+
 ### Fixed
 
 - A quote inside an unquoted field no longer joins rows. CSV gives a quote
@@ -103,6 +113,16 @@ All notable changes to this project are documented here. The format follows
   passed over without a word.
 - The time on the counts line is written to the millisecond; a run
   under one printed `0s`.
+- A name that matches a column but for its case, or for spaces around
+  it, is answered with that column: `key column "id" not in A (its
+  columns: "id ", " v"); a name is matched exactly, case and spaces
+  included: there is "id " for "id"`. A header of `ID` or `id ` gave a
+  list in which the name seemed to be there. The same for `--compare`
+  and `--ignore`; a name with a space at either end is shown in quotes.
+- `--engine native` and `--engine sortmerge` say that a file is not
+  UTF-8 and which engine compares it by its bytes. They answered with a
+  parse error from the CSV reader, after the note that `--encoding
+  latin1` prints to say the counts will be right.
 
 ### Security
 

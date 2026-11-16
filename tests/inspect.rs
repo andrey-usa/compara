@@ -462,7 +462,7 @@ fn a_tab_delimiter_can_be_named() {
     let (code, _, stderr) = cli(&["compare", a, b, "-k", "account_id", "--delimiter", ";;"]);
     assert_eq!(code, 2);
     assert!(
-        stderr.contains("--delimiter must be one character, or `tab`"),
+        stderr.contains("--delimiter must be one character"),
         "{stderr}"
     );
     let (code, _, stderr) = cli(&["compare", a, b, "-k", "account_id", "--delimiter", "\""]);
@@ -493,6 +493,45 @@ fn the_time_is_written_to_the_millisecond() {
         matches!(digits, Some((whole, ms)) if !whole.is_empty() && ms.len() == 3),
         "{stdout}"
     );
+}
+
+/// A column only one file has is not compared, and the counts cannot show
+/// it: a note says so, after them. A target that had lost a column compared
+/// as identical to its source, exit 0, with nothing on the terminal.
+#[test]
+fn a_column_only_one_file_has_is_named_in_a_note() {
+    let f = Fixture::new(1);
+    let (a, b) = (f.path("wide.csv"), f.path("narrow.csv"));
+    std::fs::write(&a, "id,v,w,x\n1,a,p,q\n2,b,r,s\n").unwrap();
+    std::fs::write(&b, "id,v,y\n1,a,z\n2,b,z\n").unwrap();
+    let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+
+    let (code, stdout, stderr) = cli(&["compare", a, b, "-k", "id"]);
+    assert_eq!(code, 0, "the columns both have are the same: {stderr}");
+    assert!(stdout.contains("matched 2 (changed 0)"), "{stdout}");
+    assert_eq!(
+        stderr,
+        "note: columns only in A, not compared: w, x\nnote: column only in B, not compared: y\n"
+    );
+    // The summary on standard output stays one document; the note follows
+    // the counts on standard error.
+    let (_, stdout, stderr) = cli(&["compare", a, b, "-k", "id", "--json", "-"]);
+    assert!(stdout.trim_start().starts_with('{'), "{stdout}");
+    assert!(
+        stderr.ends_with("note: column only in B, not compared: y\n"),
+        "{stderr}"
+    );
+
+    // A column the options leave out is known to whoever wrote them.
+    let (_, _, stderr) = cli(&["compare", a, b, "-k", "id", "-i", "w,x,y"]);
+    assert_eq!(stderr, "");
+    let (_, _, stderr) = cli(&["compare", a, b, "-k", "id", "-i", "y"]);
+    assert_eq!(stderr, "note: columns only in A, not compared: w, x\n");
+    let (_, _, stderr) = cli(&["compare", a, b, "-k", "id", "-c", "v"]);
+    assert_eq!(stderr, "");
+    // Two files of the same columns: nothing to say.
+    let (_, _, stderr) = cli(&["compare", a, a, "-k", "id"]);
+    assert_eq!(stderr, "");
 }
 
 /// `--fail-on-dups` names itself when it sets the exit code.

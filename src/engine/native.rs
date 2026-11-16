@@ -53,6 +53,22 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     out
 }
 
+/// A row the `csv` crate could not read, said for what it is. This engine
+/// and `sortmerge` hold cells as text and read UTF-8 only; `turbo` compares
+/// bytes, which is what `--encoding latin1` promises. The crate's own
+/// words for it ("CSV parse error: record 0 (line 1, field: 1, byte: 0):
+/// invalid utf-8") came after a note that the counts would be right.
+pub(crate) fn read_error(path: &Path, e: csv::Error, engine: &str) -> Error {
+    if !matches!(e.kind(), csv::ErrorKind::Utf8 { .. }) {
+        return Error::new(format!("cannot read {}: {e}", path.display()));
+    }
+    Error::input(format!(
+        "{} is not UTF-8, and the {engine} engine reads UTF-8 only; --engine turbo (or auto) \
+         compares a Latin-1 or Windows code-page file by its bytes",
+        path.display()
+    ))
+}
+
 /// Opens a CSV reader with the delimiter forced or sniffed from the header.
 fn reader(path: &Path, opt: &Options) -> Result<csv::Reader<File>> {
     let mut file =
@@ -61,12 +77,14 @@ fn reader(path: &Path, opt: &Options) -> Result<csv::Reader<File>> {
     let delimiter = match opt.delimiter_byte()? {
         Some(d) => d,
         None => {
-            let mut line = String::new();
+            // As bytes: a header that is not UTF-8 is for the reader below
+            // to refuse by name, not for this line to fail on.
+            let mut line = Vec::new();
             BufReader::new(&mut file)
-                .read_line(&mut line)
+                .read_until(b'\n', &mut line)
                 .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
             file.seek(SeekFrom::Start(0))?;
-            detect_delimiter(&line)
+            detect_delimiter(&String::from_utf8_lossy(&line))
         }
     };
 
@@ -86,9 +104,10 @@ fn read_header(path: &Path, opt: &Options) -> Result<Vec<String>> {
         .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
     crate::engine::turbo::refuse_non_text(&head, path)?;
     let mut rdr = reader(path, opt)?;
-    let headers = rdr
-        .headers()
-        .map_err(|_| Error::new(format!("file has no header row: {}", path.display())))?;
+    let headers = rdr.headers().map_err(|e| match e.kind() {
+        csv::ErrorKind::Utf8 { .. } => read_error(path, e, "native"),
+        _ => Error::new(format!("file has no header row: {}", path.display())),
+    })?;
     if headers.is_empty() {
         return Err(Error::new(format!(
             "file has no header row: {}",
@@ -121,7 +140,7 @@ fn read_store(
     let mut read = 0usize;
     while rdr
         .read_record(&mut record)
-        .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?
+        .map_err(|e| read_error(path, e, "native"))?
     {
         store.add(index.iter().map(|at| at.and_then(|i| record.get(i))), opt)?;
         read += 1;
@@ -155,7 +174,7 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
     while rows.len() < want
         && rdr
             .read_record(&mut record)
-            .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?
+            .map_err(|e| read_error(path, e, "native"))?
     {
         rows.push(
             (0..header.len())
