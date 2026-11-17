@@ -5,7 +5,8 @@
 | `-k`, `--key` | composite key, required (or from a profile) |
 | `-c`, `--compare` | columns to diff; default every column present in both files except the key |
 | `-i`, `--ignore` | columns to skip (timestamps, run ids) |
-| `--trim`, `--ignore-case`, `--empty-is-null` | normalisation before comparing (applies to key and values); a value of only spaces is still a value under `--trim`, and equal to an empty cell only with `--empty-is-null` too |
+| `--trim`, `--ignore-case` | normalisation before comparing (applies to key and values); a value `--trim` leaves empty is absent, as an empty cell is, so `"  "` against an empty or missing value is no change |
+| `--empty-is-null` | kept for old scripts and profiles: an empty value and a missing one are always equal, in every format |
 | `--tolerance` | absolute numeric tolerance where both sides parse as numbers |
 | `--delimiter` | override delimiter detection (CSV only): one character, or `'\t'` (or `tab`) for a tab; one that isn't in a file's header is noted |
 | `--encoding` | UTF-8 (the default) is read as text; Latin-1 or a Windows code page compares as bytes, with the right counts; UTF-16 and UTF-32 are refused with how to convert |

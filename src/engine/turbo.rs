@@ -25,7 +25,7 @@
 //!   over contiguous ranges of A's keys. Ordering is preserved where it is
 //!   load-bearing, so the answer does not depend on the thread count.
 //! - **Normalisation is delegated rather than reimplemented.** With `--trim`,
-//!   `--ignore-case`, `--empty-is-null` or a tolerance in play a field is decoded
+//!   `--ignore-case` or a tolerance in play a field is decoded
 //!   and handed to the same [`crate::columns`] functions every other engine uses,
 //!   so the answer cannot drift; without them the raw bytes are compared and
 //!   hashed directly, which is the path the benchmarks take.
@@ -179,7 +179,7 @@ impl Side {
 
 /// Whether the options ask for anything the raw bytes cannot answer.
 fn needs_normalising(opt: &Options) -> bool {
-    opt.trim || opt.ignore_case || opt.empty_is_null || opt.tolerance > 0.0
+    opt.trim || opt.ignore_case || opt.tolerance > 0.0
 }
 
 /// The field as the `Val` every other engine would have built for it.
@@ -210,7 +210,7 @@ fn value_checked(slab: &Slab, f: Field, opt: &Options, what: &str) -> Result<Val
         return Ok(Some(s));
     }
     let trimmed = if opt.trim { s.trim() } else { s.as_str() };
-    if opt.empty_is_null && trimmed.is_empty() {
+    if trimmed.is_empty() {
         return Ok(None);
     }
     if opt.ignore_case {

@@ -61,7 +61,8 @@ compare options:
       --config PATH       Path to compara.toml
       --trim              Strip whitespace before comparing
       --ignore-case       Compare text without regard to case
-      --empty-is-null     Treat an empty string and null as equal
+      --empty-is-null     Kept for old scripts: an empty value and a missing one
+                          are always equal (and with --trim, one of spaces)
       --tolerance N       Absolute numeric tolerance
       --max-rows N        Rows embedded per report section (default 50000)
       --delimiter D       Force the delimiter: one character, or '\\t' for a

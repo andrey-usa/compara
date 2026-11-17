@@ -96,7 +96,7 @@ fn text_of(c: Look<'_>) -> Cow<'_, str> {
 }
 
 fn needs_normalising(opt: &Options) -> bool {
-    opt.trim || opt.ignore_case || opt.empty_is_null || opt.tolerance > 0.0
+    opt.trim || opt.ignore_case || opt.tolerance > 0.0
 }
 
 fn value_of(c: Look<'_>, opt: &Options) -> Val {
@@ -110,11 +110,9 @@ fn value_of(c: Look<'_>, opt: &Options) -> Val {
     if opt.ignore_case {
         text = text.to_lowercase();
     }
-    // A value that trims to nothing is still a value, "", as it is in the CSV
-    // engines: only --empty-is-null makes it absent. Reading it as absent made
-    // `"  "` against an empty cell no change here and a change on the same rows
-    // as CSV.
-    if text.is_empty() && opt.empty_is_null {
+    // A value that trims to nothing is absent, as an empty one already is:
+    // `"  "` under --trim is the empty cell it looks like, in every format.
+    if text.is_empty() {
         return None;
     }
     Some(text)
@@ -1807,7 +1805,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                     aw: &'c parquet::Words,
                     bw: &'c parquet::Words,
                 },
-                // Words under --trim, --ignore-case, --empty-is-null or
+                // Words under --trim, --ignore-case or
                 // --tolerance: each cell is compared as the text it reads as,
                 // the way the CSV path compares it.
                 WordsAsText,

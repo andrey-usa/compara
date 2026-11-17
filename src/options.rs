@@ -86,6 +86,8 @@ pub struct Options {
 
     pub trim: bool,
     pub ignore_case: bool,
+    /// Read and echoed in the summary, and changes nothing: an empty value
+    /// is always absent, and so is one `--trim` empties.
     pub empty_is_null: bool,
     pub tolerance: f64,
     pub max_rows: usize,

@@ -16,6 +16,18 @@ All notable changes to this project are documented here. The format follows
   `-c` naming the columns to compare, says it is known. The JSON summary
   lists such columns as before (`meta.only_in_a`, `meta.only_in_b`).
 
+### Changed
+
+- Under `--trim`, a value of only spaces or tabs is the empty cell it
+  looks like: `"  "` against an empty or missing value is no change. It was
+  a change unless `--empty-is-null` was given too, which surprised most
+  people who asked for `--trim`, since an empty cell is already the same as
+  a missing one in CSV, JSON and Parquet alike. The answer changes for a
+  comparison run with `--trim` alone on such values: they were counted as
+  changed, blanked or filled and are now unchanged. `--empty-is-null` is
+  still accepted, on the command line and in a profile, and changes
+  nothing.
+
 ### Fixed
 
 - A quote inside an unquoted field no longer joins rows. CSV gives a quote

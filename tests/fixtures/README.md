@@ -63,9 +63,9 @@ only beyond ASCII (`CAFÉ`/`café`, `K` U+212A/`k`) must match the same way in e
 `scripts/make_fold_fixtures.py` writes the files and says what each row is for.
 
 Its `pad` column holds values that are only whitespace, which generated data never does. Under
-`--trim` such a value is `""`, and `""` is a value: only `--empty-is-null` makes it absent. The
-Parquet path once read it as absent under `--trim` alone, and gave a different answer
-for the same rows as Parquet than as CSV.
+`--trim` such a value is nothing, and nothing is absent, as an empty cell is, in every format.
+Before 0.7.0 it was a value unless `--empty-is-null` was given too, and the Parquet path once
+read it otherwise than CSV did.
 
 # Hostile
 

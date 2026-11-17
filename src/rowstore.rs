@@ -95,8 +95,8 @@ impl Packed {
     }
 
     /// Appends one row of raw cells as [`crate::columns::normalise`] leaves
-    /// them -- empty is absent, then `--trim`, `--ignore-case` and
-    /// `--empty-is-null` -- without a `String` per cell where none is needed.
+    /// them -- empty is absent, then `--trim` (what it empties is absent too)
+    /// and `--ignore-case` -- without a `String` per cell where none is needed.
     pub fn push_normalised<'a>(
         &mut self,
         cells: impl IntoIterator<Item = Option<&'a str>>,
@@ -115,7 +115,7 @@ impl Packed {
                 } else {
                     Cow::Borrowed(s)
                 };
-                (!(opt.empty_is_null && s.is_empty())).then_some(s)
+                (!s.is_empty()).then_some(s)
             })
             .collect();
         self.push(normalised.iter().map(|c| c.as_deref()))

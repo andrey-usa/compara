@@ -211,7 +211,12 @@ pub fn empty_to_null(s: &str) -> Val {
     }
 }
 
-/// Applies `--trim`, `--ignore-case` and `--empty-is-null` to one cell.
+/// Applies `--trim` and `--ignore-case` to one cell.
+///
+/// An empty value is absent before this is asked, in every format, and a
+/// value that `--trim` empties is absent after it: `"  "` against an empty
+/// cell, or a missing one, is no change. `--empty-is-null` said that once
+/// and is kept for the command lines and profiles that name it.
 pub fn normalise(v: Val, opt: &Options) -> Val {
     let mut s = v?;
     if opt.trim {
@@ -220,7 +225,7 @@ pub fn normalise(v: Val, opt: &Options) -> Val {
     if opt.ignore_case {
         s = s.to_lowercase();
     }
-    if opt.empty_is_null && s.is_empty() {
+    if s.is_empty() {
         return None;
     }
     Some(s)

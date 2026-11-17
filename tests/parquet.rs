@@ -567,11 +567,11 @@ fn skipping_the_added_sample_does_not_change_the_counts() {
     }
 }
 
-/// A value that is only whitespace trims to "", and "" is a value: only
-/// `--empty-is-null` makes it absent. The CSV engines and `turbo`'s Parquet
-/// decoder always read it that way; the columnar path read it as absent under
-/// `--trim` alone, so `"  "` against an empty cell was a change as CSV and no
-/// change as Parquet.
+/// A value that is only whitespace trims to nothing, and nothing is absent:
+/// under `--trim`, `"  "` against an empty cell is no change, the same as
+/// CSV and as Parquet, through either Parquet reader. It once was a change
+/// under `--trim` alone unless `--empty-is-null` was given too, and the
+/// columnar path once disagreed with the others about it.
 ///
 /// `compara-gen-data` never writes such a value, which is why `with_trim` above could
 /// not see it; this writes its own pair, in both formats, from one table.
@@ -613,9 +613,16 @@ fn trim_keeps_a_value_that_trims_to_nothing() {
         w.finish().unwrap();
     }
 
-    // (trim, empty_is_null, changed rows): under --trim alone, k1 is "" against
-    // an empty cell -- a change -- and k3 is "" against "", which is not.
-    for (trim, empty_is_null, changed) in [(true, false, 1), (true, true, 0), (false, false, 3)] {
+    // (trim, empty_is_null, changed rows): under --trim, k1 is "  " against an
+    // empty cell and k3 "  " against a tab, both nothing, and k4 " b " against
+    // "b": no change, with or without --empty-is-null, which changes nothing.
+    // Without --trim, k1, k3 and k4 change.
+    for (trim, empty_is_null, changed) in [
+        (true, false, 0),
+        (true, true, 0),
+        (false, false, 3),
+        (false, true, 3),
+    ] {
         let opt = || {
             let mut o = Options::with_key(["id"]);
             o.trim = trim;
