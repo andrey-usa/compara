@@ -259,7 +259,17 @@ pub fn parse_delimiter(value: &str) -> Result<Option<char>> {
     let mut chars = value.chars();
     match (chars.next(), chars.next()) {
         (None, _) => Ok(None),
-        (Some(c), None) => Ok(Some(c)),
+        // Refused here, where it is read, by the rule the readers hold it to:
+        // checked only when a file was opened, it came after notes that the
+        // delimiter was not in the file's header.
+        (Some(c), None) => {
+            let probe = Options {
+                delimiter: Some(c),
+                ..Options::default()
+            };
+            probe.delimiter_byte()?;
+            Ok(Some(c))
+        }
         _ => Err(Error::new(format!(
             "--delimiter must be one character, got {value:?} (a tab is --delimiter '\\t')"
         ))),

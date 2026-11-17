@@ -639,6 +639,14 @@ fn a_tab_delimiter_can_be_named_and_a_long_one_is_refused() {
         assert_eq!(stdout, plain, "{tab:?}");
         assert!(!stderr.contains("is not in"), "{tab:?}: {stderr}");
     }
+    // A quote is refused before anything is read: no note about the file
+    // comes ahead of the error.
+    let (code, _, stderr) = run(&["head", "--delimiter", "\""], &f.path("a.csv"));
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.starts_with("error: --delimiter cannot be a quote"),
+        "{stderr}"
+    );
     for command in ["head", "columns"] {
         let (code, _, stderr) = run(&[command, "--delimiter", ",;"], &f.path("a.csv"));
         assert_eq!(code, 2, "{stderr}");
