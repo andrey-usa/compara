@@ -138,6 +138,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- chrono and humantime, which the cloud reader (object_store 0.14.2, its
+  latest) depends on, are now marked unmaintained by RustSec
+  (RUSTSEC-2026-0543, RUSTSEC-2026-0542). Neither is a vulnerability and
+  neither has a fixed version; both are listed in `deny.toml`, with that
+  reason, so the audits in CI still fail on any other advisory.
 - Temporary files are the user's alone. compara spools standard input,
   downloads from object storage, decompressed copies and a table read
   from many files to the temporary directory, which most machines share
