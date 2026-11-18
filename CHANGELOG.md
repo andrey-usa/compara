@@ -22,9 +22,9 @@ All notable changes to this project are documented here. The format follows
   `-c` naming every column; they compare in 0.24 s (local, indicative). The
   refusal says how many cells, and names `--compare`.
 - `-c` (or `-i`, `-k`) naming many columns is checked against the files'
-  headers by lookup: naming all 20,000 columns of a sparse JSON table took
-  2.1-2.3 s before the compare started and the whole run now 0.5-0.6 s
-  (local, indicative).
+  headers by lookup, not a search per name: comparing a sparse JSON table
+  with `-c` naming all 20,000 of its columns took 2.1-2.3 s and now takes
+  0.5-0.6 s (local, indicative).
 
 ### Fixed
 
