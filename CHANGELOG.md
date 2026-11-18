@@ -37,6 +37,14 @@ All notable changes to this project are documented here. The format follows
   later lines are not one object each is refused with the line and how to
   rewrite it (`jq -c .`); a line that was not an object had been a row with
   no key.
+- A Parquet file compared under a heap limit (a container's, or
+  `ulimit -d`) too small for its decoded columns stopped with exit 134
+  ("memory allocation of ... failed") at most limits between too small
+  to start and enough: 2M rows a side against a CSV, in memory, from
+  300 to 500 MB. Its reader's allocations are checked now, so the run
+  is refused with exit 2 and what did not fit. Two Parquet files
+  compared by columns did the same where their dictionaries are
+  interned and the report's changed cells are held.
 - Where the system refuses a thread (a container's process limit, or a
   memory limit its stack counts against), the sortmerge and native engines
   and turbo's streaming join stopped with exit 101 ("failed to spawn

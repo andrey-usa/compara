@@ -321,13 +321,19 @@ struct Ids {
 impl Ids {
     /// Looked up before it is inserted: `entry` wants an owned key, so asking it
     /// allocated a copy of every value, including the ones already interned.
-    fn of(&mut self, v: &[u8]) -> i32 {
+    ///
+    /// The table grows with the distinct values, which on a key column is one
+    /// per row: its growth and each key's copy refuse rather than abort.
+    fn of(&mut self, v: &[u8]) -> Result<i32> {
         if let Some(&id) = self.table.get(v) {
-            return id;
+            return Ok(id);
         }
         let next = self.table.len() as i32;
-        self.table.insert(v.to_vec(), next);
-        next
+        let mut key = alloc::sized(v.len(), "an interned dictionary value")?;
+        key.extend_from_slice(v);
+        alloc::map_room(&mut self.table, 1, "the interned dictionary values")?;
+        self.table.insert(key, next);
+        Ok(next)
     }
 }
 
@@ -359,9 +365,9 @@ fn code(col: &Col<'_>, ids: &mut Ids, opt: &Options) -> Result<Vec<i32>> {
         }
         if needs_normalising(opt) {
             let v = value_of(cell, opt).unwrap_or_default();
-            out.push(ids.of(v.as_bytes()));
+            out.push(ids.of(v.as_bytes())?);
         } else {
-            out.push(ids.of(cell.bytes));
+            out.push(ids.of(cell.bytes)?);
         }
     }
     Ok(out)
@@ -1994,6 +2000,13 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 hits
             };
 
+            // The report's first `cap + 1` changed cells, sized once: up to
+            // fifty thousand of them, a few megabytes a column.
+            alloc::grow(
+                &mut out.held,
+                hits.len().min(cap.saturating_add(1)),
+                "the changed cells the report shows",
+            )?;
             for p in hits {
                 let x = a_col.at(pa[p] as usize);
                 let y = b_col.at(pb[p] as usize);
@@ -2013,14 +2026,19 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             // The rows that reach the report as added or removed need every
             // column's value, and this is the only time this column is in
             // memory.
-            out.added_vals = added_held
-                .iter()
-                .map(|&r| value_of(b_col.at(r as usize), opt))
-                .collect();
-            out.removed_vals = removed_held
-                .iter()
-                .map(|&r| value_of(a_col.at(r as usize), opt))
-                .collect();
+            out.added_vals = alloc::sized(added_held.len(), "the added rows the report shows")?;
+            out.added_vals.extend(
+                added_held
+                    .iter()
+                    .map(|&r| value_of(b_col.at(r as usize), opt)),
+            );
+            out.removed_vals =
+                alloc::sized(removed_held.len(), "the removed rows the report shows")?;
+            out.removed_vals.extend(
+                removed_held
+                    .iter()
+                    .map(|&r| value_of(a_col.at(r as usize), opt)),
+            );
             if let Some((added_list, removed_list)) = &export_lists {
                 out.export_added = added_list.cells(&b_col, |r| r, opt)?;
                 out.export_removed = removed_list.cells(&a_col, |r| r, opt)?;
@@ -2110,7 +2128,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         let mut bits = word;
         while bits != 0 && keep.len() <= cap {
             let bit = bits.trailing_zeros() as usize;
-            keep.push(w * 64 + bit);
+            alloc::push(&mut keep, w * 64 + bit, "the changed rows the report shows")?;
             bits &= bits - 1;
         }
     }

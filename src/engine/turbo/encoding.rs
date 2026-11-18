@@ -60,6 +60,9 @@ fn unpack<T: Word>(
     if width as usize > T::BITS {
         return Err(too_wide(width, T::BITS));
     }
+    // A bit-packed run is up to eight values per byte of the page, so a page of
+    // a few megabytes can unpack to tens: room asked for, not assumed.
+    crate::alloc::room(out, count, "the values of a bit-packed Parquet run")?;
     if width == 0 {
         out.extend(std::iter::repeat_n(T::of(0), count));
         return Ok(());
@@ -233,7 +236,7 @@ pub(super) fn delta_binary_packed(data: &[u8], want: usize) -> Result<(Vec<i64>,
     let mut out = crate::alloc::sized(total.max(1), "the values of a delta-encoded page")?;
     out.push(first);
     let mut value = first;
-    let mut widths = vec![0u8; miniblocks];
+    let mut widths = crate::alloc::filled(0u8, miniblocks, "a delta-encoded page's widths")?;
     let mut scratch: Vec<u64> = Vec::new();
 
     while out.len() < total {

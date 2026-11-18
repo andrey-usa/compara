@@ -170,6 +170,26 @@ pub fn room<T>(v: &mut Vec<T>, extra: usize, what: &str) -> Result<()> {
     })
 }
 
+/// [`room`] for a hash map: space for `extra` more entries, amortised.
+pub fn map_room<K, V, S>(
+    m: &mut std::collections::HashMap<K, V, S>,
+    extra: usize,
+    what: &str,
+) -> Result<()>
+where
+    K: Eq + std::hash::Hash,
+    S: std::hash::BuildHasher,
+{
+    m.try_reserve(extra).map_err(|_| {
+        refuse(
+            what,
+            m.len()
+                .saturating_add(extra)
+                .saturating_mul(size_of::<(K, V)>()),
+        )
+    })
+}
+
 /// `vec.push(value)` that returns instead of aborting.
 ///
 /// The check is the one `push` already makes; what changes is what happens when

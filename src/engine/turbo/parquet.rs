@@ -26,6 +26,7 @@
 //! and timestamps ISO 8601. A Parquet file compares against a CSV of the same
 //! data exactly when the CSV spells its values that way.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use super::codec::{Codec, decompress};
@@ -318,7 +319,7 @@ impl Reader {
             })
             .collect();
 
-        let mut fields = crate::alloc::filled(ABSENT, rows * width, "one field per cell")?;
+        let mut fields = alloc::filled(ABSENT, rows.saturating_mul(width), "one field per cell")?;
         let mut arena: Vec<u8> = Vec::new();
         let ways = threads.clamp(1, jobs.len().max(1));
 
@@ -339,12 +340,30 @@ impl Reader {
                 }
             });
 
-            for (&(slot, _), column) in wave.iter().zip(decoded) {
-                let column = column?;
+            let mut columns: Vec<Decoded> = Vec::with_capacity(wave.len());
+            for column in decoded {
+                columns.push(column?);
+            }
+            // The wave's bytes join the arena in one exact step, and the first
+            // column's are moved rather than copied while the arena is empty.
+            // Grown a column at a time the arena doubled, so its last growth
+            // could ask for as much again as it held, and could not refuse.
+            let moved = arena.is_empty() && !columns.is_empty();
+            if moved {
+                arena = std::mem::take(&mut columns[0].arena);
+            }
+            let more = columns.iter().map(|c| c.arena.len()).sum();
+            alloc::grow(&mut arena, more, "the decoded values of a Parquet file")?;
+
+            for (i, (&(slot, _), column)) in wave.iter().zip(columns).enumerate() {
                 // The offset is the low bits of the word, so moving a column's
                 // bytes into the file's one arena is an addition — and only the
                 // two sentinels have to be left alone.
-                let base = arena.len() as u64;
+                let base = if moved && i == 0 {
+                    0
+                } else {
+                    arena.len() as u64
+                };
                 arena.extend_from_slice(&column.arena);
                 // Written a block of rows at a time: the destination is
                 // row-major, so a whole column in one pass would touch every
@@ -833,8 +852,11 @@ impl Reader {
     fn decode_column(&self, leaf: usize, limit: usize) -> Result<Decoded> {
         let info = &self.columns[leaf];
         let data = self.slab.data();
+        // A field per row, sized from the footer's row count: the one
+        // allocation per column that is known up front, and the one a heap
+        // limit meets first.
         let mut out = Decoded {
-            fields: Vec::with_capacity(self.rows.min(limit)),
+            fields: alloc::sized(self.rows.min(limit), FIELDS)?,
             arena: Vec::new(),
         };
         let mut scratch: Vec<u8> = Vec::with_capacity(64);
@@ -925,14 +947,17 @@ impl Reader {
         scratch: &mut Vec<u8>,
     ) -> Result<()> {
         // Version 2 keeps the levels outside the compressed part, so only the
-        // values are decompressed; version 1 compresses the whole page.
-        let (levels, values) = if header.kind == 3 {
+        // values are decompressed; version 1 compresses the whole page. The
+        // levels and values are slices of the page: an uncompressed page is
+        // the file's own bytes, and neither part is copied out of it.
+        let page;
+        let (levels, values): (&[u8], &[u8]) = if header.kind == 3 {
             let level_bytes = header.v2_def_bytes + header.v2_rep_bytes;
             let levels = body
                 .get(..level_bytes)
                 .ok_or_else(|| Error::new("a Parquet v2 page is shorter than its levels"))?;
             let rest = &body[level_bytes..];
-            let values = if header.v2_compressed && chunk.codec != Codec::None {
+            page = if header.v2_compressed && chunk.codec != Codec::None {
                 let expected = header
                     .uncompressed
                     .checked_sub(level_bytes)
@@ -941,13 +966,13 @@ impl Reader {
                     })?;
                 decompress(chunk.codec, rest, expected)?
             } else {
-                rest.to_vec()
+                Cow::Borrowed(rest)
             };
-            (levels[header.v2_rep_bytes..].to_vec(), values)
+            (&levels[header.v2_rep_bytes..], &page[..])
         } else {
-            let page = decompress(chunk.codec, body, header.uncompressed)?;
+            page = decompress(chunk.codec, body, header.uncompressed)?;
             if info.max_def_level == 0 {
-                (Vec::new(), page)
+                (&[], &page[..])
             } else {
                 // Version 1 prefixes its level data with a four-byte length.
                 let n = u32::from_le_bytes(
@@ -960,9 +985,8 @@ impl Reader {
                 ) as usize;
                 let levels = page
                     .get(4..4 + n)
-                    .ok_or_else(|| Error::new("a Parquet page is shorter than its levels"))?
-                    .to_vec();
-                (levels, page[4 + n..].to_vec())
+                    .ok_or_else(|| Error::new("a Parquet page is shorter than its levels"))?;
+                (levels, &page[4 + n..])
             }
         };
 
@@ -970,7 +994,7 @@ impl Reader {
         let mut present = alloc::filled(true, header.num_values, "the page's null flags")?;
         let mut wanted = header.num_values;
         if info.max_def_level > 0 {
-            let mut hybrid = Hybrid::new(&levels, bit_width(info.max_def_level as u32));
+            let mut hybrid = Hybrid::new(levels, bit_width(info.max_def_level as u32));
             wanted = 0;
             for slot in present.iter_mut() {
                 *slot = hybrid.next()? >= info.max_def_level as u32;
@@ -979,7 +1003,7 @@ impl Reader {
         }
 
         let mut values = decode_values(
-            &values,
+            values,
             header.encoding,
             wanted,
             info,
@@ -988,6 +1012,9 @@ impl Reader {
             scratch,
         )?;
         values.reverse(); // popped from the back, which is the front of the page
+        // Sized from the footer's row count, so this only grows for a file
+        // whose pages hold more values than its row groups say.
+        alloc::room(&mut out.fields, present.len(), FIELDS)?;
         for slot in present {
             out.fields.push(if slot {
                 values.pop().ok_or_else(|| {
@@ -1050,7 +1077,7 @@ fn decode_values(
             let mut hybrid = Hybrid::new(&data[4.min(data.len())..], 1);
             let mut out = alloc::sized(count, "the values of a Parquet page")?;
             for _ in 0..count {
-                out.push(push_bool(arena, hybrid.next()? != 0));
+                out.push(push_bool(arena, hybrid.next()? != 0)?);
             }
             Ok(out)
         }
@@ -1058,7 +1085,7 @@ fn decode_values(
             let (ints, _) = delta_binary_packed(data, count)?;
             let mut out = alloc::sized(count, "the values of a Parquet page")?;
             for &v in ints.iter().take(count) {
-                out.push(push_number(arena, scratch, v, info));
+                out.push(push_number(arena, scratch, v, info)?);
             }
             Ok(out)
         }
@@ -1072,7 +1099,7 @@ fn decode_values(
                     .get(at..at + len)
                     .ok_or_else(|| Error::new("a delta-length Parquet page ends mid-value"))?;
                 at += len;
-                out.push(push_bytes(arena, bytes));
+                out.push(push_bytes(arena, bytes)?);
             }
             Ok(out)
         }
@@ -1098,7 +1125,7 @@ fn decode_values(
                 }
                 previous.truncate(prefix);
                 previous.extend_from_slice(bytes);
-                out.push(push_bytes(arena, &previous));
+                out.push(push_bytes(arena, &previous)?);
             }
             Ok(out)
         }
@@ -1124,7 +1151,7 @@ fn plain(
         match info.physical {
             Physical::Boolean => {
                 let byte = *data.get(i / 8).ok_or_else(short)?;
-                out.push(push_bool(arena, byte >> (i % 8) & 1 == 1));
+                out.push(push_bool(arena, byte >> (i % 8) & 1 == 1)?);
             }
             Physical::ByteArray => {
                 let head = data.get(at..at + 4).ok_or_else(short)?;
@@ -1132,31 +1159,31 @@ fn plain(
                 at += 4;
                 let bytes = data.get(at..at + len).ok_or_else(short)?;
                 at += len;
-                out.push(push_scalar(arena, scratch, bytes, info));
+                out.push(push_scalar(arena, scratch, bytes, info)?);
             }
             Physical::FixedLen => {
                 let len = info.type_length;
                 let bytes = data.get(at..at + len).ok_or_else(short)?;
                 at += len;
-                out.push(push_scalar(arena, scratch, bytes, info));
+                out.push(push_scalar(arena, scratch, bytes, info)?);
             }
             Physical::Int32 => {
                 let bytes = data.get(at..at + 4).ok_or_else(short)?;
                 at += 4;
                 let v = i32::from_le_bytes(bytes.try_into().expect("four bytes"));
                 out.push(match info.render {
-                    Render::Date => push_date(arena, scratch, v as i64),
+                    Render::Date => push_date(arena, scratch, v as i64)?,
                     Render::Int { signed: false } => {
-                        push_number(arena, scratch, (v as u32) as i64, info)
+                        push_number(arena, scratch, (v as u32) as i64, info)?
                     }
-                    _ => push_number(arena, scratch, v as i64, info),
+                    _ => push_number(arena, scratch, v as i64, info)?,
                 });
             }
             Physical::Int64 => {
                 let bytes = data.get(at..at + 8).ok_or_else(short)?;
                 at += 8;
                 let v = i64::from_le_bytes(bytes.try_into().expect("eight bytes"));
-                out.push(push_number(arena, scratch, v, info));
+                out.push(push_number(arena, scratch, v, info)?);
             }
             Physical::Int96 => {
                 // Twelve bytes: nanoseconds within the day, then a Julian day.
@@ -1167,7 +1194,7 @@ fn plain(
                 let value = (julian - 2_440_588) * 86_400_000_000_000 + nanos;
                 scratch.clear();
                 write_timestamp(scratch, value as i64, Unit::Nanos, false);
-                out.push(push_bytes(arena, scratch));
+                out.push(push_bytes(arena, scratch)?);
             }
             Physical::Float => {
                 let bytes = data.get(at..at + 4).ok_or_else(short)?;
@@ -1175,7 +1202,7 @@ fn plain(
                 let v = f32::from_le_bytes(bytes.try_into().expect("four bytes"));
                 scratch.clear();
                 write_f32(scratch, v);
-                out.push(push_bytes(arena, scratch));
+                out.push(push_bytes(arena, scratch)?);
             }
             Physical::Double => {
                 let bytes = data.get(at..at + 8).ok_or_else(short)?;
@@ -1183,7 +1210,7 @@ fn plain(
                 let v = f64::from_le_bytes(bytes.try_into().expect("eight bytes"));
                 scratch.clear();
                 write_f64(scratch, v);
-                out.push(push_bytes(arena, scratch));
+                out.push(push_bytes(arena, scratch)?);
             }
         }
     }
@@ -1194,13 +1221,22 @@ fn plain(
 // Values as text
 // ---------------------------------------------------------------------------
 
-fn push_bytes(arena: &mut Vec<u8>, bytes: &[u8]) -> Field {
+/// What a column's fields and its arena are called when they do not fit.
+const FIELDS: &str = "one field per row of a Parquet column";
+const ARENA: &str = "the decoded values of a Parquet column";
+
+/// A value's bytes, appended to the column's arena. The arena grows with the
+/// column, doubling, so its growth is checked: the last doubling of a long text
+/// column is the largest single allocation the reader makes.
+#[inline]
+fn push_bytes(arena: &mut Vec<u8>, bytes: &[u8]) -> Result<Field> {
+    alloc::room(arena, bytes.len(), ARENA)?;
     let at = arena.len() as u64;
     arena.extend_from_slice(bytes);
-    pack(at, bytes.len() as u64, false)
+    Ok(pack(at, bytes.len() as u64, false))
 }
 
-fn push_bool(arena: &mut Vec<u8>, value: bool) -> Field {
+fn push_bool(arena: &mut Vec<u8>, value: bool) -> Result<Field> {
     push_bytes(arena, if value { b"true" } else { b"false" })
 }
 
@@ -1211,7 +1247,7 @@ fn push_scalar(
     scratch: &mut Vec<u8>,
     bytes: &[u8],
     info: &ColumnInfo,
-) -> Field {
+) -> Result<Field> {
     match info.render {
         Render::Decimal { scale } => {
             let mut unscaled: i128 = if bytes.first().is_some_and(|&b| b & 0x80 != 0) {
@@ -1231,7 +1267,12 @@ fn push_scalar(
 }
 
 /// An integer value, rendered by whatever the column's logical type makes of it.
-fn push_number(arena: &mut Vec<u8>, scratch: &mut Vec<u8>, value: i64, info: &ColumnInfo) -> Field {
+fn push_number(
+    arena: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+    value: i64,
+    info: &ColumnInfo,
+) -> Result<Field> {
     scratch.clear();
     write_number(scratch, value, info.render);
     push_bytes(arena, scratch)
@@ -1250,7 +1291,7 @@ fn write_number(out: &mut Vec<u8>, value: i64, render: Render) {
     }
 }
 
-fn push_date(arena: &mut Vec<u8>, scratch: &mut Vec<u8>, days: i64) -> Field {
+fn push_date(arena: &mut Vec<u8>, scratch: &mut Vec<u8>, days: i64) -> Result<Field> {
     scratch.clear();
     write_date(scratch, days);
     push_bytes(arena, scratch)

@@ -10,6 +10,7 @@
 //! that happened to be in the file. The columnar reader (`crate::parquet`)
 //! decodes its gzip, zstd and LZ4 pages through here too.
 
+use std::borrow::Cow;
 use std::io::Read;
 
 use crate::error::{Error, Result};
@@ -55,9 +56,21 @@ fn truncated() -> Error {
 }
 
 /// Decompresses one page into `out`, which is sized from the page header.
-pub(crate) fn decompress(codec: Codec, input: &[u8], expected: usize) -> Result<Vec<u8>> {
+///
+/// An uncompressed page is the file's own bytes, borrowed: copying it would be
+/// a page-sized allocation per page with nothing gained, and one that, unlike
+/// the decoders' buffers below, could not refuse.
+pub(crate) fn decompress(codec: Codec, input: &[u8], expected: usize) -> Result<Cow<'_, [u8]>> {
     let out = match codec {
-        Codec::None => input.to_vec(),
+        Codec::None => {
+            if input.len() != expected {
+                return Err(Error::new(format!(
+                    "a Parquet page decompressed to {} bytes where its header says {expected}",
+                    input.len()
+                )));
+            }
+            return Ok(Cow::Borrowed(input));
+        }
         Codec::Snappy => snappy(input, expected)?,
         Codec::Lz4Raw => lz4(input, expected)?,
         Codec::Gzip => {
@@ -85,7 +98,7 @@ pub(crate) fn decompress(codec: Codec, input: &[u8], expected: usize) -> Result<
             out.len()
         )));
     }
-    Ok(out)
+    Ok(Cow::Owned(out))
 }
 
 /// Copies `len` bytes from `distance` back in `out`, which may overlap itself:

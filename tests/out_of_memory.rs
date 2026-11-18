@@ -435,3 +435,80 @@ fn every_engine_answers_when_no_thread_can_be_had() {
         assert_eq!(counts(&free), counts(&refused), "{engine} {fused}: {err}");
     }
 }
+
+/// A Parquet pair whose decoded columns do not fit the heap is refused, not
+/// aborted on. The reader sized each column's field per row, grew each
+/// column's bytes and joined the columns into one arena without the checked
+/// path, and the columnar path's interned dictionaries and report lists grew
+/// the same way, so between "cannot start" and "enough" most rungs ended on
+/// signal 6: 200,000 rows a side, every 2 MB from 20 to 80 MB, 23 of 31 in
+/// memory (`--engine turbo`) and 10 of 31 by the columnar path (`auto`).
+///
+/// An abort on an allocation of a few bytes, made by another thread at the
+/// moment the reader took the last of the heap, is not counted here, and nor
+/// is the alternate signal stack the runtime maps for every thread: both are
+/// the ceiling's own coin flips, not allocations this reader makes. Anything
+/// larger than the reserve covers is.
+#[test]
+fn a_parquet_pair_too_big_for_the_heap_is_refused_not_aborted() {
+    let dir = std::env::temp_dir().join(format!("compara-oom-pq-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let made = Command::new(env!("CARGO_BIN_EXE_compara-gen-data"))
+        .args([
+            "--rows",
+            "200k",
+            "--format",
+            "parquet",
+            "--prefix",
+            "p",
+            "--out-dir",
+        ])
+        .arg(&dir)
+        .output()
+        .expect("gen-data");
+    assert!(made.status.success(), "{made:?}");
+    let (a, b) = (dir.join("p_a.parquet"), dir.join("p_b.parquet"));
+
+    // The size in "memory allocation of N bytes failed", the line the
+    // allocator prints before it aborts.
+    let failed = |stderr: &str| -> Option<usize> {
+        let at = stderr.find("memory allocation of ")? + "memory allocation of ".len();
+        stderr[at..].split(' ').next()?.parse().ok()
+    };
+    let (mut aborted, mut refused, mut answered) = (Vec::new(), 0, 0);
+    for engine in ["turbo", "auto"] {
+        for cap_mb in (20..=80).step_by(2) {
+            let run = run_script(cap_mb * 1024, &a, &b, &format!("--engine {engine}"));
+            assert!(!run.hung, "{engine} {cap_mb} MB: the run did not finish");
+            match run.code {
+                Some(0) | Some(1) => answered += 1,
+                Some(2) => {
+                    assert!(
+                        run.stderr.contains("out of memory") && run.stderr.contains("needs"),
+                        "{engine} {cap_mb} MB: a refusal that does not say what ran out: {}",
+                        run.stderr.trim()
+                    );
+                    refused += 1;
+                }
+                None => {
+                    if failed(&run.stderr).is_some_and(|n| n > 64 * 1024) {
+                        aborted.push(format!("{engine} {cap_mb} MB: {}", run.stderr.trim()));
+                    }
+                }
+                other => panic!(
+                    "{engine} {cap_mb} MB: unexpected exit {other:?}; stderr: {}",
+                    run.stderr.trim()
+                ),
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        aborted.is_empty(),
+        "{} runs aborted on an allocation the reader made:\n{}",
+        aborted.len(),
+        aborted.join("\n")
+    );
+    assert!(refused > 0, "no cap in the range was too small to serve");
+    assert!(answered > 0, "no cap in the range was enough to answer");
+}
