@@ -38,10 +38,21 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
     // ending in commas, as spreadsheets write it) have no name to match by.
     // A repeated name the options leave out (`-i`, or not in `-c`) is never
     // read, so it is no reason to refuse the file.
+    //
+    // Every name list is looked up in a set built once: `-c` can name every
+    // column of a table of tens of thousands, and a search of the list for
+    // each header column, and of the header for each name, is quadratic.
+    type Names<'a> = std::collections::HashSet<&'a str>;
+    let key_set: Names = opt.key.iter().map(String::as_str).collect();
+    let ignore_set: Names = opt.ignore.iter().map(String::as_str).collect();
+    let wanted_set: Option<Names> = opt
+        .compare
+        .as_ref()
+        .map(|w| w.iter().map(String::as_str).collect());
     let read = |c: &String| {
-        opt.key.contains(c)
-            || (!opt.ignore.contains(c)
-                && opt.compare.as_ref().is_none_or(|wanted| wanted.contains(c)))
+        key_set.contains(c.as_str())
+            || (!ignore_set.contains(c.as_str())
+                && wanted_set.as_ref().is_none_or(|w| w.contains(c.as_str())))
     };
     for (side, cols) in [("A", a_cols), ("B", b_cols)] {
         let mut seen = std::collections::HashSet::new();
@@ -76,11 +87,15 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
         }
         list
     };
-    for (side, cols) in [("A", a_cols), ("B", b_cols)] {
+    // Looked up by name, not searched for: a table of sixty thousand columns
+    // searched a list of sixty thousand for each of them, at every step here.
+    let a_has: Names = a_cols.iter().map(String::as_str).collect();
+    let b_has: Names = b_cols.iter().map(String::as_str).collect();
+    for (side, cols, has) in [("A", a_cols, &a_has), ("B", b_cols, &b_has)] {
         let missing: Vec<&str> = opt
             .key
             .iter()
-            .filter(|k| !cols.contains(k))
+            .filter(|k| !has.contains(k.as_str()))
             .map(String::as_str)
             .collect();
         if !missing.is_empty() {
@@ -110,7 +125,7 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
     let unknown: Vec<&str> = opt
         .ignore
         .iter()
-        .filter(|c| !a_cols.contains(c) && !b_cols.contains(c))
+        .filter(|c| !a_has.contains(c.as_str()) && !b_has.contains(c.as_str()))
         .map(String::as_str)
         .collect();
     if !unknown.is_empty() {
@@ -124,10 +139,6 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
         )));
     }
 
-    // Looked up by name, not searched for: a table of sixty thousand columns
-    // searched a list of sixty thousand for each of them, at every step here.
-    let a_has: std::collections::HashSet<&str> = a_cols.iter().map(String::as_str).collect();
-    let b_has: std::collections::HashSet<&str> = b_cols.iter().map(String::as_str).collect();
     let common: Vec<String> = a_cols
         .iter()
         .filter(|c| b_has.contains(c.as_str()))
@@ -156,7 +167,7 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
 
     let compared: Vec<String> = requested
         .into_iter()
-        .filter(|c| !opt.key.contains(c) && !opt.ignore.contains(c))
+        .filter(|c| !key_set.contains(c.as_str()) && !ignore_set.contains(c.as_str()))
         .collect();
 
     Ok(Resolved {
@@ -497,6 +508,207 @@ mod tests {
             ignore: names(ignore),
             ..Options::default()
         }
+    }
+
+    /// The search-based resolution this module had before it used lookups;
+    /// kept as the reference the lookup version is checked against.
+    fn resolve_by_search(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Resolved> {
+        // Columns are matched by name: two of one name in a file would leave one
+        // of them out of the comparison without a word. Unnamed ones (a header
+        // ending in commas, as spreadsheets write it) have no name to match by.
+        // A repeated name the options leave out (`-i`, or not in `-c`) is never
+        // read, so it is no reason to refuse the file.
+        let read = |c: &String| {
+            opt.key.contains(c)
+                || (!opt.ignore.contains(c)
+                    && opt.compare.as_ref().is_none_or(|wanted| wanted.contains(c)))
+        };
+        for (side, cols) in [("A", a_cols), ("B", b_cols)] {
+            let mut seen = std::collections::HashSet::new();
+            if let Some(twice) = cols
+                .iter()
+                .filter(|c| !c.trim().is_empty() && read(c))
+                .find(|c| !seen.insert(c.as_str()))
+            {
+                return Err(Error::input(format!(
+                    "{side} has two columns named {twice:?}; compara matches columns by name, so rename one \
+                     (or leave it out with -i {twice})"
+                )));
+            }
+        }
+        // A name with a space at either end is shown in quotes: `id ` in a
+        // list reads as `id`, the name that was asked for and not found.
+        let shown = |cols: &[String]| {
+            let mut list = cols
+                .iter()
+                .take(12)
+                .map(|c| {
+                    if c.trim() == c {
+                        c.clone()
+                    } else {
+                        format!("{c:?}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if cols.len() > 12 {
+                list.push_str(&format!(", … ({} in all)", cols.len()));
+            }
+            list
+        };
+        for (side, cols) in [("A", a_cols), ("B", b_cols)] {
+            let missing: Vec<&str> = opt
+                .key
+                .iter()
+                .filter(|k| !cols.contains(k))
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                return Err(Error::input(format!(
+                    "key column {} not in {side} (its columns: {}){}",
+                    missing
+                        .iter()
+                        .map(|k| format!("{k:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    shown(cols),
+                    near(&missing, cols)
+                )));
+            }
+        }
+
+        // A name that is in neither file is a typo, and a typo here is the one that
+        // does not announce itself: `--key` makes the answer impossible and
+        // `--compare` refuses, but a misspelled `--ignore` silently compares the
+        // column it was meant to drop and reports it as changed on every row. It
+        // cost a benchmark run, and a `-i x,y,z` against a `z2` column sat in this
+        // repository's own C suite until the check went in.
+        //
+        // In *neither* file, not in both: `--ignore` is subtractive, so naming a
+        // column that only one side has is a real name doing no harm -- it is not
+        // compared either way. Only a name nothing has can be a mistake.
+        let unknown: Vec<&str> = opt
+            .ignore
+            .iter()
+            .filter(|c| !a_cols.contains(c) && !b_cols.contains(c))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            let either: Vec<String> = a_cols.iter().chain(b_cols).cloned().collect();
+            return Err(Error::input(format!(
+                "ignore column(s) present in neither file: {} (A has: {}; B has: {}){}",
+                unknown.join(", "),
+                shown(a_cols),
+                shown(b_cols),
+                near(&unknown, &either)
+            )));
+        }
+
+        // Looked up by name, not searched for: a table of sixty thousand columns
+        // searched a list of sixty thousand for each of them, at every step here.
+        let a_has: std::collections::HashSet<&str> = a_cols.iter().map(String::as_str).collect();
+        let b_has: std::collections::HashSet<&str> = b_cols.iter().map(String::as_str).collect();
+        let common: Vec<String> = a_cols
+            .iter()
+            .filter(|c| b_has.contains(c.as_str()))
+            .cloned()
+            .collect();
+
+        let requested: Vec<String> = match &opt.compare {
+            None => common.clone(),
+            Some(wanted) => {
+                let bad: Vec<&str> = wanted
+                    .iter()
+                    .filter(|c| !(a_has.contains(c.as_str()) && b_has.contains(c.as_str())))
+                    .map(String::as_str)
+                    .collect();
+                if !bad.is_empty() {
+                    return Err(Error::input(format!(
+                        "compare column(s) not present in both files: {} (in both: {}){}",
+                        bad.join(", "),
+                        shown(&common),
+                        near(&bad, &common)
+                    )));
+                }
+                wanted.clone()
+            }
+        };
+
+        let compared: Vec<String> = requested
+            .into_iter()
+            .filter(|c| !opt.key.contains(c) && !opt.ignore.contains(c))
+            .collect();
+
+        Ok(Resolved {
+            compared,
+            only_in_a: a_cols
+                .iter()
+                .filter(|c| !b_has.contains(c.as_str()))
+                .cloned()
+                .collect(),
+            only_in_b: b_cols
+                .iter()
+                .filter(|c| !a_has.contains(c.as_str()))
+                .cloned()
+                .collect(),
+        })
+    }
+
+    // Both versions on the same generated option sets: the same `Resolved`, or
+    // the same error text, for names present, absent, repeated, on one side
+    // only and with spaces.
+    #[test]
+    fn lookups_give_what_searching_gave() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |n: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % n
+        };
+        let pool: Vec<String> = (0..9)
+            .map(|i| match i {
+                7 => "a b".to_string(),
+                8 => " id".to_string(),
+                _ => format!("c{i}"),
+            })
+            .chain(["id".to_string(), "ID".to_string(), String::new()])
+            .collect();
+        let pick = |max: usize, next: &mut dyn FnMut(usize) -> usize| -> Vec<String> {
+            (0..next(max + 1))
+                .map(|_| pool[next(pool.len())].clone())
+                .collect()
+        };
+        let (mut ok, mut refused) = (0, 0);
+        for _ in 0..4000 {
+            let a_cols = pick(8, &mut next);
+            let b_cols = pick(8, &mut next);
+            let compare = (next(2) == 0).then(|| pick(6, &mut next));
+            let o = Options {
+                key: pick(2, &mut next),
+                ignore: pick(3, &mut next),
+                compare,
+                ..Options::default()
+            };
+            let new = resolve(&a_cols, &b_cols, &o);
+            let old = resolve_by_search(&a_cols, &b_cols, &o);
+            match (new, old) {
+                (Ok(n), Ok(o)) => {
+                    assert_eq!(n, o);
+                    ok += 1;
+                }
+                (Err(n), Err(o)) => {
+                    assert_eq!(n.to_string(), o.to_string());
+                    assert_eq!(n.is_input(), o.is_input());
+                    refused += 1;
+                }
+                (n, o) => panic!("{a_cols:?} {b_cols:?}: {n:?} vs {o:?}"),
+            }
+        }
+        assert!(
+            ok > 100 && refused > 100,
+            "{ok} resolved, {refused} refused"
+        );
     }
 
     /// Columns are matched by name: a second column of one name was left out
