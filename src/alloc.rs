@@ -56,7 +56,15 @@ use crate::{Error, Result};
 /// the reserve is a few chunks, and [`crate::hugepages`]' allocator gives one
 /// back and tries again whenever a small allocation fails while any are left;
 /// [`refuse`] gives one back as well, for the message.
-const RESERVE_CHUNK: usize = 64 * 1024;
+///
+/// A chunk is larger than the C library's mmap threshold (128 KB in glibc and
+/// musl), so it is a mapping of its own, and giving it back returns it to the
+/// kernel, where any thread can have it. Chunks of 64 KB went back to the main
+/// thread's heap, which a thread that had not allocated yet cannot use: its
+/// first allocation maps a heap of its own, 132 KB, which the limit refused,
+/// and it aborted on a few bytes ("memory allocation of 8 bytes failed",
+/// Parquet against CSV in memory at a 30 MB limit, 200,000 rows a side).
+const RESERVE_CHUNK: usize = 256 * 1024;
 static RESERVE: [AtomicPtr<u8>; 4] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 4];
 
 fn chunk() -> Layout {
@@ -97,8 +105,11 @@ pub fn release_reserve() -> bool {
 /// small enough that a chunk covers it. A large one fails as it would have,
 /// and the checked helpers here turn that into a refusal; spending the
 /// reserve on it would leave none for the refusal's message.
+///
+/// The line is a quarter of a chunk: the chunks are as large as they are to
+/// be mappings of their own, not to cover larger requests.
 pub fn reserve_covers(size: usize) -> bool {
-    size <= RESERVE_CHUNK
+    size <= RESERVE_CHUNK / 4
 }
 
 /// The refusal itself: what was being sized, and how big it was.
