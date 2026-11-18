@@ -28,6 +28,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A JSON file of pretty-printed objects one after another, as `jq .`
+  writes them, was read a line at a time: two objects were six rows, and
+  two such files that differed compared as identical (exit 0). Its rows are
+  now its objects, as a JSON array's are, and so are several objects on one
+  line, where all but the first were dropped. A file read as
+  newline-delimited JSON (its first object on one line of its own) whose
+  later lines are not one object each is refused with the line and how to
+  rewrite it (`jq -c .`); a line that was not an object had been a row with
+  no key.
 - Where the system refuses a thread (a container's process limit, or a
   memory limit its stack counts against), the sortmerge and native engines
   and turbo's streaming join stopped with exit 101 ("failed to spawn

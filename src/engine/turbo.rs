@@ -50,7 +50,7 @@ use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 pub(crate) use text::refuse_non_text;
 use text::{
     KeyBudget, RowParser, Runs, csv_header, detect_delimiter, guard_span, in_order,
-    json_array_row_starts, json_header, json_is_array, json_later_keys, json_row_indent,
+    json_array_row_starts, json_framed, json_header, json_later_keys, json_row_indent,
     json_rows_match, json_rows_match_at, shared_tail, sniff_dialect,
 };
 
@@ -1886,7 +1886,7 @@ fn sweep_text(
         return Ok((Vec::new(), Vec::new()));
     }
     let dialect = side.slab.dialect();
-    if dialect == Dialect::Csv || (dialect == Dialect::Json && json_is_array(data)) {
+    if dialect == Dialect::Csv || (dialect == Dialect::Json && json_framed(data)) {
         let guessed = chunk_bounds(data, from, threads, dialect, false);
         if let Some(swept) = sweep_checked(side, keys, whole, &guessed, key_size, opt, sink)? {
             return Ok(swept);
@@ -2139,7 +2139,7 @@ fn chunk_bounds(
     let nominal: Vec<usize> = (1..threads)
         .map(|i| from + (end - from) * i / threads)
         .collect();
-    let array = dialect == Dialect::Json && json_is_array(data);
+    let array = dialect == Dialect::Json && json_framed(data);
     if array && counted {
         let mut bounds = vec![from];
         bounds.extend(
@@ -4007,7 +4007,7 @@ fn json_keys_after_the_first(
     opt: &Options,
 ) -> Result<(Vec<String>, usize)> {
     let data = slab.data();
-    let array = json_is_array(data);
+    let array = json_framed(data);
     let budget = || {
         KeyBudget::new(
             crate::memory::stated(opt.memory),
@@ -4173,8 +4173,16 @@ impl Input {
         slab.set_dialect(dialect);
         if dialect == Dialect::Json {
             let mut header = json_header(&slab, path)?;
-            let (later, objects) = json_keys_after_the_first(&slab, &header, rows, opt)
-                .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+            let (later, objects) =
+                json_keys_after_the_first(&slab, &header, rows, opt).map_err(|e| {
+                    // A file that is not what it is read as is the input's
+                    // fault, and is said so, not as an engine that failed.
+                    if e.is_input() {
+                        e.context(format!("{}: ", path.display()))
+                    } else {
+                        Error::new(format!("{}: {e}", path.display()))
+                    }
+                })?;
             header.extend(later);
             if header.is_empty() {
                 return Err(Error::new(format!(
@@ -4242,7 +4250,7 @@ impl Input {
                 }
                 let has = |n: &String| place.contains_key(n.as_str());
                 let json = slab.dialect() == Dialect::Json;
-                let array = json && json_is_array(slab.data());
+                let array = json && json_framed(slab.data());
                 let build = |names: &[&String]| -> RowParser {
                     if json {
                         RowParser::json(
@@ -4441,10 +4449,12 @@ pub fn shape(path: &Path, opt: &Options) -> Result<Shape> {
             columns: header,
         },
         Input::Text { slab, header, .. } => Shape {
-            format: if slab.dialect() == Dialect::Json {
-                "ndjson"
-            } else {
+            format: if slab.dialect() != Dialect::Json {
                 "csv"
+            } else if json_framed(slab.data()) {
+                "json"
+            } else {
+                "ndjson"
             },
             rows: None,
             columns: header,
@@ -4498,7 +4508,7 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
                 RowParser::json(
                     header.iter().cloned().map(Some).collect(),
                     0,
-                    json_is_array(slab.data()),
+                    json_framed(slab.data()),
                 )
             } else {
                 RowParser::csv(delimiter, (0..width).map(Some).collect())

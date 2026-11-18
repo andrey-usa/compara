@@ -789,6 +789,118 @@ fn chunk_boundaries_land_between_rows_of_a_pretty_json_array() {
     }
 }
 
+/// Rows as `jq .` writes them: one pretty-printed object after another, with
+/// no array around them, the same rows as [`nested_array`].
+fn nested_stream(rows: usize, indent: usize, odd: bool) -> String {
+    let pad = |level: usize| " ".repeat(level * indent);
+    let mut s = String::new();
+    for i in 0..rows {
+        let c = if odd && i % 1000 == 0 { 9 } else { i % 3 };
+        s.push_str(&format!(
+            "{{\n{p1}\"id\": {i},\n{p1}\"meta\": {{\n{p2}\"a\": {a},\n{p2}\"b\": [\n\
+             {p3}1,\n{p3}{{\n{p4}\"c\": {c}\n{p3}}}\n{p2}]\n{p1}}},\n{p1}\"v\": {v}\n}}\n",
+            p1 = pad(1),
+            p2 = pad(2),
+            p3 = pad(3),
+            p4 = pad(4),
+            a = i % 7,
+            v = i * 3,
+        ));
+    }
+    s
+}
+
+/// A stream of pretty-printed objects is its objects, not its lines. Read a
+/// line at a time, a two-object file was six rows and two such files that
+/// differed compared as identical, exit 0, with a column set that moved with
+/// the thread count. Unindented, every nested object opens at column 0 like a
+/// row, so the split guess is wrong and the check behind it has to catch it.
+#[test]
+fn a_stream_of_pretty_json_objects_is_read_as_its_objects() {
+    for indent in [2usize, 0] {
+        let rows = 120_000;
+        let a = nested_stream(rows, indent, false);
+        let b = nested_stream(rows, indent, true);
+        assert!(
+            a.len() > 8 << 20,
+            "fixture must exceed the chunking threshold"
+        );
+        let f = json_fixture(&a, &b);
+        for threads in [1usize, 2, 3, 4, 8] {
+            let mut opt = Options::with_key(["id"]);
+            opt.threads = Some(threads);
+            let r = compare(&f.a, &f.b, &mut opt).expect("compare");
+            let c = &r.counts;
+            assert_eq!(
+                (c.a_rows, c.b_rows, c.changed, c.added, c.removed),
+                (rows as i64, rows as i64, 120, 0, 0),
+                "indent {indent}, threads {threads}: {}",
+                serde_json::json!(r.counts)
+            );
+            let names: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, ["meta", "v"], "indent {indent}, threads {threads}");
+        }
+    }
+    // Several compact objects to a line are a stream too: the second and
+    // third on each line were dropped.
+    let line = |v: u8| {
+        (0..300)
+            .map(|i| format!("{{\"id\":{i},\"v\":{}}}", if i == 7 { v } else { 1 }))
+            .collect::<Vec<_>>()
+            .chunks(3)
+            .map(|c| c.join(" ") + "\n")
+            .collect::<String>()
+    };
+    let f = json_fixture(&line(1), &line(2));
+    let r = compare(&f.a, &f.b, &mut Options::with_key(["id"])).expect("compare");
+    assert_eq!(
+        (r.counts.a_rows, r.counts.b_rows, r.counts.changed),
+        (300, 300, 1)
+    );
+}
+
+/// A file read a line at a time whose lines are not one object each is
+/// refused with the line and what to do, not read as some other number of
+/// rows: a line that is not an object was a row with no key, and an object
+/// that ran onto the next line, or a second one on its line, lost rows.
+#[test]
+fn json_lines_that_are_not_one_object_each_are_refused() {
+    let good = "{\"id\":1,\"v\":\"x\"}\n{\"id\":2,\"v\":\"x\"}\n";
+    for (bad, said) in [
+        (
+            "{\"id\":1,\"v\":\"x\"}\nhello\n",
+            "line 2 (\"hello\") is not a JSON object",
+        ),
+        (
+            "{\"id\":1,\"v\":\"x\"}\n[2]\n",
+            "line 2 (\"[2]\") is not a JSON object",
+        ),
+        (
+            "{\"id\":1,\"v\":\"x\"}\n{\n \"id\": 2,\n \"v\": \"y\"\n}\n",
+            "line 2 (\"{\") runs onto",
+        ),
+        (
+            "{\"id\":1,\"v\":\"x\"}\n{\"id\":2,\"v\":[\n1]}\n",
+            "line 2 (\"{\\\"id\\\":2,\\\"v\\\":[\") runs onto",
+        ),
+        (
+            "{\"id\":1,\"v\":\"x\"}\n{\"id\":2} {\"id\":3}\n",
+            "follows an object on its line",
+        ),
+    ] {
+        let f = json_fixture(bad, good);
+        for threads in [1usize, 4] {
+            let mut opt = Options::with_key(["id"]);
+            opt.threads = Some(threads);
+            let err = compare(&f.a, &f.b, &mut opt).expect_err(bad);
+            let text = err.to_string();
+            assert!(err.is_input(), "{bad:?}: {text}");
+            assert!(text.contains(said), "{bad:?}: {text}");
+            assert!(text.contains("jq -c ."), "{bad:?}: {text}");
+        }
+    }
+}
+
 /// `changed` for one pair, at every thread count, so a proof that fires on one
 /// chunking and not another shows up.
 fn changed_json(a_body: &str, b_body: &str) -> i64 {

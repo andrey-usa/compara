@@ -13,8 +13,8 @@
 #[cfg(target_arch = "x86_64")]
 use super::field::Wide512;
 use super::field::{
-    ABSENT, Delims, Field, Scan, Swar, Wide, next_of1_with, next_of2, next_of2_with, next_of3_with,
-    pack, skip_quoted, skip_quoted_with,
+    ABSENT, Delims, Field, Scan, Swar, Wide, next_of1, next_of1_with, next_of2, next_of2_with,
+    next_of3_with, pack, skip_quoted, skip_quoted_with,
 };
 use super::slab::{Dialect, Slab, text_of};
 use crate::error::{Error, Result};
@@ -46,15 +46,36 @@ fn json_space(c: u8) -> bool {
     c == b' ' || c == b'\t' || c == b'\r' || c == b'\n'
 }
 
-/// Whether the file opens with a top-level `[`: the rows then sit inside a
-/// JSON array, and row boundaries answer to its brackets and separators.
-/// Only asked once per file, where the parser is built.
-pub(super) fn json_is_array(data: &[u8]) -> bool {
+/// Whether the file's rows are framed by their braces rather than by lines:
+/// a top-level `[` (the rows sit inside a JSON array, and row boundaries
+/// answer to its brackets and separators), or objects one after another that
+/// do not each keep to a line of their own -- `jq .` writes them so, one
+/// pretty-printed object after the next. Newline-delimited JSON closes its
+/// first object before that line ends and puts nothing after it there; read
+/// a line at a time, a stream of pretty objects was a row for every line, and
+/// two such files that differed compared as identical.
+///
+/// Decided by the first object, which is walked once: its own bytes, a row's
+/// worth. A later object that leaves its line in a file read line by line is
+/// refused by the key walk ([`json_later_keys`]).
+pub(super) fn json_framed(data: &[u8]) -> bool {
     let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
-    data.iter()
-        .take(64)
-        .find(|&&b| !json_space(b))
-        .is_some_and(|&b| b == b'[')
+    let Some(first) = data.iter().position(|&b| !json_space(b)) else {
+        return false;
+    };
+    match data[first] {
+        b'[' => true,
+        b'{' => {
+            let end = data.len();
+            let close = skip_json_nested(Swar, data, first, end);
+            let line_end = next_of1(data, first, end, b'\n');
+            line_end < close
+                || data[close..line_end.min(end)]
+                    .iter()
+                    .any(|&b| !json_space(b))
+        }
+        _ => false,
+    }
 }
 
 /// Guesses the delimiter from the header line, defaulting to a comma.
@@ -402,6 +423,12 @@ fn starts_with_short(data: &[u8], text: &[u8]) -> bool {
 /// string, compared with the name the first object had at that place (the
 /// common case, and then nothing more is asked of it), and its value is
 /// skipped whatever it is. `lo` must be the start of a row.
+///
+/// It is also the one walk over every row before the comparison, so it says
+/// where a file is not the JSON it is read as: a row that is not an object,
+/// and, read a line at a time, an object that runs onto the next line or has
+/// more after it on its own. The row parser reads each of those as some other
+/// number of rows than the file holds.
 pub(super) fn json_later_keys(
     slab: &Slab,
     lo: usize,
@@ -452,23 +479,38 @@ pub(super) fn json_later_keys(
             break;
         }
         if data[pos] != b'{' {
-            // Not an object: the comparison passes over the line too.
-            let next = end_of_json_row(scan, data, pos, end, array, false);
-            pos = if next > pos { next } else { pos + 1 };
-            continue;
+            return Err(not_a_row(data, pos, "is not a JSON object", array));
         }
         rows += 1;
+        let row = pos;
         pos += 1;
+        let mut closed = false;
+        // A line feed met between the object's tokens: newline-delimited
+        // JSON has none, and outside its strings that is the only place
+        // one can be (a scalar ends at one, a nested value is searched).
+        let mut lines = false;
         let mut member = 0usize; // the place of this key in the first object
         loop {
-            while pos < end && (json_space(data[pos]) || data[pos] == b',') {
+            // Compact ndjson separates members with a bare `,"`, which goes
+            // straight to the next key, as it does in the row parser.
+            if pos + 1 < end && data[pos] == b',' && data[pos + 1] == b'"' {
                 pos += 1;
+            } else {
+                while pos < end {
+                    match data[pos] {
+                        b',' | b' ' | b'\t' | b'\r' => {}
+                        b'\n' => lines = true,
+                        _ => break,
+                    }
+                    pos += 1;
+                }
             }
             if pos >= end {
                 break;
             }
             if data[pos] == b'}' {
                 pos += 1;
+                closed = true;
                 break;
             }
             if data[pos] != b'"' {
@@ -481,7 +523,7 @@ pub(super) fn json_later_keys(
                 && !json_space(data[pos + text.len()])
             {
                 member += 1;
-                pos = json_value_end(scan, data, pos + text.len(), end);
+                pos = json_value_end_lines(scan, data, pos + text.len(), end, &mut lines);
                 continue;
             }
             let key_from = pos + 1;
@@ -491,14 +533,24 @@ pub(super) fn json_later_keys(
             }
             let key = &data[key_from..key_end - 1];
             pos = key_end;
-            while pos < end && json_space(data[pos]) {
+            while pos < end {
+                match data[pos] {
+                    b' ' | b'\t' | b'\r' => {}
+                    b'\n' => lines = true,
+                    _ => break,
+                }
                 pos += 1;
             }
             if pos >= end || data[pos] != b':' {
                 break;
             }
             pos += 1;
-            while pos < end && json_space(data[pos]) {
+            while pos < end {
+                match data[pos] {
+                    b' ' | b'\t' | b'\r' => {}
+                    b'\n' => lines = true,
+                    _ => break,
+                }
                 pos += 1;
             }
             if pos >= end {
@@ -533,12 +585,79 @@ pub(super) fn json_later_keys(
                 }
             }
             member += 1;
-            pos = json_value_end(scan, data, pos, end);
+            pos = json_value_end_lines(scan, data, pos, end, &mut lines);
+        }
+        if !array && closed {
+            // A line is a row: the object closes on the line it opens, with
+            // nothing after it there but space.
+            if lines {
+                return Err(not_a_row(data, row, "runs onto the next line", false));
+            }
+            let line_end = next_of1_with(scan, data, pos, end, b'\n');
+            if let Some(at) = data[pos..line_end].iter().position(|&b| !json_space(b)) {
+                return Err(not_a_row(
+                    data,
+                    pos + at,
+                    "follows an object on its line",
+                    false,
+                ));
+            }
+            pos = line_end.saturating_add(1);
+            continue;
         }
         let next = end_of_json_row(scan, data, pos.min(end), end, array, false);
         pos = if next > pos { next } else { pos + 1 };
     }
     Ok((in_order(later), rows))
+}
+
+/// [`json_value_end`], noting in `lines` a line feed inside a nested value.
+/// Only a nested value is searched: a string cannot hold one, and a number or
+/// a literal ends at one, which the walk then steps over as space.
+#[inline(always)]
+fn json_value_end_lines<S: Scan>(
+    scan: S,
+    d: &[u8],
+    mut at: usize,
+    end: usize,
+    lines: &mut bool,
+) -> usize {
+    if at >= end {
+        return end;
+    }
+    match d[at] {
+        b'"' => skip_json_string(scan, d, at, end).0,
+        b'{' | b'[' => {
+            let to = skip_json_nested(scan, d, at, end);
+            *lines |= next_of1_with(scan, d, at, to, b'\n') < to;
+            to
+        }
+        _ => {
+            while at < end && !matches!(d[at], b',' | b'}' | b']' | b'\n') && !json_gap(d[at]) {
+                at += 1;
+            }
+            at
+        }
+    }
+}
+
+/// A row the reader cannot take as one, said with its line and what to do.
+/// Only on the way out: the line is counted from the start of the file.
+#[cold]
+#[inline(never)]
+fn not_a_row(data: &[u8], at: usize, what: &str, framed: bool) -> Error {
+    let line = 1 + data[..at].iter().filter(|&&b| b == b'\n').count();
+    let shown: String = String::from_utf8_lossy(&data[at..data.len().min(at + 32)])
+        .chars()
+        .take_while(|&c| c != '\n' && c != '\r')
+        .collect();
+    let how = if framed {
+        "every row of a JSON array or stream of objects is an object"
+    } else {
+        "the first object is on one line of its own, so the file is read as newline-delimited \
+         JSON, one object a line; rewrite it so with jq -c . FILE"
+    };
+    Error::input(format!("line {line} ({shown:?}) {what}: {how}"))
 }
 
 /// The names of a map from name to the place it was first met, in that order.
@@ -573,27 +692,30 @@ fn skip_json_string<S: Scan>(scan: S, data: &[u8], mut at: usize, end: usize) ->
     }
 }
 
-/// The column of a top-level array's first object: how far its `{` sits from
-/// the start of its line, when nothing but spaces precede it there. A
-/// pretty-printer indents every row of the array alike and anything nested in
+/// The column of a framed file's first object: how far its `{` sits from the
+/// start of its line, when nothing but spaces precede it there. A
+/// pretty-printer indents every row of an array alike and anything nested in
 /// a row further, so a line opening an object at this column is most likely a
-/// row. `None` when the array is not laid out a row per line (`[{` on one line).
+/// row; a stream of objects starts each at the line's start. `None` when the
+/// rows are not laid out one per line (`[{` on one line).
 pub(super) fn json_row_indent(data: &[u8]) -> Option<usize> {
     let mut pos = usize::from(data.starts_with(b"\xEF\xBB\xBF")) * 3;
     while pos < data.len() && json_space(data[pos]) {
         pos += 1;
     }
-    if pos >= data.len() || data[pos] != b'[' {
-        return None;
-    }
-    pos += 1;
-    while pos < data.len() && json_space(data[pos]) {
+    if pos < data.len() && data[pos] == b'[' {
         pos += 1;
+        while pos < data.len() && json_space(data[pos]) {
+            pos += 1;
+        }
     }
     if pos >= data.len() || data[pos] != b'{' {
         return None;
     }
-    let line = data[..pos].iter().rposition(|&b| b == b'\n')? + 1;
+    let line = data[..pos]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |at| at + 1);
     data[line..pos]
         .iter()
         .all(|&b| b == b' ' || b == b'\t')
@@ -1114,8 +1236,9 @@ pub(super) enum RowParser {
         /// member after slot `i` is tried as `i + 1` first, and a right guess
         /// has to give exactly the slot the table would.
         canon: Vec<i32>,
-        /// The file wraps its rows in a top-level array: `[`, `]` and the `,`
-        /// separators are container syntax, and an object can span lines.
+        /// The file frames its rows by their braces ([`json_framed`]): a
+        /// top-level array, whose `[`, `]` and `,` separators are container
+        /// syntax, or a stream of objects; either way an object can span lines.
         /// ndjson keeps the plain one-memchr row end -- it is most of the
         /// JSON this reader ever sees, and the container walk costs it
         /// three quarters again of a sweep.
@@ -2583,8 +2706,10 @@ fn end_of_array_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize, open:
     }
     // Between rows a top-level array puts its own bytes: the `,` separator,
     // which the next object follows on the same line or a later one, and the
-    // closing `]`, after which there are no more rows. Anything else ends at
-    // the next newline, exactly as a bare ndjson row always has.
+    // closing `]`, after which there are no more rows. A stream of objects
+    // puts nothing but space: the next `{` is the next row, on this line or
+    // another. Anything else ends at the next newline, exactly as a bare
+    // ndjson row always has.
     let mut cur = at;
     while cur < end && json_space(data[cur]) {
         cur += 1;
@@ -2602,6 +2727,8 @@ fn end_of_array_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize, open:
         }
     } else if cur < end && data[cur] == b']' {
         return end;
+    } else if cur < end && data[cur] == b'{' {
+        return cur;
     }
     let stop = next_of1_with(scan, data, at, end, b'\n');
     if stop >= end { end } else { stop + 1 }
@@ -2984,6 +3111,35 @@ mod tests {
     }
 
     #[test]
+    fn rows_are_framed_by_braces_unless_the_first_object_keeps_to_its_line() {
+        // Read a line at a time: the first object closes on its line, alone.
+        for lines in [
+            "{\"a\":1}\n{\n\"a\":2}\n",
+            "\u{feff}  {\"a\":{\"b\":[1,2]}}  \r\n",
+            "{\"a\":\"} {\"}\n",
+            "{\"a\":1}",
+            "",
+            "id,v\n1,2\n",
+        ] {
+            assert!(!json_framed(lines.as_bytes()), "{lines:?}");
+        }
+        // Framed by braces: an array, an object over lines, two on a line.
+        for framed in [
+            "[{\"a\":1}]",
+            "\n [\n{\"a\":1}\n]",
+            "{\n  \"a\": 1\n}\n{\n  \"a\": 2\n}\n",
+            "{\"a\":[\n1]}\n",
+            "{\"a\":1} {\"a\":2}\n",
+            "{\"a\":1}{\"a\":2}",
+        ] {
+            assert!(json_framed(framed.as_bytes()), "{framed:?}");
+        }
+        assert_eq!(json_row_indent(b"{\n  \"a\": 1\n}\n"), Some(0));
+        assert_eq!(json_row_indent(b"[\n  {\"a\": 1}\n]"), Some(2));
+        assert_eq!(json_row_indent(b"[{\"a\": 1}]"), None);
+    }
+
+    #[test]
     fn an_array_of_objects_one_per_line_reads_like_ndjson() {
         let ndjson = "{\"k\":\"a\",\"v\":1}\n{\"k\":\"b\",\"v\":2}\n";
         let array = "[\n{\"k\":\"a\",\"v\":1},\n{\"k\":\"b\",\"v\":2}\n]\n";
@@ -3030,7 +3186,9 @@ mod tests {
         );
         assert_eq!(json_row_indent(data), Some(2));
         assert_eq!(json_row_indent(b"[{\"k\":1}]"), None);
-        assert_eq!(json_row_indent(b"{\"k\":1}\n"), None);
+        // A stream's rows start at their line's start; only a file framed by
+        // braces asks (newline-delimited JSON has a row a line).
+        assert_eq!(json_row_indent(b"{\"k\":1}\n"), Some(0));
     }
 
     #[test]
