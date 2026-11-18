@@ -57,6 +57,9 @@ import duckdb
 a, b, fmt, key, ignore = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4].split(","), sys.argv[5]
 t0 = time.perf_counter()
 con = duckdb.connect()
+# Its progress bar, drawn for a query that runs a few seconds, goes to stdout
+# and ran into the result line the harness reads.
+con.execute("SET enable_progress_bar = false")
 if fmt == "csv":
     # A CSV row has no number in DuckDB until it is in a table: load each
     # file once, then take each key's first row by rowid, which is file order.
@@ -238,6 +241,16 @@ def contender(name, binary, a, b, fmt, work, memory_max=None):
     return cmd, (out_json if name == "compara" else None)
 
 
+def last_result(out, name, fmt):
+    """The result a Python contender prints last. Text a library writes to
+    stdout without a line break (DuckDB's progress bar) can come before it on
+    the same line, so the result is read from where it starts."""
+    at = out.rfind('{"wall_s"')
+    if at < 0:
+        sys.exit(f"{name} printed no result on {fmt}: {out[-500:]}")
+    return json.loads(out[at:].splitlines()[0])
+
+
 def bench(args, fmt, a, b):
     """Every tool on one pair, in interleaved rounds. A tool the kernel kills
     for memory (SIGKILL) is recorded as out of memory, with how much it held,
@@ -275,7 +288,7 @@ def bench(args, fmt, a, b):
             else:
                 if code != 0:
                     sys.exit(f"{n} failed on {fmt} (exit {code}): {err}")
-                r = json.loads(out.strip().splitlines()[-1])
+                r = last_result(out, n, fmt)
                 wall = r["wall_s"]
                 counts[n] = r["counts"]
             runs[n].append({"wall_s": round(wall, 3), "cpu_s": round(cpu, 3), "peak_rss_mb": round(rss),
