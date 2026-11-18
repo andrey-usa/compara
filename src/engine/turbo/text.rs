@@ -281,6 +281,10 @@ pub(super) struct KeyBudget {
     /// What set a `limit` below the ceiling, and what to do about it, for the
     /// refusal to say.
     from: &'static str,
+    /// Shared by pieces of a file: a piece that finds it spent stops and
+    /// hands back the names it has, for the file's walk to judge them all
+    /// together, rather than refusing on its own count.
+    pieces: bool,
 }
 
 impl KeyBudget {
@@ -305,18 +309,45 @@ impl KeyBudget {
             limit: limit as usize,
             used: AtomicUsize::new(0),
             from,
+            pieces: false,
         }
     }
 
-    /// Takes room for one more name of `bytes`, or refuses once the file's
-    /// names, on every thread together, would pass the ceiling.
-    fn take(&self, bytes: usize) -> Result<()> {
-        let cost = bytes.saturating_add(NAME_OVERHEAD);
-        let before = self.used.fetch_add(cost, Ordering::Relaxed);
-        if before.saturating_add(cost) <= self.limit {
-            return Ok(());
+    /// The same budget, shared by the pieces of one file walked at once.
+    pub(super) fn for_pieces(self) -> KeyBudget {
+        KeyBudget {
+            pieces: true,
+            ..self
         }
-        Err(Error::new(format!(
+    }
+
+    /// What a name of `bytes` is charged.
+    pub(super) fn cost(bytes: usize) -> usize {
+        bytes.saturating_add(NAME_OVERHEAD)
+    }
+
+    /// Whether names that together cost `total` pass the ceiling.
+    pub(super) fn exceeded_by(&self, total: usize) -> bool {
+        total > self.limit
+    }
+
+    /// Whether the names taken so far, on every thread together, passed the
+    /// ceiling.
+    pub(super) fn spent(&self) -> bool {
+        self.exceeded_by(self.used.load(Ordering::Relaxed))
+    }
+
+    /// Takes room for one more name of `bytes`; false once the file's names,
+    /// on every thread together, would pass the ceiling.
+    fn take(&self, bytes: usize) -> bool {
+        let cost = KeyBudget::cost(bytes);
+        let before = self.used.fetch_add(cost, Ordering::Relaxed);
+        !self.exceeded_by(before.saturating_add(cost))
+    }
+
+    /// The error for a file whose names pass the ceiling.
+    pub(super) fn refusal(&self) -> Error {
+        Error::new(format!(
             "the objects of this JSON file hold more than {} of different keys between them{}: \
              they are not the rows of one table{}",
             mb(self.limit),
@@ -326,7 +357,7 @@ impl KeyBudget {
             } else {
                 ", or need more memory than that"
             }
-        )))
+        ))
     }
 }
 
@@ -407,7 +438,7 @@ pub(super) fn json_later_keys(
     let mut later: HashMap<String, usize> = HashMap::new();
     let mut rows = 0usize;
     let mut pos = lo;
-    while pos < end && rows < max_rows {
+    'rows: while pos < end && rows < max_rows {
         while pos < end && json_space(data[pos]) {
             pos += 1;
         }
@@ -487,9 +518,18 @@ pub(super) fn json_later_keys(
                 if !seen.contains(name.as_str()) && !later.contains_key(&name) {
                     // The names are the one thing here that grows with a
                     // hostile file, so they have a ceiling of their own.
-                    budget.take(name.len())?;
+                    let room = budget.take(name.len());
+                    if !room && !budget.pieces {
+                        return Err(budget.refusal());
+                    }
                     let at = later.len();
                     later.insert(name, at);
+                    // A piece keeps the name that did not fit, so the names
+                    // the pieces hand back, counted once each, pass the
+                    // ceiling where the file's own do.
+                    if !room {
+                        break 'rows;
+                    }
                 }
             }
             member += 1;

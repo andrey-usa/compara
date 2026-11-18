@@ -41,7 +41,7 @@ mod slab;
 mod text;
 mod thrift;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -4008,14 +4008,20 @@ fn json_keys_after_the_first(
 ) -> Result<(Vec<String>, usize)> {
     let data = slab.data();
     let array = json_is_array(data);
-    let budget = KeyBudget::new(
-        crate::memory::stated(opt.memory),
-        crate::memory::heap_limit(),
-    );
+    let budget = || {
+        KeyBudget::new(
+            crate::memory::stated(opt.memory),
+            crate::memory::heap_limit(),
+        )
+    };
     if rows != usize::MAX {
-        return json_later_keys(slab, 0, data.len(), array, first, rows, &budget);
+        return json_later_keys(slab, 0, data.len(), array, first, rows, &budget());
     }
     let bounds = chunk_bounds(data, 0, opt.thread_budget(), Dialect::Json, true);
+    if bounds.len() <= 2 {
+        return json_later_keys(slab, 0, data.len(), array, first, usize::MAX, &budget());
+    }
+    let shared = budget().for_pieces();
     let found = in_parallel(bounds.len() - 1, |i| {
         json_later_keys(
             slab,
@@ -4024,9 +4030,44 @@ fn json_keys_after_the_first(
             array,
             first,
             usize::MAX,
-            &budget,
+            &shared,
         )
     });
+    // Each piece holds, and is charged for, the names new to it, so a name
+    // that is in every piece is charged once a piece: were a piece to refuse
+    // on that count, whether a file is refused would depend on the cores
+    // reading it, and a sparse table compared on four would be refused on
+    // sixteen. So a piece that finds the budget spent stops, and the names
+    // the pieces found are counted once each. If those alone pass the
+    // ceiling, so do the file's, and it is refused as one thread would refuse
+    // it. If not, the pieces ran out only on the names they share: they are
+    // let go and the file walked again as one piece, each name held and
+    // charged once. Either way the answer is the one a single thread gives.
+    if shared.spent() {
+        let mut once: HashSet<String> = HashSet::new();
+        let mut total = 0usize;
+        let mut failed = false;
+        for piece in found {
+            let Ok((names, _)) = piece else {
+                failed = true;
+                continue;
+            };
+            for name in names {
+                let cost = KeyBudget::cost(name.len());
+                if once.insert(name) {
+                    total += cost;
+                }
+            }
+        }
+        // A piece that failed for another reason may have failed before a
+        // single thread would have met the ceiling: the walk as one piece
+        // says which comes first.
+        if !failed && shared.exceeded_by(total) {
+            return Err(shared.refusal());
+        }
+        drop(once);
+        return json_later_keys(slab, 0, data.len(), array, first, usize::MAX, &budget());
+    }
     // Each name moves from its piece into the map, or is dropped there as one
     // an earlier piece had: never copied.
     let mut later: HashMap<String, usize> = HashMap::new();

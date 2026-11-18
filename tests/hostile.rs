@@ -455,6 +455,47 @@ fn a_json_file_s_key_names_have_one_budget_across_threads() {
     );
 }
 
+/// Whether a JSON file's later key names fit their budget does not depend
+/// on the thread count. Each thread's piece holds the names new to it, so a
+/// name in every piece was charged once a piece: this sparse table, a
+/// thousand names of a kilobyte (1.1 MB held once) in each of four pieces,
+/// compared at --threads 1 and was refused at 4 under a 4 MB budget.
+#[test]
+fn a_json_file_s_key_names_get_one_answer_at_every_thread_count() {
+    let pad = "Q".repeat(1000);
+    let mut text = String::new();
+    for i in 0..8000 {
+        text.push_str(&format!("{{\"id\":{i},\"{pad}{}\":1}}\n", i % 1000));
+    }
+    assert!(
+        text.len() > 4 << 20,
+        "{} bytes: too few to split",
+        text.len()
+    );
+    let file = Scratch::new("names-every-piece.ndjson", text.as_bytes());
+    for threads in ["1", "4"] {
+        let out = Command::new(BIN)
+            .args([
+                "compare",
+                "-k",
+                "id",
+                "--threads",
+                threads,
+                "--memory",
+                "16M",
+            ])
+            .args([&file.0, &file.0])
+            .output()
+            .expect("run compara");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "--threads {threads}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// A table of twenty thousand columns is compared in the time its bytes
 /// take: each column's name used to be searched for in the list of all of
 /// them, at five places, so the time grew with the square of the width (17
