@@ -55,11 +55,17 @@ def size(rows):
     return rows.upper() if isinstance(rows, str) else f"{rows:,}"
 
 
+def memory(r):
+    """Peak RSS, and the private part of it where the run sampled it (results before it did not)."""
+    own = r.get("peak_private_mb")
+    return f"{r['peak_rss_mb']:,} MB" + (f" ({own:,} private)" if own is not None else "")
+
+
 def cell(r, best):
     if r.get("failed"):
         return f"{r['failed']} after {r['wall_s']:.0f} s, at {r['peak_rss_mb']:,} MB"
     wall = f"{r['wall_s']:.2f} s"
-    return f"{'**' + wall + '**' if best else wall} · {r['cpu_s']:.1f} s · {r['peak_rss_mb']:,} MB"
+    return f"{'**' + wall + '**' if best else wall} · {r['cpu_s']:.1f} s · {memory(r)}"
 
 
 def label(inp):
@@ -108,15 +114,16 @@ def main():
                                                          if n in rs else "not run" for n in names) + " |")
         for key, what_, fmt in (("wall_s", "wall time", lambda x: f"{x:.2f} s"),
                                 ("cpu_s", "CPU time", lambda x: f"{x:.1f} s"),
-                                ("peak_rss_mb", "peak memory", lambda x: f"{x:,} MB")):
-            mine = rs["compara"][key]
-            for n in done[1:] if done and done[0] == "compara" else []:
-                if rs[n][key] < mine * (1 - TIE):
+                                ("peak_rss_mb", "peak memory", lambda x: f"{x:,} MB"),
+                                ("peak_private_mb", "peak private memory", lambda x: f"{x:,} MB")):
+            mine = rs["compara"].get(key)
+            for n in done[1:] if done and done[0] == "compara" and mine is not None else []:
+                if rs[n].get(key) is not None and rs[n][key] < mine * (1 - TIE):
                     losses.append(f"{what_} on {label(inp)}: {NAMES[n]} {fmt(rs[n][key])}, compara {fmt(mine)}")
     loss_line = ("Where another tool did better in this run (by more than 2%): " + "; ".join(losses) + "."
                  if losses else "No other tool did better than compara by more than 2% on any measure in this run.")
-    note = ("Each cell: wall time, best of {runs} · CPU time (user and system) · peak memory, of the best "
-            "run; fastest in bold. DuckDB and Polars run from Python, and their time starts at their first "
+    note = ("Each cell: wall time, best of {runs} · CPU time (user and system) · peak memory (RSS, and "
+            "in brackets the private part of it), of the best run; fastest in bold. DuckDB and Polars run from Python, and their time starts at their first "
             "read, after the interpreter's start and the import; qsv is a binary and is timed as a whole process, like compara, runs on CSV only, and is given the files with the ignored column and the repeated keys already taken out (the page says how). A tool the runner's kernel stopped for "
             "lack of memory says so.").format(runs=doc["runs"])
 
@@ -137,7 +144,7 @@ def main():
         for n in (n for n in names if n in inp["tools"]):
             r = inp["tools"][n]
             every = cell(r, False) if r.get("failed") else "; ".join(
-                f"{x['wall_s']:.2f} s · {x['cpu_s']:.1f} s · {x['peak_rss_mb']:,} MB" for x in r["runs"])
+                f"{x['wall_s']:.2f} s · {x['cpu_s']:.1f} s · {memory(x)}" for x in r["runs"])
             runs.append(f"| {label(inp)} | {NAMES[n]} | {every} |")
     gate = "; ".join(
         f"{label(inp)}: " + ", ".join(f"{v_:,} {k}" for k, v_ in inp["tools"]["compara"]["counts"].items())
@@ -153,8 +160,11 @@ def main():
             + (f" qsv {ver['qsv']} is its release binary, as downloaded in the run." if v.get("qsv") else ""), "",
             "## Method", "",
             "Each pair is written by `compara-gen-data` (seed 7) in each format, and every tool reads the "
-            "same files. Each tool runs in a process of its own; CPU time and peak memory are that "
-            "process's (`wait4`). Each tool computes what compara does: values compared as text in CSV and "
+            "same files. Each tool runs in a process of its own; CPU time and peak RSS are that "
+            "process's (`wait4`). Peak RSS counts the pages of files a tool maps, which the kernel can drop "
+            "and read again under memory pressure: compara maps both inputs, so most of its RSS is the "
+            "files themselves. The private part is the tool's own memory (heap, stacks; `RssAnon` of its "
+            "process tree, sampled every 5 ms, so a lower bound), what a container limit has to leave it. Each tool computes what compara does: values compared as text in CSV and "
             "by value in Parquet, an empty field equal only to an empty field, and a key that appears "
             "twice in a file compared by its first row. DuckDB reads Parquet where it is (`read_parquet`, "
             "its row numbers from the file) and loads each CSV into a table once, for a row order to take "
@@ -178,8 +188,9 @@ def main():
         open(opts["--page"], "w").write("\n".join(page))
     lose = ["# Where compara is not ahead", "", f"Numbers: {link}, {date}.", "",
             "Each measure of the benchmarks on which another tool beat compara in this run by more than "
-            "2%, read from its results: wall time, CPU time and peak memory, on each input. Closer than "
-            "that is a tie.", ""]
+            "2%, read from its results: wall time, CPU time, peak memory and, where the run sampled it, "
+            "peak private memory, on each input. Closer than that is a tie. Peak memory counts the input "
+            "files compara maps, which the kernel can drop; private memory is what the tool holds itself.", ""]
     lose += [f"- {x[0].upper() + x[1:]}." for x in losses] or ["- None in this run."]
     if "--losses" in opts:
         open(opts["--losses"], "w").write("\n".join(lose) + "\n")

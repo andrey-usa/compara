@@ -14,7 +14,7 @@ Each contender gets compara's semantics: values compared as text in CSV and
 by value in Parquet, an empty field equal only to an empty field, and a key
 that appears twice in one file compared by its first row. Each run is a
 process of its own; wall is the best of --runs, and that run's CPU (user +
-system) and peak RSS go beside it. DuckDB and Polars run from Python with
+system), peak RSS and peak private memory (RssAnon, sampled) go beside it. DuckDB and Polars run from Python with
 the fastest way found for each (every core; DuckDB reads Parquet where it
 is and loads CSV once; Polars' lazy API, which its streaming engine did not
 beat here); their wall is timed
@@ -45,6 +45,7 @@ import re
 import platform
 import subprocess
 import sys
+import threading
 import time
 
 KEY = ["account_id", "txn_id"]
@@ -104,18 +105,62 @@ print(json.dumps({"wall_s": wall, "counts": {k: int(v) for k, v in r.items()}}))
 """
 
 
+def tree(pid):
+    """pid and every process below it (sudo and systemd-run sit above the tool under --memory-max)."""
+    out, todo = [], [pid]
+    while todo:
+        p = todo.pop()
+        out.append(p)
+        try:
+            for t in os.listdir(f"/proc/{p}/task"):
+                todo += [int(c) for c in open(f"/proc/{p}/task/{t}/children").read().split()]
+        except OSError:
+            pass
+    return out
+
+
+def private_kb(pids):
+    """RssAnon summed over pids: the pages a process holds that are its own (heap, stacks,
+    anonymous maps). Peak RSS also counts the pages of files it maps, which the kernel can
+    drop and read again: compara maps its inputs, so its RSS is mostly the files."""
+    total = 0
+    for p in pids:
+        try:
+            for line in open(f"/proc/{p}/status"):
+                if line.startswith("RssAnon:"):
+                    total += int(line.split()[1])
+                    break
+        except OSError:
+            pass
+    return total
+
+
 def run_one(cmd, work):
     """One run of cmd in a process of its own: exit code, wall, CPU (user +
-    system) and peak RSS in MB of that process alone (wait4), and its stdout."""
+    system) and peak RSS in MB of that process alone (wait4), peak private
+    memory in MB (RssAnon of its process tree, sampled every 5 ms from a
+    thread of this harness: a lower bound, since a peak shorter than a sample
+    can be missed), and its stdout."""
     out_path = os.path.join(work, "run.out")
+    peak = [0]
     with open(out_path, "w") as out, open(os.path.join(work, "run.err"), "w") as err:
         t0 = time.perf_counter()
         p = subprocess.Popen(cmd, stdout=out, stderr=err)
+        done = threading.Event()
+
+        def sample():
+            while not done.wait(0.005):
+                peak[0] = max(peak[0], private_kb(tree(p.pid)))
+
+        sampler = threading.Thread(target=sample, daemon=True)
+        sampler.start()
         _, status, ru = os.wait4(p.pid, 0)
         wall = time.perf_counter() - t0
+        done.set()
+        sampler.join()
     p.returncode = os.waitstatus_to_exitcode(status)
     text = open(out_path).read()
-    return p.returncode, wall, ru.ru_utime + ru.ru_stime, ru.ru_maxrss / 1024, text
+    return p.returncode, wall, ru.ru_utime + ru.ru_stime, ru.ru_maxrss / 1024, peak[0] / 1024, text
 
 
 def compara_cmd(binary, a, b, out_json):
@@ -212,7 +257,7 @@ def bench(args, fmt, a, b):
             if n in failed:
                 continue
             cmd, out_json = cmds[n]
-            code, wall, cpu, rss, out = run_one(cmd, args.work)
+            code, wall, cpu, rss, anon, out = run_one(cmd, args.work)
             err = open(os.path.join(args.work, "run.err")).read()[-2000:]
             if code in (-9, 137) and n != "compara":
                 failed[n] = {"failed": "out of memory", "peak_rss_mb": round(rss), "wall_s": round(wall, 3)}
@@ -233,8 +278,10 @@ def bench(args, fmt, a, b):
                 r = json.loads(out.strip().splitlines()[-1])
                 wall = r["wall_s"]
                 counts[n] = r["counts"]
-            runs[n].append({"wall_s": round(wall, 3), "cpu_s": round(cpu, 3), "peak_rss_mb": round(rss)})
-            print(f"{fmt} run {i + 1} {n}: {wall:.2f} s wall, {cpu:.2f} s CPU, {rss:.0f} MB, {counts[n]}", flush=True)
+            runs[n].append({"wall_s": round(wall, 3), "cpu_s": round(cpu, 3), "peak_rss_mb": round(rss),
+                            "peak_private_mb": round(anon)})
+            print(f"{fmt} run {i + 1} {n}: {wall:.2f} s wall, {cpu:.2f} s CPU, {rss:.0f} MB ({anon:.0f} private), "
+                  f"{counts[n]}", flush=True)
     results = {}
     for n in names:
         if n in failed:
