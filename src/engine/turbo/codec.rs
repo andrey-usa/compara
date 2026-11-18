@@ -84,11 +84,24 @@ pub(crate) fn decompress(codec: Codec, input: &[u8], expected: usize) -> Result<
         // Into a buffer of exactly the size the header gives, which zstd will
         // not write past: a few kilobytes of zstd can expand to gigabytes, and
         // decode_all would have produced all of them before the length check.
+        //
+        // The context is zstd's own allocation, from the C allocator, and
+        // `Decompressor::new` panics where it is refused: under a heap limit
+        // that read "error: internal: zstd returned null pointer". Asked for
+        // here, it is refused like the buffer.
         Codec::Zstd => {
             let mut out = crate::alloc::sized(expected, "a decompressed Parquet page")?;
-            zstd::bulk::Decompressor::new()
-                .and_then(|mut d| d.decompress_to_buffer(input, &mut out))
-                .map_err(|e| Error::new(format!("a zstd Parquet page will not decode: {e}")))?;
+            let mut context = zstd::zstd_safe::DCtx::try_create().ok_or_else(|| {
+                Error::out_of_memory(
+                    "out of memory: a zstd decompression context needs about 100 KB",
+                )
+            })?;
+            context.decompress(&mut out, input).map_err(|code| {
+                Error::new(format!(
+                    "a zstd Parquet page will not decode: {}",
+                    zstd::zstd_safe::get_error_name(code)
+                ))
+            })?;
             out
         }
     };
