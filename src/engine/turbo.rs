@@ -600,6 +600,146 @@ fn append_in_parallel<T: Copy + Send>(out: &mut Vec<T>, parts: Vec<Vec<T>>) -> R
     Ok(())
 }
 
+/// Slots in the key index for `rows` rows: a power of two at about a two-thirds
+/// load, at least four thousand (see [`RowIndex::build`] for why).
+fn table_slots(rows: usize) -> usize {
+    let mut cap: usize = 1 << 12;
+    while cap * 2 < rows.saturating_mul(3).saturating_add(16) {
+        cap <<= 1;
+    }
+    cap
+}
+
+/// The heap one side's key index reserves for `rows` rows, at the least: an
+/// offset (8 bytes), a hash (4), a first row (4) and a count (4) per row, and a
+/// 4-byte slot per table entry. The report, the changed cells and the sweep's
+/// own buffers come on top, so a pair this says does not fit cannot.
+fn index_bytes(rows: u64) -> u64 {
+    rows.saturating_mul(20)
+        .saturating_add((table_slots(rows as usize) as u64).saturating_mul(4))
+}
+
+/// Refuses, as out of memory, a pair whose two key indexes alone need more
+/// than `heap`; `about` says whether the other side's count is an estimate.
+fn refuse_over(heap: u64, rows: u64, theirs: u64, about: &str) -> Result<()> {
+    let need = index_bytes(rows).saturating_add(index_bytes(theirs));
+    if need <= heap {
+        return Ok(());
+    }
+    Err(Error::out_of_memory(format!(
+        "out of memory: indexing {} rows here and {about}{} in the other file needs at least {}",
+        grouped(rows),
+        grouped(theirs),
+        crate::source::human(need)
+    )))
+}
+
+/// No side has finished its sweep yet.
+const UNCOUNTED: u64 = u64::MAX;
+
+/// For the in-memory join under a heap limit (a container's, or `ulimit -d`).
+/// Both files are swept at once, and the second sweep to finish has both row
+/// counts: before its index takes any memory, it checks what the two indexes
+/// reserve at the least against the heap, and a pair that cannot fit is refused
+/// as out of memory there, so `--engine auto` goes to the engine that spills to
+/// disk without building an index it must throw away. The counts are exact, so
+/// a refused pair is one whose indexes could not have been built. The first
+/// side to finish records its count and builds while the other still reads.
+fn fits_counted(
+    heap: Option<u64>,
+    first: &AtomicU64,
+) -> Option<impl Fn(usize) -> Result<()> + Sync + '_> {
+    let heap = heap?;
+    Some(move |rows: usize| {
+        let rows = rows as u64;
+        match first.compare_exchange(UNCOUNTED, rows, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(()),
+            Err(theirs) => refuse_over(heap, rows, theirs, ""),
+        }
+    })
+}
+
+/// Windows read from each file to estimate its line count, and their size.
+const LINE_WINDOWS: usize = 32;
+const LINE_WINDOW: usize = 64 << 10;
+
+/// About how many lines `text` has, from `LINE_WINDOWS` windows spread evenly
+/// across it (the whole of a small file): a few megabytes read, however large
+/// the file. Lines end in `\n`, or in `\r` where a file has no `\n` at all.
+fn lines_about(text: &[u8]) -> u64 {
+    let span = LINE_WINDOW * LINE_WINDOWS;
+    let count = |target: u8| -> (u64, u64) {
+        if text.len() <= span {
+            return (
+                count_byte(text, 0, text.len(), target) as u64,
+                text.len() as u64,
+            );
+        }
+        let step = (text.len() - LINE_WINDOW) / (LINE_WINDOWS - 1);
+        let lines = (0..LINE_WINDOWS)
+            .map(|i| count_byte(text, i * step, i * step + LINE_WINDOW, target))
+            .sum::<usize>();
+        (lines as u64, span as u64)
+    };
+    let (mut lines, read) = count(b'\n');
+    if lines == 0 {
+        lines = count(b'\r').0;
+    }
+    (lines as u128 * text.len() as u128 / read.max(1) as u128).min(u64::MAX as u128) as u64
+}
+
+/// For the fused join under a heap limit. B's index is built before A is read,
+/// so the check after B's sweep has B's count and only A's bytes: A's rows are
+/// estimated two ways, in proportion to the files' sizes and in proportion to
+/// their sampled line counts ([`lines_about`]), and the pair is refused as out
+/// of memory only when both say the two indexes cannot fit. The size alone
+/// assumes rows of the same length in both files: a 2M-row file against a
+/// 200k-row file of the same size was taken for 2M rows a side, and refused
+/// under 108 MB though turbo finishes it in 80. The line counts see the
+/// difference; the two counts in a ratio, so a format whose rows span several
+/// lines counts alike in both. Still an estimate: a pair whose row lengths
+/// differ only where no window reads can be refused early, and is then
+/// compared by sortmerge, to the same answer. At ten million rows a side under
+/// a 512 MB limit, the refusal saves B's index build and A's sweep, five of
+/// the run's eighteen seconds.
+fn fits_estimated<'t>(
+    heap: Option<u64>,
+    own: &'t [u8],
+    other: &'t [u8],
+) -> Option<impl Fn(usize) -> Result<()> + Sync + 't> {
+    let heap = heap?;
+    Some(move |rows: usize| {
+        let rows = rows as u64;
+        let scale = |num: u64, den: u64| -> u64 {
+            (rows as u128 * num as u128 / den.max(1) as u128).min(u64::MAX as u128) as u64
+        };
+        let by_size = scale(other.len() as u64, own.len() as u64);
+        if refuse_over(heap, rows, by_size, "about ").is_ok() {
+            return Ok(());
+        }
+        let own_lines = lines_about(own);
+        let theirs = if own_lines == 0 {
+            by_size
+        } else {
+            by_size.min(scale(lines_about(other), own_lines))
+        };
+        refuse_over(heap, rows, theirs, "about ")
+    })
+}
+
+/// `2000200` as `2,000,200`, as the summary line writes counts.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// An empty table of `cap` slots, with the zeroes written rather than taken from
 /// the kernel.
 ///
@@ -743,6 +883,7 @@ impl RowIndex {
     /// opted into, the insertion is split by key instead (`insert_parallel`), each thread taking
     /// every row of its own keys in file order, which leaves the answer the
     /// serial one.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         side: &Side,
         key_size: usize,
@@ -751,6 +892,7 @@ impl RowIndex {
         tag: &'static str,
         sink: Option<&RowSink<'_>>,
         after_sweep: Option<&(dyn Fn(usize) + Sync)>,
+        fits: Option<&(dyn Fn(usize) -> Result<()> + Sync)>,
     ) -> Result<(Self, Vec<SweptPart>)> {
         let mut phases = Phases::new(tag);
         let (mut chunks, fparts) = sweep(side, key_size, opt, threads, sink)?;
@@ -794,10 +936,10 @@ impl RowIndex {
         // insert by 27% and the join by 6%. `first_row` and `occurrences` are sized the same way: they end
         // up one entry per distinct key, and every key is distinct until proven
         // otherwise.
-        let mut cap: usize = 1 << 12;
-        while cap * 2 < total * 3 + 16 {
-            cap <<= 1;
+        if let Some(fits) = fits {
+            fits(total)?;
         }
+        let cap = table_slots(total);
         // Wide enough to hold every key index plus the +1 that keeps 0 for
         // empty, narrow enough to leave the rest of the 32-bit slot for the
         // hash tag: 24 position bits at ten million rows, 26 at fifty. Past
@@ -3200,7 +3342,7 @@ fn fused_join<'x>(
         nc,
         keep_rows: ctx.keep_picks,
     };
-    let (ai, parts) = RowIndex::build(a, key_size, opt, threads, "A ", Some(&sink), None)?;
+    let (ai, parts) = RowIndex::build(a, key_size, opt, threads, "A ", Some(&sink), None, None)?;
 
     // The rows that turned out to repeat a key were joined as though first;
     // join them again and subtract. Re-marking the same seen bits changes
@@ -3522,6 +3664,7 @@ fn compare_fused(
     // A projected on the full budget too; its sweep joins as it goes.
     let b = b_input.project(wanted, key_size, total)?;
     let a = a_input.project(wanted, key_size, total)?;
+    let fits = fits_estimated(crate::memory::heap_limit(), b.slab.data(), a.slab.data());
     // While B's rows are inserted, on one thread, nothing reads the disk: A's
     // sweep cannot start until B's index is whole. So the reads A's sweep will
     // begin with are started then, by a thread that only asks for them.
@@ -3537,7 +3680,17 @@ fn compare_fused(
         let start = move |rows: usize| {
             let _ = go.send(rows);
         };
-        let built = RowIndex::build(&b, key_size, opt, total, "B ", None, Some(&start));
+        let built = RowIndex::build(
+            &b,
+            key_size,
+            opt,
+            total,
+            "B ",
+            None,
+            Some(&start),
+            fits.as_ref()
+                .map(|f| f as &(dyn Fn(usize) -> Result<()> + Sync)),
+        );
         // A's sweep starts now and reads for itself; the read-ahead stops at
         // its next step rather than queue reads the sweep is already making.
         stop.store(true, Ordering::Relaxed);
@@ -3983,9 +4136,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     // time, and each is split further: two files across four cores is two chunks
     // each, so the whole machine is busy rather than half of it.
     let per_file = (total / 2).max(1);
+    let first = AtomicU64::new(UNCOUNTED);
+    let fits = fits_counted(crate::memory::heap_limit(), &first);
     let prepare = |input: Input, tag: &'static str| -> Result<(Side, RowIndex)> {
         let side = input.project(&wanted, key_size, per_file)?;
-        let (index, _) = RowIndex::build(&side, key_size, opt, per_file, tag, None, None)?;
+        let fits = fits
+            .as_ref()
+            .map(|f| f as &(dyn Fn(usize) -> Result<()> + Sync));
+        let (index, _) = RowIndex::build(&side, key_size, opt, per_file, tag, None, None, fits)?;
         Ok((side, index))
     };
     let b_held = parallel::Once::new(b_input);
@@ -4202,4 +4360,82 @@ fn render_row(slab: &Slab, fields: &[Field]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    /// `rows` lines of `len` bytes each, the last byte the line's end.
+    fn text(rows: usize, len: usize, end: u8) -> Vec<u8> {
+        let mut line = vec![b'x'; len];
+        line[len - 1] = end;
+        line.repeat(rows)
+    }
+
+    #[test]
+    fn the_second_sweep_to_finish_refuses_on_both_exact_counts() {
+        let need = index_bytes(2_000_000) + index_bytes(200_000);
+        for (first, second) in [(2_000_000, 200_000), (200_000, 2_000_000)] {
+            let fits_at = |heap: u64| {
+                let counted = AtomicU64::new(UNCOUNTED);
+                let fits = fits_counted(Some(heap), &counted).unwrap();
+                assert!(fits(first).is_ok(), "the first side never refuses");
+                fits(second)
+            };
+            assert!(fits_at(need).is_ok());
+            let err = fits_at(need - 1).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!(
+                    "indexing {} rows here and {} in the other file",
+                    grouped(second as u64),
+                    grouped(first as u64)
+                )),
+                "{err}"
+            );
+        }
+        let counted = AtomicU64::new(UNCOUNTED);
+        assert!(fits_counted(None, &counted).is_none(), "no limit, no check");
+    }
+
+    #[test]
+    fn lines_are_counted_from_windows_of_a_large_file() {
+        assert_eq!(lines_about(&text(1000, 37, b'\n')), 1000);
+        assert_eq!(lines_about(&text(1000, 37, b'\r')), 1000);
+        assert_eq!(lines_about(b""), 0);
+        // Larger than the windows: an estimate, exact here as the lines are
+        // all one length.
+        let big = text(200_000, 41, b'\n');
+        assert!(big.len() > LINE_WINDOW * LINE_WINDOWS);
+        let est = lines_about(&big);
+        assert!(est.abs_diff(200_000) < 200, "{est}");
+    }
+
+    #[test]
+    fn a_file_of_longer_rows_is_not_taken_for_as_many_rows() {
+        // B: 200,000 rows of 20 bytes; A: the same 4 MB in 20,000 rows of 200.
+        let b = text(200_000, 20, b'\n');
+        let a = text(20_000, 200, b'\n');
+        let truth = index_bytes(200_000) + index_bytes(20_000);
+        let by_size = index_bytes(200_000) * 2;
+        assert!(truth + (1 << 20) < by_size);
+        // Between the truth and the size proportion: the indexes fit.
+        let fits = fits_estimated(Some(truth + (1 << 20)), &b, &a).unwrap();
+        assert!(fits(200_000).is_ok());
+        // Below the truth: refused, A's rows estimated from its lines.
+        let fits = fits_estimated(Some(truth - (1 << 20)), &b, &a).unwrap();
+        let err = fits(200_000).unwrap_err().to_string();
+        let theirs: u64 = err
+            .split("and about ")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .map(|n| n.replace(',', "").parse().unwrap())
+            .unwrap();
+        assert!(theirs.abs_diff(20_000) < 200, "{err}");
+        // The other way round, B of the longer rows: the size proportion is
+        // already the smaller and decides, as before.
+        let fits = fits_estimated(Some(truth + (1 << 20)), &a, &b).unwrap();
+        assert!(fits(20_000).is_ok());
+        assert!(fits_estimated(None, &b, &a).is_none(), "no limit, no check");
+    }
 }

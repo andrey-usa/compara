@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- In a container (or under `ulimit -d`), a pair whose key indexes
+  cannot fit the heap goes to the sortmerge engine once its rows
+  are counted, instead of after building indexes it then throws away:
+  10M rows a side under a 512 MB limit, 27.6 s to 18.7 s (local, cold
+  cache, median of three interleaved rounds). The note says how much the
+  indexes need. Where they fit, nothing changes, also when one file's rows
+  are much longer than the other's.
+
 ## [0.7.0] - 2026-11-17
 
 ### Added

@@ -349,6 +349,20 @@ fn a_csv_pair_too_big_for_the_heap_is_compared_by_spilling() {
     assert_eq!(counts(&free), counts(&tight), "{err}");
     assert!(err.contains("sortmerge"), "{err}");
     assert!(String::from_utf8_lossy(&tight.stdout).contains("sortmerge"));
+    // Refused once both sweeps have counted their rows, before the second index
+    // is built: the two indexes alone need about 108 MB here, from the counts.
+    assert!(
+        err.contains("indexing 2,000,"),
+        "refused late, not after the sweep: {err}"
+    );
+    // A limit the indexes fit is not refused by that check: it is a lower
+    // bound, and the run fails over (if at all) only where turbo really runs out.
+    let roomy = run(Some(125 * 1024), "auto");
+    assert!(
+        !String::from_utf8_lossy(&roomy.stderr).contains("indexing"),
+        "{roomy:?}"
+    );
+    assert_eq!(counts(&free), counts(&roomy));
     let named = run(Some(100 * 1024), "turbo");
     assert_eq!(named.status.code(), Some(2), "{:?}", named);
     assert!(String::from_utf8_lossy(&named.stderr).contains("out of memory"));
