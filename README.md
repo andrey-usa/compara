@@ -15,7 +15,7 @@ Parquet a warehouse emits, a migration's source against its target.
 
 - Reads **CSV, TSV, JSON (newline-delimited or one array of objects) and
   Parquet**, and the two sides need not be in the same format.
-- Ten million rows × 20 columns in about a second on four cores, CSV or Parquet
+- Ten million rows × 20 columns in a second or two on four cores, CSV or Parquet
   ([benchmarks](https://andrey-usa.github.io/compara/benchmarks/results.html)).
 - Reads and writes **object storage and the web** directly (`s3://`,
   `gs://`, `az://`, `https://`), with each cloud's own credentials, and
@@ -83,18 +83,18 @@ changed and `--export-dir` for the rows.
 
 ## Benchmarks
 
-Two tables of 20 columns compared on a composite key (`-k account_id,txn_id -i updated_at`), every tool's unchanged, changed, added and removed counts checked identical, on GitHub's `ubuntu-24.04, image 20261111.127.1` (Intel(R) Xeon(R) 6975P-C, 4 cores, 15 GB), [bench-contenders run 43794429051](https://github.com/andrey-usa/compara/actions/runs/43794429051), 2026-11-16:
+Two tables of 20 columns compared on a composite key (`-k account_id,txn_id -i updated_at`), every tool's unchanged, changed, added and removed counts checked identical, on GitHub's `ubuntu-24.04, image 20261111.370.1` (Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz, 4 cores, 15 GB), [bench-contenders run 44398184156](https://github.com/andrey-usa/compara/actions/runs/44398184156), 2026-11-18:
 
-| input, both files | compara 0.6.1 | DuckDB 2.0.0 | Polars 2.1.0 | qsv 29.0.0 |
+| input, both files | compara 0.7.0 | DuckDB 2.0.0 | Polars 2.1.0 | qsv 29.0.0 |
 |---|---|---|---|---|
-| 1M rows, CSV, 368 MB | **0.09 s** · 0.3 s · 411 MB | 2.29 s · 6.3 s · 1,080 MB | 2.25 s · 8.8 s · 2,364 MB | 0.78 s · 2.0 s · 145 MB |
-| 1M rows, Parquet, 161 MB | **0.13 s** · 0.4 s · 322 MB | 1.26 s · 2.1 s · 1,167 MB | 2.27 s · 7.9 s · 2,382 MB | not run |
-| 10M rows, CSV, 3,679 MB | **0.84 s** · 2.8 s · 4,030 MB | 17.16 s · 64.6 s · 8,793 MB | out of memory after 10 s, at 13,341 MB | 8.31 s · 22.1 s · 1,008 MB |
-| 10M rows, Parquet, 1,609 MB | **1.06 s** · 3.5 s · 2,730 MB | 7.25 s · 26.8 s · 7,142 MB | out of memory after 9 s, at 13,342 MB | not run |
+| 1M rows, CSV, 368 MB | **0.13 s** · 0.4 s · 411 MB (56 private) | 3.26 s · 9.2 s · 1,164 MB (1,103 private) | 3.22 s · 12.1 s · 2,208 MB (2,145 private) | 0.96 s · 2.6 s · 132 MB (102 private) |
+| 1M rows, Parquet, 161 MB | **0.18 s** · 0.5 s · 320 MB (180 private) | 1.67 s · 2.8 s · 1,231 MB (1,171 private) | 3.00 s · 10.2 s · 2,234 MB (2,170 private) | not run |
+| 10M rows, CSV, 3,679 MB | **1.15 s** · 3.9 s · 4,030 MB (511 private) | 25.67 s · 94.5 s · 8,832 MB (8,760 private) | out of memory after 14 s, at 13,335 MB | 11.46 s · 30.6 s · 982 MB (953 private) |
+| 10M rows, Parquet, 1,609 MB | **1.55 s** · 5.2 s · 2,738 MB (1,340 private) | 10.27 s · 37.3 s · 7,057 MB (6,985 private) | out of memory after 11 s, at 13,336 MB | not run |
 
-Each cell: wall time, best of 3 · CPU time (user and system) · peak memory, of the best run; fastest in bold. DuckDB and Polars run from Python, and their time starts at their first read, after the interpreter's start and the import; qsv is a binary and is timed as a whole process, like compara, runs on CSV only, and is given the files with the ignored column and the repeated keys already taken out (the page says how). A tool the runner's kernel stopped for lack of memory says so.
+Each cell: wall time, best of 3 · CPU time (user and system) · peak memory (RSS, and in brackets the private part of it), of the best run; fastest in bold. DuckDB and Polars run from Python, and their time starts at their first read, after the interpreter's start and the import; qsv is a binary and is timed as a whole process, like compara, runs on CSV only, and is given the files with the ignored column and the repeated keys already taken out (the page says how). A tool the runner's kernel stopped for lack of memory says so.
 
-Where another tool did better in this run (by more than 2%): peak memory on 1M rows, CSV, 368 MB: qsv 145 MB, compara 411 MB; peak memory on 10M rows, CSV, 3,679 MB: qsv 1,008 MB, compara 4,030 MB.
+Where another tool did better in this run (by more than 2%): peak memory on 1M rows, CSV, 368 MB: qsv 132 MB, compara 411 MB; peak memory on 10M rows, CSV, 3,679 MB: qsv 982 MB, compara 4,030 MB.
 
 The method, every run and object storage: [Benchmarks](https://andrey-usa.github.io/compara/benchmarks/results.html).
 
