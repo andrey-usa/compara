@@ -350,16 +350,17 @@ fn keys_built_to_collide_do_not_make_a_compare_quadratic() {
     assert!(took < Duration::from_secs(5), "took {took:?}");
 }
 
-/// A JSON file whose every object names a column of its own is refused for
-/// what it is, and quickly. Its columns are all its objects' keys, so
-/// 60,000 such objects are 60,001 columns and 3.6 billion cells in two
-/// megabytes of file: the compare took seven seconds, and two minutes at
-/// 400,000. Naming the columns to compare is the way through, and is said.
+/// A JSON file whose comparison would touch more cells than a file of its
+/// size may is refused for that, quickly, with the count and the way
+/// through. Its columns are all its objects' keys, so 150,000 objects with a
+/// key of their own each are 150,001 columns and 22.5 billion cells in 4 MB
+/// of file: minutes of work. Naming the columns to compare is the way
+/// through, and is said.
 #[test]
-fn a_json_file_with_a_key_of_its_own_in_every_object_is_refused() {
+fn a_json_file_too_costly_to_compare_is_refused_by_its_cells() {
     let table = |value: &str| {
         let mut text = String::new();
-        for i in 0..60_000 {
+        for i in 0..150_000 {
             text.push_str(&format!("{{\"id\":\"{i}\",\"k{i}\":\"{value}\"}}\n"));
         }
         text
@@ -371,7 +372,7 @@ fn a_json_file_with_a_key_of_its_own_in_every_object_is_refused() {
         &["-k", "id"],
         Duration::from_secs(20),
     );
-    assert!(said.contains("is not one table"), "{said}");
+    assert!(said.contains("22.5 billion cells"), "{said}");
     assert!(said.contains("--compare"), "{said}");
 
     // With the columns named there is a table to compare, and it is.
@@ -383,6 +384,38 @@ fn a_json_file_with_a_key_of_its_own_in_every_object_is_refused() {
     assert_eq!(out.status.code(), Some(1));
     let counts = String::from_utf8_lossy(&out.stdout);
     assert!(counts.contains("(changed 2)"), "{counts}");
+}
+
+/// A sparse JSON table is compared whole when that costs seconds, however few
+/// of its columns any one object has: the refusal was once by shape (over
+/// 1,024 columns and 256 cells a byte), and a table of 10,000 objects with a
+/// key of its own each, 100 million cells, could not be compared at all, not
+/// even with every column named.
+#[test]
+fn a_sparse_json_table_that_costs_seconds_is_compared() {
+    let table = |changed: usize| {
+        let mut text = String::new();
+        for i in 0..10_000 {
+            let value = if i == changed { "y" } else { "x" };
+            text.push_str(&format!("{{\"id\":\"{i}\",\"k{i}\":\"{value}\"}}\n"));
+        }
+        text
+    };
+    let a = Scratch::new("sparse-a.ndjson", table(usize::MAX).as_bytes());
+    let b = Scratch::new("sparse-b.ndjson", table(5).as_bytes());
+    let out = Command::new(BIN)
+        .args(["compare", "-k", "id"])
+        .args([&a.0, &b.0])
+        .output()
+        .expect("run compara");
+    let counts = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{counts}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(counts.contains("matched 10,000 (changed 1)"), "{counts}");
 }
 
 /// The names a JSON file's later objects bring are held to one budget for

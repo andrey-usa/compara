@@ -15,6 +15,12 @@ All notable changes to this project are documented here. The format follows
   cache, median of three interleaved rounds). The note says how much the
   indexes need. Where they fit, nothing changes, also when one file's rows
   are much longer than the other's.
+- A JSON file is refused for what comparing it would cost, not for its
+  shape: when its objects times the columns compared pass 17.2 billion
+  cells (2^34) and 256 for each byte of the file. 200,000 objects of 2 of
+  20,000 keys each (7.7 MB) were refused as "not one table", even with
+  `-c` naming every column; they compare in 0.24 s (local, indicative). The
+  refusal says how many cells, and names `--compare`.
 
 ### Fixed
 

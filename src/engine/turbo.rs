@@ -4044,15 +4044,31 @@ fn json_keys_after_the_first(
     Ok((in_order(later), objects))
 }
 
-/// Refuses a JSON file whose objects share so few keys that it is not one
-/// table: `width` columns to read for each of its objects, most of them absent.
+/// The cells a JSON file's comparison may touch whatever the file's size.
 ///
-/// A table costs its cells, and a file's cells are in its bytes -- except
-/// here, where every object can name a column of its own for a few bytes: a
-/// 14 MB file of 400,000 such objects is 160 billion cells, and took two
-/// minutes. Wide tables pass (a thousand columns always do), and so does a
-/// sparse one until it is hundreds of times its file's size in cells.
-fn refuse_scattered_json(input: &Input, width: usize, path: &Path) -> Result<()> {
+/// A cell costs about 2 ns of one core where its row differs from its mate
+/// and a tenth of that where the row's bytes are the same: 200,000 objects of
+/// 2 of 80,000 keys (16 billion cells) took 2.7 s of CPU with one row in
+/// twenty changed and 34 s with every row changed. 2^34 is that file: what a
+/// sparse table may cost before a reason is asked for.
+const JSON_CELLS_FLOOR: u128 = 1 << 34;
+
+/// Past [`JSON_CELLS_FLOOR`], the cells a JSON file may ask for each of its
+/// bytes, so that a larger file may cost more.
+const JSON_CELLS_PER_BYTE: u128 = 256;
+
+/// Refuses a JSON file whose comparison would touch more cells than a file of
+/// its size may: `width` columns read and compared for each of its objects.
+///
+/// A table costs its cells. Each row is read into a slot for every column
+/// compared, and each slot of a changed row is compared, absent or not. A
+/// file's cells are in its bytes -- except in JSON, where an object can name
+/// a column of its own in a few bytes and leave out every other: 400,000 such
+/// objects, 14 MB, are 160 billion cells, minutes of work for no table. So
+/// the cells are counted before any is touched, and what is refused is the
+/// cost: a sparse table that compares in seconds is compared, however few of
+/// its columns any one object has.
+fn refuse_costly_json(input: &Input, width: usize, path: &Path) -> Result<()> {
     let Input::Text {
         slab,
         header,
@@ -4062,19 +4078,26 @@ fn refuse_scattered_json(input: &Input, width: usize, path: &Path) -> Result<()>
     else {
         return Ok(());
     };
-    if slab.dialect() != Dialect::Json || width <= 1024 {
+    if slab.dialect() != Dialect::Json {
         return Ok(());
     }
     let cells = (*objects as u128) * (width as u128);
-    if cells <= 256 * slab.data().len() as u128 {
+    let most = JSON_CELLS_FLOOR.max(JSON_CELLS_PER_BYTE * slab.data().len() as u128);
+    if cells <= most {
         return Ok(());
     }
+    let billions = |n: u128| format!("{:.1} billion", n as f64 / 1e9);
     Err(Error::input(format!(
-        "{} is not one table: its {} objects hold {} different keys between them, and few in any \
-         one object. Name the columns to compare with --compare (compara columns lists them)",
+        "{}: comparing {} columns over its {} objects is {} cells to read and compare, most of \
+         them absent (its objects hold {} different keys between them, few in any one), and a \
+         file of its size may ask {}. Name the columns to compare with --compare (compara \
+         columns lists them)",
         path.display(),
-        objects,
-        header.len()
+        grouped(width as u64),
+        grouped(*objects as u64),
+        billions(cells),
+        grouped(header.len() as u64),
+        billions(most)
     )))
 }
 
@@ -4237,8 +4260,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let b_input = Input::open(b_path, opt)?;
     let resolved = resolve(a_input.header(), b_input.header(), opt)?;
     let width = opt.key.len() + resolved.compared.len();
-    refuse_scattered_json(&a_input, width, a_path)?;
-    refuse_scattered_json(&b_input, width, b_path)?;
+    refuse_costly_json(&a_input, width, a_path)?;
+    refuse_costly_json(&b_input, width, b_path)?;
 
     let key_size = opt.key.len();
     let a_cols = a_input.header().len();
