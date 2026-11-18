@@ -659,71 +659,147 @@ fn fits_counted(
     })
 }
 
-/// Windows read from each file to estimate its line count, and their size.
+/// Windows read from a file to estimate its row count, and their size.
 const LINE_WINDOWS: usize = 32;
 const LINE_WINDOW: usize = 64 << 10;
 
-/// About how many lines `text` has, from `LINE_WINDOWS` windows spread evenly
-/// across it (the whole of a small file): a few megabytes read, however large
-/// the file. Lines end in `\n`, or in `\r` where a file has no `\n` at all.
-fn lines_about(text: &[u8]) -> u64 {
+/// About how many rows the CSV `text` has, from `LINE_WINDOWS` windows spread
+/// evenly across it (the whole of a small file): a few megabytes read, however
+/// large the file. A row ends in `\n`, or in `\r` where a file has no `\n` at
+/// all, outside quotes: a quoted field that spans lines is one row, so a file
+/// whose rows span lines is not taken for more rows than it has. A window
+/// starts in an unknown quote state, which [`settled_after`] finds; its rows
+/// are counted from there, and a window whose quotes never settle it is
+/// passed over.
+fn rows_about(text: &[u8], delimiter: u8) -> u64 {
     let span = LINE_WINDOW * LINE_WINDOWS;
-    let count = |target: u8| -> (u64, u64) {
-        if text.len() <= span {
-            return (
-                count_byte(text, 0, text.len(), target) as u64,
-                text.len() as u64,
-            );
-        }
+    let windows: Vec<(usize, usize)> = if text.len() <= span {
+        vec![(0, text.len())]
+    } else {
         let step = (text.len() - LINE_WINDOW) / (LINE_WINDOWS - 1);
-        let lines = (0..LINE_WINDOWS)
-            .map(|i| count_byte(text, i * step, i * step + LINE_WINDOW, target))
-            .sum::<usize>();
-        (lines as u64, span as u64)
+        (0..LINE_WINDOWS)
+            .map(|i| (i * step, i * step + LINE_WINDOW))
+            .collect()
     };
-    let (mut lines, read) = count(b'\n');
-    if lines == 0 {
-        lines = count(b'\r').0;
+    let end = if windows
+        .iter()
+        .any(|&(lo, hi)| count_byte(text, lo, hi, b'\n') > 0)
+    {
+        b'\n'
+    } else {
+        b'\r'
+    };
+    let (mut rows, mut read) = (0u64, 0u64);
+    for (lo, hi) in windows {
+        let from = if lo == 0 {
+            Some(0)
+        } else {
+            settled_after(text, lo, hi, delimiter)
+        };
+        if let Some(from) = from {
+            rows += row_ends(text, from, hi, delimiter, end) as u64;
+            read += (hi - from) as u64;
+        }
     }
-    (lines as u128 * text.len() as u128 / read.max(1) as u128).min(u64::MAX as u128) as u64
+    (rows as u128 * text.len() as u128 / read.max(1) as u128).min(u64::MAX as u128) as u64
+}
+
+/// Where in `text[lo..hi]`, `lo` past the file's start, the quote state is
+/// known to be outside a field: `lo` when the window holds no quote, else just
+/// past the first run of quotes that cannot open a field and is odd. A run
+/// that starts inside a field (after a byte that is not a delimiter or a line
+/// end) leaves a quoted field when odd -- its pairs are quotes, the last one
+/// closes it -- and an unquoted one as it was, so outside a field either way.
+/// `None` when no run in the window settles it.
+fn settled_after(text: &[u8], lo: usize, hi: usize, delimiter: u8) -> Option<usize> {
+    let mut at = lo;
+    let mut quoted = false;
+    while let Some(q) = text[at..hi].iter().position(|&c| c == b'"').map(|i| at + i) {
+        quoted = true;
+        let mut start = q;
+        while start > 0 && text[start - 1] == b'"' {
+            start -= 1;
+        }
+        let mut end = q;
+        while end < text.len() && text[end] == b'"' {
+            end += 1;
+        }
+        let inside_a_field =
+            start > 0 && text[start - 1] != delimiter && !matches!(text[start - 1], b'\n' | b'\r');
+        if end >= hi {
+            break;
+        }
+        if inside_a_field && (end - start) % 2 == 1 {
+            return Some(end);
+        }
+        at = end;
+    }
+    (!quoted).then_some(lo)
+}
+
+/// Rows ending in `text[from..hi]`, `from` being outside any field: `end`
+/// bytes outside quotes. A quote opens a field only at its start, after a
+/// delimiter or a line end; inside one, a doubled quote is a quote and any
+/// other closes it.
+fn row_ends(text: &[u8], from: usize, hi: usize, delimiter: u8, end: u8) -> usize {
+    let (mut rows, mut inside, mut at) = (0usize, false, from);
+    while at < hi {
+        let c = text[at];
+        if inside {
+            if c == b'"' {
+                if text.get(at + 1) == Some(&b'"') {
+                    at += 1;
+                } else {
+                    inside = false;
+                }
+            }
+        } else if c == end {
+            rows += 1;
+        } else if c == b'"'
+            && (at == 0 || text[at - 1] == delimiter || matches!(text[at - 1], b'\n' | b'\r'))
+        {
+            inside = true;
+        }
+        at += 1;
+    }
+    rows
 }
 
 /// For the fused join under a heap limit. B's index is built before A is read,
 /// so the check after B's sweep has B's count and only A's bytes: A's rows are
-/// estimated two ways, in proportion to the files' sizes and in proportion to
-/// their sampled line counts ([`lines_about`]), and the pair is refused as out
-/// of memory only when both say the two indexes cannot fit. The size alone
-/// assumes rows of the same length in both files: a 2M-row file against a
-/// 200k-row file of the same size was taken for 2M rows a side, and refused
-/// under 108 MB though turbo finishes it in 80. The line counts see the
-/// difference; the two counts in a ratio, so a format whose rows span several
-/// lines counts alike in both. Still an estimate: a pair whose row lengths
-/// differ only where no window reads can be refused early, and is then
-/// compared by sortmerge, to the same answer. At ten million rows a side under
-/// a 512 MB limit, the refusal saves B's index build and A's sweep, five of
-/// the run's eighteen seconds.
+/// estimated two ways, in proportion to the files' sizes and from its sampled
+/// row ends ([`rows_about`]), and the pair is refused as out of memory only
+/// when both say the two indexes cannot fit. The size alone assumes rows of
+/// the same length in both files: a 2M-row file against a 200k-row file of the
+/// same size was taken for 2M rows a side, and refused under 108 MB though
+/// turbo finishes it in 80. The row ends see the difference. Lines alone did
+/// not: a 200k-row A whose quoted notes span ten lines read as 2M rows, and
+/// was refused under 110 MB though turbo finishes it in 75. Still an estimate:
+/// a pair whose row lengths differ only where no window reads can be refused
+/// early, and is then compared by sortmerge, to the same answer (only that:
+/// see [`estimate_may_refuse`]). At ten million rows a side under a 512 MB
+/// limit, the refusal saves B's index build and A's sweep, five of the run's
+/// eighteen seconds.
 fn fits_estimated<'t>(
     heap: Option<u64>,
     own: &'t [u8],
     other: &'t [u8],
+    delimiter: u8,
 ) -> Option<impl Fn(usize) -> Result<()> + Sync + 't> {
     let heap = heap?;
     Some(move |rows: usize| {
         let rows = rows as u64;
-        let scale = |num: u64, den: u64| -> u64 {
-            (rows as u128 * num as u128 / den.max(1) as u128).min(u64::MAX as u128) as u64
-        };
-        let by_size = scale(other.len() as u64, own.len() as u64);
+        let by_size = (rows as u128 * other.len() as u128 / own.len().max(1) as u128)
+            .min(u64::MAX as u128) as u64;
         if refuse_over(heap, rows, by_size, "about ").is_ok() {
             return Ok(());
         }
-        let own_lines = lines_about(own);
-        let theirs = if own_lines == 0 {
-            by_size
-        } else {
-            by_size.min(scale(lines_about(other), own_lines))
-        };
-        refuse_over(heap, rows, theirs, "about ")
+        refuse_over(
+            heap,
+            rows,
+            by_size.min(rows_about(other, delimiter)),
+            "about ",
+        )
     })
 }
 
@@ -3679,6 +3755,10 @@ fn compare_fused(
 
     // B first, on the full budget: its index is all the join needs from B.
     // A projected on the full budget too; its sweep joins as it goes.
+    let a_delimiter = match &a_input {
+        Input::Text { delimiter, .. } => *delimiter,
+        Input::Parquet { .. } => b',',
+    };
     let b = b_input.project(wanted, key_size, total)?;
     let a = a_input.project(wanted, key_size, total)?;
     let heap = crate::memory::heap_limit();
@@ -3687,7 +3767,7 @@ fn compare_fused(
         [a.slab.dialect(), b.slab.dialect()],
         heap,
     )
-    .then(|| fits_estimated(heap, b.slab.data(), a.slab.data()))
+    .then(|| fits_estimated(heap, b.slab.data(), a.slab.data(), a_delimiter))
     .flatten();
     // While B's rows are inserted, on one thread, nothing reads the disk: A's
     // sweep cannot start until B's index is whole. So the reads A's sweep will
@@ -4423,17 +4503,68 @@ mod fit_tests {
         assert!(fits_counted(None, &counted).is_none(), "no limit, no check");
     }
 
+    /// `rows` CSV rows `id,"note",x`, the note `lines` lines of `seg` bytes.
+    fn quoted(rows: usize, lines: usize, seg: usize) -> Vec<u8> {
+        let note = vec![vec![b'y'; seg]; lines].join(&b'\n');
+        let mut out = Vec::new();
+        for i in 0..rows {
+            out.extend_from_slice(format!("{i},\"").as_bytes());
+            out.extend_from_slice(&note);
+            out.extend_from_slice(b"\",x\n");
+        }
+        out
+    }
+
     #[test]
-    fn lines_are_counted_from_windows_of_a_large_file() {
-        assert_eq!(lines_about(&text(1000, 37, b'\n')), 1000);
-        assert_eq!(lines_about(&text(1000, 37, b'\r')), 1000);
-        assert_eq!(lines_about(b""), 0);
+    fn rows_are_counted_from_windows_of_a_large_file() {
+        assert_eq!(rows_about(&text(1000, 37, b'\n'), b','), 1000);
+        assert_eq!(rows_about(&text(1000, 37, b'\r'), b','), 1000);
+        assert_eq!(rows_about(b"", b','), 0);
+        assert_eq!(rows_about(b"a,b\r\nc,d\r\n", b','), 2);
+        assert_eq!(rows_about(b"a,b\nc,d", b','), 1, "no line end, no row end");
         // Larger than the windows: an estimate, exact here as the lines are
         // all one length.
         let big = text(200_000, 41, b'\n');
         assert!(big.len() > LINE_WINDOW * LINE_WINDOWS);
-        let est = lines_about(&big);
+        let est = rows_about(&big, b',');
         assert!(est.abs_diff(200_000) < 200, "{est}");
+    }
+
+    #[test]
+    fn a_quoted_field_that_spans_lines_is_one_row() {
+        assert_eq!(rows_about(&quoted(1000, 3, 5), b','), 1000);
+        // Windows that start inside a quoted field settle at its closing quote.
+        for (lines, seg) in [(10, 18), (4, 45), (2, 7)] {
+            let big = quoted(100_000, lines, seg);
+            assert!(big.len() > LINE_WINDOW * LINE_WINDOWS);
+            let est = rows_about(&big, b',');
+            assert!(est.abs_diff(100_000) < 1_000, "{lines} lines: {est}");
+        }
+        // Every field quoted, doubled quotes, a quote inside an unquoted
+        // field, and a tab delimiter: one row a line.
+        for (line, delimiter) in [
+            (&b"\"k\",\"v\"\n"[..], b','),
+            (b"k,\"say \"\"hi\"\"\",z\n", b','),
+            (b"k,5\" nail,z\n", b','),
+            (b"k\t\"v\"\tz\n", b'\t'),
+        ] {
+            let big = line.repeat(400_000);
+            let rows = 400_000u64;
+            let est = rows_about(&big, delimiter);
+            assert!(est.abs_diff(rows) < rows / 100, "{line:?}: {est}");
+        }
+    }
+
+    #[test]
+    fn a_file_whose_rows_span_lines_is_not_taken_for_more_rows() {
+        // B: 200,000 rows of 20 bytes; A: about the same 4 MB in 20,000 rows of
+        // 200, each a note of ten lines: 200,000 lines, 20,000 rows.
+        let b = text(200_000, 20, b'\n');
+        let a = quoted(20_000, 10, 18);
+        assert!(a.len().abs_diff(b.len()) < b.len() / 10);
+        let truth = index_bytes(200_000) + index_bytes(20_000);
+        let fits = fits_estimated(Some(truth + (1 << 20)), &b, &a, b',').unwrap();
+        assert!(fits(200_000).is_ok());
     }
 
     #[test]
@@ -4474,10 +4605,10 @@ mod fit_tests {
         let by_size = index_bytes(200_000) * 2;
         assert!(truth + (1 << 20) < by_size);
         // Between the truth and the size proportion: the indexes fit.
-        let fits = fits_estimated(Some(truth + (1 << 20)), &b, &a).unwrap();
+        let fits = fits_estimated(Some(truth + (1 << 20)), &b, &a, b',').unwrap();
         assert!(fits(200_000).is_ok());
-        // Below the truth: refused, A's rows estimated from its lines.
-        let fits = fits_estimated(Some(truth - (1 << 20)), &b, &a).unwrap();
+        // Below the truth: refused, A's rows estimated from its row ends.
+        let fits = fits_estimated(Some(truth - (1 << 20)), &b, &a, b',').unwrap();
         let err = fits(200_000).unwrap_err().to_string();
         let theirs: u64 = err
             .split("and about ")
@@ -4488,8 +4619,11 @@ mod fit_tests {
         assert!(theirs.abs_diff(20_000) < 200, "{err}");
         // The other way round, B of the longer rows: the size proportion is
         // already the smaller and decides, as before.
-        let fits = fits_estimated(Some(truth + (1 << 20)), &a, &b).unwrap();
+        let fits = fits_estimated(Some(truth + (1 << 20)), &a, &b, b',').unwrap();
         assert!(fits(20_000).is_ok());
-        assert!(fits_estimated(None, &b, &a).is_none(), "no limit, no check");
+        assert!(
+            fits_estimated(None, &b, &a, b',').is_none(),
+            "no limit, no check"
+        );
     }
 }
