@@ -31,6 +31,10 @@ All notable changes to this project are documented here. The format follows
   long keys took 200 MB of peak RSS at `--threads 1` and 739 MB at 4
   before it was refused, whatever `--memory` said; now 137 and 146 MB,
   and under `--memory 64M` it is refused at 40-51 MB (local, indicative).
+- A JSON key with no value (`"zz":}`, `"q":,`) or no colon names no
+  column, in the first object as in the later ones: the row parser reads
+  no member there, and `compara columns` listed a column empty in every
+  row.
 
 ## [0.7.0] - 2026-11-17
 

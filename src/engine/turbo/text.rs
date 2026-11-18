@@ -212,12 +212,6 @@ pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
         if close <= from {
             break;
         }
-        // A name repeated in the object is one column (its last value wins),
-        // not two.
-        let name = text_of(slab, pack(from as u64, (close - 1 - from) as u64, escaped));
-        if !names.contains(&name) {
-            names.push(name);
-        }
         pos = close;
         while pos < end && json_space(data[pos]) {
             pos += 1;
@@ -231,6 +225,17 @@ pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
         }
         if pos >= end {
             break;
+        }
+        // A key is a column with its colon and a value, as it is a member to
+        // the row parser: one with no colon ends the object above, and one
+        // with no value (a comma or the closing brace next) is passed over.
+        // A name repeated in the object is one column (its last value wins),
+        // not two.
+        if !matches!(data[pos], b',' | b'}') {
+            let name = text_of(slab, pack(from as u64, (close - 1 - from) as u64, escaped));
+            if !names.contains(&name) {
+                names.push(name);
+            }
         }
         pos = match data[pos] {
             b'"' => skip_json_string(Swar, data, pos, end).0,
@@ -469,9 +474,12 @@ pub(super) fn json_later_keys(
                 break;
             }
             // Only now is it a member, as it is to the row parser: a key
-            // with no colon or no value after it ends the object there, and
-            // names no column.
-            if known.get(member).map(String::as_bytes) != Some(key) {
+            // with no colon after it ends the object there, and one with no
+            // value (a comma or the closing brace next), which the parser
+            // reads as empty, is passed over. Neither names a column.
+            if !matches!(data[pos], b',' | b'}')
+                && known.get(member).map(String::as_bytes) != Some(key)
+            {
                 let name = text_of(
                     slab,
                     pack(key_from as u64, (key_end - 1 - key_from) as u64, escaped),

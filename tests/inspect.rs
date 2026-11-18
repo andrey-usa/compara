@@ -693,3 +693,23 @@ fn columns_of_a_json_file_are_every_object_s_keys() {
     let (_, two, _) = run(&["head", "-n", "2", "--csv"], &path);
     assert_eq!(two, "id,v\n1,\n2,x\n");
 }
+
+/// A key is a column with its colon and a value, in the first object as in
+/// the later ones, as it is a member to the row parser: one with no value
+/// (`"zz":}`, `"q":,`) is passed over and one with no colon ends the object.
+/// Before, each named a column that was empty in every row.
+#[test]
+fn a_json_key_with_no_value_names_no_column() {
+    let f = Fixture::new(1);
+    let path = f.path("valueless.ndjson");
+    std::fs::write(
+        &path,
+        "{\"id\":\"1\",\"q\":,\"p\":\"v\",\"r\"}\n{\"id\":\"2\",\"b\":\"x\"\"zz\":}\n{\"id\":\"3\",\"y\": }\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run(&["columns"], &path);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "id\np\nb\n");
+    let (_, rows, _) = run(&["head", "--csv"], &path);
+    assert_eq!(rows, "id,p,b\n1,v,\n2,,x\n3,,\n");
+}
