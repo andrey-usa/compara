@@ -385,6 +385,43 @@ fn a_json_file_with_a_key_of_its_own_in_every_object_is_refused() {
     assert!(counts.contains("(changed 2)"), "{counts}");
 }
 
+/// The names a JSON file's later objects bring are held to one budget for
+/// the file, whatever the thread count, and to a quarter of `--memory` when
+/// that is less: each thread had a 64 MB ceiling of its own, so a file's
+/// names could take 64 MB a core, and `--memory` was not asked. Eight names
+/// of a megabyte each: four pieces of two fit under any one thread's share of
+/// a 4 MB budget, and only the file's total says it does not.
+#[test]
+fn a_json_file_s_key_names_have_one_budget_across_threads() {
+    let pad = "Q".repeat(1 << 20);
+    let mut text = String::new();
+    for i in 0..8 {
+        text.push_str(&format!("{{\"id\":{i},\"{pad}{i}\":1}}\n"));
+    }
+    let file = Scratch::new("big-names.ndjson", text.as_bytes());
+    for threads in ["1", "4"] {
+        let said = refused(
+            &[Path::new("compare"), &file.0, &file.0],
+            &["-k", "id", "--threads", threads, "--memory", "16M"],
+            Duration::from_secs(20),
+        );
+        assert!(said.contains("4 MB of different keys"), "{said}");
+        assert!(said.contains("--memory"), "{said}");
+    }
+    // Under the ceiling a file's own budget allows, the same file compares.
+    let out = Command::new(BIN)
+        .args(["compare", "-k", "id", "--threads", "4"])
+        .args([&file.0, &file.0])
+        .output()
+        .expect("run compara");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A table of twenty thousand columns is compared in the time its bytes
 /// take: each column's name used to be searched for in the list of all of
 /// them, at five places, so the time grew with the square of the width (17

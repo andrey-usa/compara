@@ -41,7 +41,7 @@ mod slab;
 mod text;
 mod thrift;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -49,9 +49,9 @@ use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 pub(crate) use text::refuse_non_text;
 use text::{
-    RowParser, Runs, csv_header, detect_delimiter, guard_span, json_array_row_starts, json_header,
-    json_is_array, json_later_keys, json_row_indent, json_rows_match, json_rows_match_at,
-    shared_tail, sniff_dialect,
+    KeyBudget, RowParser, Runs, csv_header, detect_delimiter, guard_span, in_order,
+    json_array_row_starts, json_header, json_is_array, json_later_keys, json_row_indent,
+    json_rows_match, json_rows_match_at, shared_tail, sniff_dialect,
 };
 
 use crate::alloc;
@@ -3997,7 +3997,9 @@ enum Input {
 ///
 /// The whole file is walked on every thread, each over its own run of rows;
 /// the runs are taken in file order, so the names come out in the order a
-/// reader of the file would meet them, whatever the thread count.
+/// reader of the file would meet them, whatever the thread count. The threads
+/// share one budget for the names they hold, so the memory a file's names may
+/// take is the same on one core as on sixty-four.
 fn json_keys_after_the_first(
     slab: &Slab,
     first: &[String],
@@ -4006,15 +4008,28 @@ fn json_keys_after_the_first(
 ) -> Result<(Vec<String>, usize)> {
     let data = slab.data();
     let array = json_is_array(data);
+    let budget = KeyBudget::new(
+        crate::memory::stated(opt.memory),
+        crate::memory::heap_limit(),
+    );
     if rows != usize::MAX {
-        return json_later_keys(slab, 0, data.len(), array, first, rows);
+        return json_later_keys(slab, 0, data.len(), array, first, rows, &budget);
     }
     let bounds = chunk_bounds(data, 0, opt.thread_budget(), Dialect::Json, true);
     let found = in_parallel(bounds.len() - 1, |i| {
-        json_later_keys(slab, bounds[i], bounds[i + 1], array, first, usize::MAX)
+        json_later_keys(
+            slab,
+            bounds[i],
+            bounds[i + 1],
+            array,
+            first,
+            usize::MAX,
+            &budget,
+        )
     });
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut later: Vec<String> = Vec::new();
+    // Each name moves from its piece into the map, or is dropped there as one
+    // an earlier piece had: never copied.
+    let mut later: HashMap<String, usize> = HashMap::new();
     let mut objects = 0usize;
     // A piece that failed fails the read: its columns would otherwise be
     // missing from the comparison without a word.
@@ -4022,12 +4037,11 @@ fn json_keys_after_the_first(
         let (names, rows) = piece?;
         objects += rows;
         for name in names {
-            if seen.insert(name.clone()) {
-                later.push(name);
-            }
+            let at = later.len();
+            later.entry(name).or_insert(at);
         }
     }
-    Ok((later, objects))
+    Ok((in_order(later), objects))
 }
 
 /// Refuses a JSON file whose objects share so few keys that it is not one

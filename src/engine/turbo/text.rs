@@ -18,8 +18,9 @@ use super::field::{
 };
 use super::slab::{Dialect, Slab, text_of};
 use crate::error::{Error, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Newline-delimited JSON if the first thing that is not whitespace is a brace
 /// or a bracket: a top-level JSON array is the same rows, wrapped.
@@ -252,6 +253,87 @@ pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
 /// A table's column names are a few kilobytes; this is a file that is not one.
 const LATER_KEYS_BYTES: usize = 64 << 20;
 
+/// What a name costs held beyond its bytes: its `String`, its slot in the
+/// table that finds it again (twice while the table grows), the allocator's
+/// rounding of a short string, and its place in the list the names leave in.
+/// 400,000 names of seven bytes took 52-60 MB of peak RSS more than none.
+/// Charged with the bytes, so a file of many short names is held to the
+/// budget as one of a few long ones is.
+const NAME_OVERHEAD: usize = 128;
+
+/// The memory the names found past a file's first object may take, shared by
+/// every thread that walks a piece of the file: one ceiling for the file, not
+/// one for each piece, so what a file may hold does not grow with the cores
+/// that read it.
+///
+/// The ceiling is [`LATER_KEYS_BYTES`], or a quarter of the memory the run was
+/// given (`--memory`, `COMPARA_MEMORY`) or may have (its heap limit), when that
+/// is less: the names are read before anything else is held, but both files'
+/// are kept for the rest of the run.
+pub(super) struct KeyBudget {
+    limit: usize,
+    used: AtomicUsize,
+    /// What set a `limit` below the ceiling, and what to do about it, for the
+    /// refusal to say.
+    from: &'static str,
+}
+
+impl KeyBudget {
+    /// The budget for one file, given the memory the run was given and its
+    /// heap limit.
+    pub(super) fn new(stated: Option<u64>, heap: Option<u64>) -> KeyBudget {
+        let mut limit = LATER_KEYS_BYTES as u64;
+        let mut from = "";
+        if let Some(h) = heap.map(|h| h / 4)
+            && h < limit
+        {
+            limit = h;
+            from = ", a quarter of this process's heap limit (ulimit -d, or the container's)";
+        }
+        if let Some(m) = stated.map(|m| m / 4)
+            && m < limit
+        {
+            limit = m;
+            from = ", a quarter of --memory (or COMPARA_MEMORY)";
+        }
+        KeyBudget {
+            limit: limit as usize,
+            used: AtomicUsize::new(0),
+            from,
+        }
+    }
+
+    /// Takes room for one more name of `bytes`, or refuses once the file's
+    /// names, on every thread together, would pass the ceiling.
+    fn take(&self, bytes: usize) -> Result<()> {
+        let cost = bytes.saturating_add(NAME_OVERHEAD);
+        let before = self.used.fetch_add(cost, Ordering::Relaxed);
+        if before.saturating_add(cost) <= self.limit {
+            return Ok(());
+        }
+        Err(Error::new(format!(
+            "the objects of this JSON file hold more than {} of different keys between them{}: \
+             they are not the rows of one table{}",
+            mb(self.limit),
+            self.from,
+            if self.from.is_empty() {
+                ""
+            } else {
+                ", or need more memory than that"
+            }
+        )))
+    }
+}
+
+/// `n` bytes for a message: in MB, or KB below one.
+fn mb(n: usize) -> String {
+    if n >= 1 << 20 {
+        format!("{} MB", n >> 20)
+    } else {
+        format!("{} KB", n >> 10)
+    }
+}
+
 /// `data.starts_with(text)` for a `text` of a few bytes, as two loads of eight
 /// that overlap rather than a call: it is asked once a member of every row.
 #[inline(always)]
@@ -269,6 +351,8 @@ fn starts_with_short(data: &[u8], text: &[u8]) -> bool {
 
 /// The keys that objects in `data[lo..hi]` carry and `known` does not hold,
 /// in the order they are first met, looking at no more than `max_rows` rows.
+/// Each one found is taken from `budget`, which the other pieces of the file
+/// share.
 ///
 /// A JSON table has no header: [`json_header`] takes the first object's keys,
 /// and a writer that leaves a null field out of its object (Spark does, and
@@ -289,11 +373,11 @@ pub(super) fn json_later_keys(
     array: bool,
     known: &[String],
     max_rows: usize,
+    budget: &KeyBudget,
 ) -> Result<(Vec<String>, usize)> {
     let data = slab.data();
     let scan = Swar;
     let end = hi.min(data.len());
-    let mut later_bytes = 0usize;
     // Each of the first object's members as a compact writer spells it,
     // `"name":`, so the common row is asked one comparison a member. A name
     // that needs an escape has no such spelling and takes the walk below.
@@ -313,8 +397,9 @@ pub(super) fn json_later_keys(
     // Names are looked up, not searched for: a file built to carry a new key
     // in every row would otherwise cost the square of its rows.
     let seen: HashSet<&str> = known.iter().map(String::as_str).collect();
-    let mut later: Vec<String> = Vec::new();
-    let mut later_seen: HashSet<String> = HashSet::new();
+    // Each new name once, with the place it was first met: a list beside a
+    // set held every name twice.
+    let mut later: HashMap<String, usize> = HashMap::new();
     let mut rows = 0usize;
     let mut pos = lo;
     while pos < end && rows < max_rows {
@@ -391,19 +476,12 @@ pub(super) fn json_later_keys(
                     slab,
                     pack(key_from as u64, (key_end - 1 - key_from) as u64, escaped),
                 );
-                if !seen.contains(name.as_str()) && !later_seen.contains(&name) {
+                if !seen.contains(name.as_str()) && !later.contains_key(&name) {
                     // The names are the one thing here that grows with a
                     // hostile file, so they have a ceiling of their own.
-                    later_bytes += name.len();
-                    if later_bytes > LATER_KEYS_BYTES {
-                        return Err(Error::new(format!(
-                            "the objects of this JSON file hold more than {} MB of different keys \
-                             between them: they are not the rows of one table",
-                            LATER_KEYS_BYTES >> 20
-                        )));
-                    }
-                    later_seen.insert(name.clone());
-                    later.push(name);
+                    budget.take(name.len())?;
+                    let at = later.len();
+                    later.insert(name, at);
                 }
             }
             member += 1;
@@ -412,7 +490,14 @@ pub(super) fn json_later_keys(
         let next = end_of_json_row(scan, data, pos.min(end), end, array, false);
         pos = if next > pos { next } else { pos + 1 };
     }
-    Ok((later, rows))
+    Ok((in_order(later), rows))
+}
+
+/// The names of a map from name to the place it was first met, in that order.
+pub(super) fn in_order(names: HashMap<String, usize>) -> Vec<String> {
+    let mut placed: Vec<(usize, String)> = names.into_iter().map(|(n, at)| (at, n)).collect();
+    placed.sort_unstable_by_key(|(at, _)| *at);
+    placed.into_iter().map(|(_, n)| n).collect()
 }
 
 /// Skips one JSON string starting at its opening quote, returning the offset one

@@ -24,6 +24,13 @@ All notable changes to this project are documented here. The format follows
   thread"); they now do that work on the thread they have, with the same
   answer. A URL input or output is read and written on that thread too,
   where it was a panic and exit 101 ("OS can't spawn worker thread").
+- The names of the JSON columns found past a file's first object are held
+  to one budget for the file, shared by every thread reading it: 64 MB,
+  or a quarter of `--memory` (or of the heap limit) when that is less.
+  Each thread had 64 MB of its own and held each name twice, so a file of
+  long keys took 200 MB of peak RSS at `--threads 1` and 739 MB at 4
+  before it was refused, whatever `--memory` said; now 137 and 146 MB,
+  and under `--memory 64M` it is refused at 40-51 MB (local, indicative).
 
 ## [0.7.0] - 2026-11-17
 
