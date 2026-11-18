@@ -46,12 +46,87 @@ const TAIL: u64 = 64 << 10;
 const GAP: u64 = 256 << 10;
 
 pub(super) fn fetch(spec: &str, want: &Want) -> Result<Source> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .map_err(|e| Error::new(format!("cannot start the download runtime: {e}")))?;
-    runtime.block_on(fetch_async(spec, want))
+    runtime("download")?.block_on(fetch_async(spec, want))
+}
+
+/// Worker threads a transfer's runtime runs on.
+const WORKERS: usize = 4;
+
+/// The runtime a transfer runs on: `WORKERS` threads, or the calling thread
+/// alone where the system refuses them. tokio starts its threads itself and
+/// panics, exit 101, when one is refused: a thread wants a stack, and under a
+/// data limit stacks count against (`ulimit -d`, or the one set from a
+/// container's) or a process limit there may be none. So the workers, and one
+/// more for a name lookup ([`look_up`]), are asked for here first, held at
+/// once; if one is refused, the transfer runs on this thread, with its
+/// requests still in flight together, to the same bytes.
+fn runtime(what: &str) -> Result<tokio::runtime::Runtime> {
+    let built = if threads_available(WORKERS + 1).is_ok() {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(WORKERS)
+            .enable_all()
+            .build()
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    };
+    built.map_err(|e| Error::new(format!("cannot start the {what} runtime: {e}")))
+}
+
+/// Whether the transfer runs on the calling thread alone ([`runtime`]): there
+/// is no thread to hand blocking work to, and tokio panics if asked for one.
+fn on_one_thread() -> bool {
+    tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread)
+}
+
+/// The addresses of `host`, looked up by the system off the runtime's threads,
+/// or on the only one when there is no other ([`on_one_thread`]): the lookup
+/// then holds up the requests in flight, for the time a lookup takes.
+async fn look_up(host: String) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let find = move || {
+        (host.as_str(), 0u16)
+            .to_socket_addrs()
+            .map(|a| a.collect::<Vec<_>>())
+    };
+    if on_one_thread() {
+        return find();
+    }
+    tokio::task::spawn_blocking(find)
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+/// Whether `n` threads can be had at once: each is started and waits until the
+/// last has been, or one is refused.
+fn threads_available(n: usize) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let mut held = Vec::with_capacity(n);
+        let mut refused = Ok(());
+        for _ in 0..n {
+            let spawned = std::thread::Builder::new().spawn_scoped(scope, || {
+                while !done.load(Ordering::Acquire) {
+                    std::thread::park();
+                }
+            });
+            match spawned {
+                Ok(h) => held.push(h),
+                Err(e) => {
+                    refused = Err(e);
+                    break;
+                }
+            }
+        }
+        done.store(true, Ordering::Release);
+        for h in &held {
+            h.thread().unpark();
+        }
+        refused
+    })
 }
 
 /// How the bytes are asked for.
@@ -635,12 +710,7 @@ impl Drop for TempPath {
 /// as a multipart upload of 16 MB parts, eight in flight, when it is not. A
 /// plain `https://` URL -- a presigned PUT -- takes the whole file in one PUT.
 pub(super) fn upload(from: &std::path::Path, dest: &str) -> Result<u64> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .map_err(|e| Error::new(format!("cannot start the upload runtime: {e}")))?;
-    runtime.block_on(upload_async(from, dest))
+    runtime("upload")?.block_on(upload_async(from, dest))
 }
 
 async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
@@ -1273,19 +1343,25 @@ fn metadata_url_via(url: &url::Url, proxied: bool) -> Option<String> {
 /// Name resolution that leaves out metadata addresses (see [`metadata_address`]).
 struct NoMetadata;
 
+/// Name resolution as the system does it, by [`look_up`] all the same: on one
+/// thread the client's own resolver would ask tokio for a thread it cannot have.
+struct System;
+
+impl reqwest::dns::Resolve for System {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let found = look_up(host).await?;
+            Ok(Box::new(found.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 impl reqwest::dns::Resolve for NoMetadata {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
         Box::pin(async move {
-            use std::net::ToSocketAddrs;
-            let lookup = host.clone();
-            let found = tokio::task::spawn_blocking(move || {
-                (lookup.as_str(), 0u16)
-                    .to_socket_addrs()
-                    .map(|a| a.collect::<Vec<_>>())
-            })
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })??;
+            let found = look_up(host.clone()).await?;
             let kept: Vec<_> = found
                 .into_iter()
                 .filter(|a| !metadata_address(a.ip()))
@@ -1371,7 +1447,9 @@ fn http_client() -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(concat!("compara/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(30));
-    if !link_local_allowed() {
+    if link_local_allowed() {
+        builder = builder.dns_resolver(Arc::new(System));
+    } else {
         builder =
             builder
                 .dns_resolver(Arc::new(NoMetadata))
@@ -1436,7 +1514,26 @@ fn client_options() -> object_store::ClientOptions {
             options = options.with_proxy_excludes(excludes);
         }
     }
+    // The store's own resolver hands each lookup to a thread, and shuffles
+    // what it finds; on one thread there is none to hand it to.
+    if on_one_thread() {
+        options = options.with_dns_resolver(Arc::new(StoreLookUp));
+    }
     options
+}
+
+/// A store's name resolution on one thread ([`client_options`]).
+#[derive(Debug)]
+struct StoreLookUp;
+
+impl object_store::client::DnsResolver for StoreLookUp {
+    fn resolve(&self, host: &str) -> object_store::client::DnsFuture {
+        let host = host.to_string();
+        Box::pin(async move {
+            let found = look_up(host).await?;
+            Ok(found.into_iter().map(|a| a.ip()).collect())
+        })
+    }
 }
 
 /// A signed store for the URL's cloud, configured from the environment.

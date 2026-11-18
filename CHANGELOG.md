@@ -22,7 +22,8 @@ All notable changes to this project are documented here. The format follows
   memory limit its stack counts against), the sortmerge and native engines
   and turbo's streaming join stopped with exit 101 ("failed to spawn
   thread"); they now do that work on the thread they have, with the same
-  answer.
+  answer. A URL input or output is read and written on that thread too,
+  where it was a panic and exit 101 ("OS can't spawn worker thread").
 
 ## [0.7.0] - 2026-11-17
 

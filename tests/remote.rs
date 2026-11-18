@@ -108,6 +108,35 @@ fn compare(
     env: &[(&str, &str)],
     stdin: Option<&[u8]>,
 ) -> (i32, String, String, String) {
+    compare_by(
+        Command::new(env!("CARGO_BIN_EXE_compara")),
+        a,
+        b,
+        args,
+        env,
+        stdin,
+    )
+}
+
+/// The program run where the system refuses every thread it asks for: each
+/// asks for a stack (`RUST_MIN_STACK`) larger than the data limit.
+fn without_threads() -> Command {
+    let mut cmd = Command::new("bash");
+    cmd.args(["-c", "ulimit -d 4194304; exec \"$0\" \"$@\""])
+        .arg(env!("CARGO_BIN_EXE_compara"))
+        .env("RUST_MIN_STACK", (8u64 << 30).to_string());
+    cmd
+}
+
+/// [`compare`], run as `cmd`.
+fn compare_by(
+    mut cmd: Command,
+    a: &str,
+    b: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    stdin: Option<&[u8]>,
+) -> (i32, String, String, String) {
     let out_dir = std::env::temp_dir().join(format!(
         "compara-remote-out-{}-{}",
         std::process::id(),
@@ -116,7 +145,6 @@ fn compare(
     let json = out_dir.join("summary.json");
     let export = out_dir.join("export");
     std::fs::create_dir_all(&out_dir).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_compara"));
     cmd.args(["compare", a, b])
         .args(args)
         .arg("--json")
@@ -356,6 +384,39 @@ fn text_over_http_and_s3_is_the_local_answer() {
         "stdin: {}",
         got.1
     );
+}
+
+/// Where the system refuses every thread, a URL is read on the calling thread
+/// alone, to the local answer: over HTTP by a name, looked up on that thread
+/// too, and over S3 by one. With threads, the runtime and the name lookup
+/// would each have asked tokio for one, and tokio panics when refused.
+#[test]
+fn urls_are_read_on_one_thread_when_no_other_can_be_had() {
+    let f = fixture("20k", &[]);
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let want = compare(&local("t_a.csv"), &local("t_b.csv"), &KEY, &[], None);
+    assert!(!want.2.is_empty());
+    let Some(server) = Server::start(&f.0, &[]) else {
+        eprintln!("skipping: no python to run the object server");
+        return;
+    };
+    let named = server.url.replace("127.0.0.1", "localhost");
+    let env = s3_env(&named);
+    let s3 = borrowed(&env);
+    for (a, b, env) in [
+        (format!("{named}/bkt/t_a.csv"), local("t_b.csv"), &[][..]),
+        (
+            "s3://bkt/t_a.csv".into(),
+            "s3://bkt/t_b.csv".into(),
+            &s3[..],
+        ),
+    ] {
+        let got = compare_by(without_threads(), &a, &b, &KEY, env, None);
+        assert_eq!(want.0, got.0, "{a} {b}: exit; stderr {}", got.1);
+        assert_eq!(want.2, got.2, "{a} {b}: summary");
+        assert_eq!(want.3, got.3, "{a} {b}: rows");
+    }
 }
 
 /// What goes wrong says what it is: a missing object, a refused one, a
