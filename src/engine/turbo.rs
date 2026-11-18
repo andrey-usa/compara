@@ -4318,6 +4318,18 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let wanted: Vec<&String> = opt.key.iter().chain(&resolved.compared).collect();
 
     if fused_active(a_input.text_bytes(), b_input.text_bytes(), opt, total) {
+        // Only forced: the size gate never picks it for Parquet. A's rows are
+        // joined by the text sweep, which a Parquet file does not have, so the
+        // sweep would join none of them and the check below fail on its own
+        // answer, after the whole compare.
+        if let Input::Parquet { .. } = a_input {
+            return Err(Error::new(format!(
+                "COMPARA_FUSED_JOIN joins the first file's rows as its text is swept, and {} \
+                 is Parquet: unset COMPARA_FUSED_JOIN to compare it with the ordinary join, or \
+                 give a text file first",
+                a_path.display()
+            )));
+        }
         return compare_fused(
             a_input, b_input, opt, &resolved, key_size, a_cols, b_cols, &wanted, total,
         );

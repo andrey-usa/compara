@@ -196,6 +196,22 @@ impl Fixture {
         Fixture(dir)
     }
 
+    /// The same 20,000-row pair as CSV and as Parquet, so either file can be
+    /// given as either format.
+    fn with_parquet() -> Fixture {
+        let fx = Fixture::new();
+        generate_as(
+            20_000,
+            &fx.path("a.parquet"),
+            &fx.path("b.parquet"),
+            7,
+            Format::Parquet,
+            Compression::None,
+        )
+        .expect("the generator");
+        fx
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
@@ -653,4 +669,45 @@ fn parallel_insert_off_switch_forces_serial_index_insert() {
         "COMPARA_PARALLEL_INSERT=0 did not take serial index insert:\n{err_off}"
     );
     assert_eq!(counts(&out_on), counts(&out_off));
+}
+
+/// The fused join joins A's rows as the sweep reads their text, and a Parquet
+/// file has none: forced on a Parquet first file, the sweep joined no row and
+/// the run failed its own agreement check after the whole compare ("disagrees").
+/// It is refused before anything is read, with what to do instead. A Parquet
+/// second file is read into B's index like any other, and joins. (`turbo` is
+/// named: two Parquet files go to the columnar path otherwise.)
+#[test]
+fn a_parquet_first_file_is_refused_by_the_fused_join_and_a_second_one_joins() {
+    let fx = Fixture::with_parquet();
+    let args = |a: &'static str, b: &'static str| {
+        [
+            "compare",
+            a,
+            b,
+            "-k",
+            "account_id,txn_id",
+            "--summary",
+            "--engine",
+            "turbo",
+        ]
+    };
+    let (code, csv, err) = run(&fx.0, &args("a.csv", "b.csv"), false);
+    assert_eq!(code, 1, "{err}");
+    for (a, b) in [("a.parquet", "b.csv"), ("a.parquet", "b.parquet")] {
+        let (code, out, err) = run(&fx.0, &args(a, b), false);
+        assert_eq!(code, 1, "{a} {b}: {err}");
+        assert_eq!(counts(&out), counts(&csv), "{a} {b}");
+        let (code, _, err) = run(&fx.0, &args(a, b), true);
+        assert_eq!(code, 2, "{a} {b}: {err}");
+        assert!(
+            err.contains("COMPARA_FUSED_JOIN")
+                && err.contains("is Parquet")
+                && err.contains("unset COMPARA_FUSED_JOIN"),
+            "{a} {b}: {err}"
+        );
+    }
+    let (code, out, err) = run(&fx.0, &args("a.csv", "b.parquet"), true);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(counts(&out), counts(&csv));
 }
