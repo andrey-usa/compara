@@ -59,7 +59,7 @@ use crate::columns::{Resolved, Typed, compare_keys, differs, empty_to_null, norm
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
 use crate::error::{Error, Result};
 use crate::keyhash;
-use crate::options::Options;
+use crate::options::{Engine, Options};
 use crate::parallel;
 use crate::phases::Phases;
 use crate::rowstore::Joined;
@@ -725,6 +725,20 @@ fn fits_estimated<'t>(
         };
         refuse_over(heap, rows, theirs, "about ")
     })
+}
+
+/// Whether the fused join may refuse a pair on [`fits_estimated`]'s estimate.
+/// An estimate can be wrong -- A's rows spanning more lines than B's and longer
+/// than them read as more rows than A has -- so it is acted on only where the
+/// refusal is not the answer: under `--engine auto`, with both files CSV and
+/// the heap at sortmerge's floor or above, the pair goes to sortmerge, which
+/// gives the same counts. JSON and Parquet have no other reader, a named engine
+/// is the one that answers, and below the floor the refusal is the error the
+/// run ends with; there the pair is tried, as before the check.
+fn estimate_may_refuse(engine: Option<Engine>, dialects: [Dialect; 2], heap: Option<u64>) -> bool {
+    engine == Some(Engine::Auto)
+        && dialects.iter().all(|d| *d == Dialect::Csv)
+        && heap.is_some_and(|h| h >= crate::engine::SORTMERGE_FLOOR)
 }
 
 /// `2000200` as `2,000,200`, as the summary line writes counts.
@@ -3667,7 +3681,14 @@ fn compare_fused(
     // A projected on the full budget too; its sweep joins as it goes.
     let b = b_input.project(wanted, key_size, total)?;
     let a = a_input.project(wanted, key_size, total)?;
-    let fits = fits_estimated(crate::memory::heap_limit(), b.slab.data(), a.slab.data());
+    let heap = crate::memory::heap_limit();
+    let fits = estimate_may_refuse(
+        opt.engine_name().ok(),
+        [a.slab.dialect(), b.slab.dialect()],
+        heap,
+    )
+    .then(|| fits_estimated(heap, b.slab.data(), a.slab.data()))
+    .flatten();
     // While B's rows are inserted, on one thread, nothing reads the disk: A's
     // sweep cannot start until B's index is whole. So the reads A's sweep will
     // begin with are started then, by a thread that only asks for them.
@@ -4413,6 +4434,35 @@ mod fit_tests {
         assert!(big.len() > LINE_WINDOW * LINE_WINDOWS);
         let est = lines_about(&big);
         assert!(est.abs_diff(200_000) < 200, "{est}");
+    }
+
+    #[test]
+    fn an_estimate_refuses_only_where_sortmerge_answers_instead() {
+        let floor = crate::engine::SORTMERGE_FLOOR;
+        let csv = [Dialect::Csv, Dialect::Csv];
+        assert!(estimate_may_refuse(Some(Engine::Auto), csv, Some(floor)));
+        // JSON or Parquet on either side: turbo is the only reader.
+        for other in [Dialect::Json, Dialect::Raw] {
+            assert!(!estimate_may_refuse(
+                Some(Engine::Auto),
+                [other, Dialect::Csv],
+                Some(floor)
+            ));
+            assert!(!estimate_may_refuse(
+                Some(Engine::Auto),
+                [Dialect::Csv, other],
+                Some(floor)
+            ));
+        }
+        // A named turbo answers itself; below the floor nothing takes over.
+        assert!(!estimate_may_refuse(Some(Engine::Turbo), csv, Some(floor)));
+        assert!(!estimate_may_refuse(None, csv, Some(floor)));
+        assert!(!estimate_may_refuse(
+            Some(Engine::Auto),
+            csv,
+            Some(floor - 1)
+        ));
+        assert!(!estimate_may_refuse(Some(Engine::Auto), csv, None));
     }
 
     #[test]
