@@ -16,6 +16,14 @@ All notable changes to this project are documented here. The format follows
   indexes need. Where they fit, nothing changes, also when one file's rows
   are much longer than the other's.
 
+### Fixed
+
+- Where the system refuses a thread (a container's process limit, or a
+  memory limit its stack counts against), the sortmerge and native engines
+  and turbo's streaming join stopped with exit 101 ("failed to spawn
+  thread"); they now do that work on the thread they have, with the same
+  answer.
+
 ## [0.7.0] - 2026-11-17
 
 ### Added

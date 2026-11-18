@@ -3630,7 +3630,10 @@ fn read_ahead(a: &Side, rows: usize, threads: usize, stop: &AtomicBool) {
         for i in 0..ways {
             let start = from + span * i / ways;
             let end = (start + each).min(size);
-            scope.spawn(move || {
+            // Only a head start on reads the sweep makes anyway: a thread the
+            // OS refuses (a process limit, or a data limit its stack counts
+            // against) is one chunk not read ahead.
+            let _ = std::thread::Builder::new().spawn_scoped(scope, move || {
                 let mut seen = 0u8;
                 let mut at = start;
                 while at < end && !stop.load(Ordering::Relaxed) {
@@ -3672,7 +3675,8 @@ fn compare_fused(
     let (mut bi, _) = std::thread::scope(|scope| {
         let (go, wait) = std::sync::mpsc::channel::<usize>();
         let (a, stop) = (&a, &stop);
-        scope.spawn(move || {
+        // Refused a thread, there is no read-ahead and `start` sends to no one.
+        let _ = std::thread::Builder::new().spawn_scoped(scope, move || {
             if let Ok(rows) = wait.recv() {
                 read_ahead(a, rows, total, stop);
             }

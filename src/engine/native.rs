@@ -27,7 +27,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let read_b = || read_store(b_path, &b_header, &resolved.compared, opt);
     let (a, b) = if opt.thread_budget() > 1 {
         std::thread::scope(|scope| {
-            let b = scope.spawn(read_b);
+            // Refused a thread, B is read here, after A.
+            let b = crate::parallel::spawn(scope, &read_b);
             let a = read_store(a_path, &a_header, &resolved.compared, opt);
             let b = b
                 .join()

@@ -384,3 +384,54 @@ fn a_named_sortmerge_without_room_is_refused_up_front() {
         run.stderr
     );
 }
+
+/// A thread wants a stack, and under a memory limit (or a container's process
+/// limit) the OS may refuse one. Each engine, and the fused join, then does the
+/// work on the thread it already has: the same answer, not a panic and exit 101.
+/// A stack larger than the data limit makes every spawn fail, the same way on
+/// every machine; the batches are small so sortmerge spills and merges.
+#[test]
+fn every_engine_answers_when_no_thread_can_be_had() {
+    let f = Fixture::new();
+    let run = |engine: &str, fused: bool, refused: bool| {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(format!(
+            "ulimit -d {}; exec {} compare {} {} -k account_id,txn_id --threads 4 --engine {engine}",
+            4 << 20,
+            env!("CARGO_BIN_EXE_compara"),
+            f.a().display(),
+            f.b().display(),
+        ));
+        cmd.env("COMPARA_SORTMERGE_BATCH_BYTES", "200000")
+            .env_remove("COMPARA_FUSED_JOIN")
+            .env_remove("RUST_MIN_STACK");
+        if fused {
+            cmd.env("COMPARA_FUSED_JOIN", "1");
+        }
+        if refused {
+            cmd.env("RUST_MIN_STACK", (8u64 << 30).to_string());
+        }
+        cmd.output().expect("bash")
+    };
+    // The counts, without the engine and its time at the end.
+    let counts = |o: &std::process::Output| {
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        out.rsplit_once(" | ")
+            .map(|(c, _)| c.to_string())
+            .unwrap_or(out)
+    };
+    for (engine, fused) in [
+        ("auto", false),
+        ("turbo", false),
+        ("turbo", true),
+        ("sortmerge", false),
+        ("native", false),
+    ] {
+        let free = run(engine, fused, false);
+        let refused = run(engine, fused, true);
+        let err = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(free.status.code(), Some(1), "{engine} {fused}: {free:?}");
+        assert_eq!(refused.status.code(), Some(1), "{engine} {fused}: {err}");
+        assert_eq!(counts(&free), counts(&refused), "{engine} {fused}: {err}");
+    }
+}

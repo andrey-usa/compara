@@ -96,9 +96,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             width,
         )
     };
+    let sort_b = || sort("b", b_path, &b_header);
     let (a_runs, b_runs) = if opt.thread_budget() > 1 {
         std::thread::scope(|scope| {
-            let b = scope.spawn(|| sort("b", b_path, &b_header));
+            // Refused a thread, B is sorted here, after A.
+            let b = crate::parallel::spawn(scope, &sort_b);
             let a = sort("a", a_path, &a_header);
             let b = b
                 .join()
@@ -106,7 +108,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             (a, b)
         })
     } else {
-        (sort("a", a_path, &a_header), sort("b", b_path, &b_header))
+        (sort("a", a_path, &a_header), sort_b())
     };
     let (a_runs, b_runs) = (a_runs?, b_runs?);
     let (a_rows, b_rows) = (a_runs.rows, b_runs.rows);
@@ -133,7 +135,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         std::thread::scope(|scope| {
             let ca = Ahead::start(scope, ca, width)?;
             let cb = Ahead::start(scope, cb, width)?;
-            join(Box::new(ca), Box::new(cb))
+            join(ca, cb)
         })?
     } else {
         join(ca, cb)?
@@ -221,30 +223,40 @@ fn stream_into(
     let key_size = opt.key.len();
     let budget = batch_bytes(opt);
 
+    // Sorts a full batch and writes it as the run numbered `n`.
+    let spill = |batch: &Packed, n: usize, rowbuf: &mut Vec<u8>| -> Result<PathBuf> {
+        let path = dir.join(format!("run-{n}.bin"));
+        let mut w = BufWriter::with_capacity(1 << 16, File::create(&path)?);
+        for row in sorted_order(batch, key_size) {
+            write_row(&mut w, batch, row as usize, rowbuf)?;
+        }
+        w.flush()?;
+        let file = w.into_inner().map_err(|e| Error::new(e.to_string()))?;
+        crate::memory::write_out(&file);
+        Ok(path)
+    };
+
     // Full batches go to a thread that sorts and writes them while this one
     // reads on. The channel holds one, so at most two are in memory: the one
     // being written and the one being filled.
     let (to_spill, batches) = mpsc::sync_channel::<Packed>(0);
-    let spill_dir = dir.to_path_buf();
     std::thread::scope(|scope| {
-        let spiller = scope.spawn(move || -> Result<Vec<PathBuf>> {
-            let mut spilled = Vec::new();
-            let mut rowbuf: Vec<u8> = Vec::new();
-            for batch in batches {
-                let path = spill_dir.join(format!("run-{}.bin", spilled.len()));
-                let mut w = BufWriter::with_capacity(1 << 16, File::create(&path)?);
-                for row in sorted_order(&batch, key_size) {
-                    write_row(&mut w, &batch, row as usize, &mut rowbuf)?;
+        let spill = &spill;
+        let spiller =
+            std::thread::Builder::new().spawn_scoped(scope, move || -> Result<Vec<PathBuf>> {
+                let mut spilled = Vec::new();
+                let mut rowbuf: Vec<u8> = Vec::new();
+                for batch in batches {
+                    spilled.push(spill(&batch, spilled.len(), &mut rowbuf)?);
                 }
-                w.flush()?;
-                let file = w.into_inner().map_err(|e| Error::new(e.to_string()))?;
-                crate::memory::write_out(&file);
-                spilled.push(path);
-            }
-            Ok(spilled)
-        });
+                Ok(spilled)
+            });
+        // A thread the OS refuses (a process limit, or a data limit its stack
+        // counts against) leaves the batches to be written here, between reads.
+        let mut here: Option<(Vec<PathBuf>, Vec<u8>)> =
+            spiller.is_err().then(|| (Vec::new(), Vec::new()));
 
-        let read = || -> Result<(Packed, i64)> {
+        let mut read = || -> Result<(Packed, i64)> {
             let mut batch = Packed::new(width);
             let mut rows = 0i64;
             let mut sent = false;
@@ -260,7 +272,9 @@ fn stream_into(
                 if batch.bytes() + batch.len() * 4 >= budget {
                     let full = std::mem::replace(&mut batch, Packed::new(width));
                     sent = true;
-                    if to_spill.send(full).is_err() {
+                    if let Some((spilled, rowbuf)) = here.as_mut() {
+                        spilled.push(spill(&full, spilled.len(), rowbuf)?);
+                    } else if to_spill.send(full).is_err() {
                         break; // the spiller failed, and says why below
                     }
                 }
@@ -269,15 +283,22 @@ fn stream_into(
             // never filled a batch stays in memory and is sorted here.
             if sent && !batch.is_empty() {
                 let rest = std::mem::replace(&mut batch, Packed::new(width));
-                let _ = to_spill.send(rest);
+                if let Some((spilled, rowbuf)) = here.as_mut() {
+                    spilled.push(spill(&rest, spilled.len(), rowbuf)?);
+                } else {
+                    let _ = to_spill.send(rest);
+                }
             }
             Ok((batch, rows))
         };
         let got = read();
         drop(to_spill);
-        let spilled = spiller
-            .join()
-            .unwrap_or_else(|_| Err(Error::new("spilling a sorted run panicked")))?;
+        let spilled = match spiller {
+            Ok(spiller) => spiller
+                .join()
+                .unwrap_or_else(|_| Err(Error::new("spilling a sorted run panicked")))?,
+            Err(_) => here.map(|(spilled, _)| spilled).unwrap_or_default(),
+        };
         let (last, rows) = got?;
         let order = if spilled.is_empty() {
             sorted_order(&last, key_size)
@@ -406,13 +427,24 @@ struct Ahead {
 }
 
 impl Ahead {
+    /// `inner` run ahead on a thread, or, where the OS refuses one (a process
+    /// limit, or a data limit its stack counts against), `inner` itself, read
+    /// in turn with the other file's.
     fn start<'s>(
         scope: &'s std::thread::Scope<'s, '_>,
-        mut inner: Box<dyn Cursor + Send>,
+        inner: Box<dyn Cursor + Send>,
         width: usize,
-    ) -> Result<Ahead> {
+    ) -> Result<Box<dyn Cursor>> {
         let (to_join, blocks) = mpsc::sync_channel(2);
-        scope.spawn(move || {
+        // Handed over through a slot rather than moved: a refused spawn drops
+        // its closure, and the cursor must outlive that.
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(inner)));
+        let theirs = std::sync::Arc::clone(&slot);
+        let spawned = std::thread::Builder::new().spawn_scoped(scope, move || {
+            let taken = theirs.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let Some(mut inner) = taken else {
+                return;
+            };
             loop {
                 let mut block = Packed::new(width);
                 while block.len() < AHEAD_ROWS {
@@ -430,13 +462,19 @@ impl Ahead {
                 }
             }
         });
+        if spawned.is_err() {
+            let inner = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            return inner
+                .map(|c| c as Box<dyn Cursor>)
+                .ok_or_else(|| Error::new("a merge cursor was taken twice"));
+        }
         let mut ahead = Ahead {
             blocks,
             block: Packed::new(width),
             at: 0,
         };
         ahead.refill()?;
-        Ok(ahead)
+        Ok(Box::new(ahead))
     }
 
     /// The next block, or an empty one once the rows are done. An error on the
