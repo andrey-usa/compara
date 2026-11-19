@@ -1458,6 +1458,9 @@ async fn fetch_part_once(
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| FetchError::Transient(e.to_string()))?;
                 let len = chunk.len() as u64;
+                if at + len > part.end {
+                    return Err(FetchError::Transient("a range ran past its end".into()));
+                }
                 to.put(at + shift, chunk).await?;
                 at += len;
             }
