@@ -440,6 +440,10 @@ fn text_over_http_and_s3_is_the_local_answer() {
 /// would each have asked tokio for one, and tokio panics when refused.
 #[test]
 fn urls_are_read_on_one_thread_when_no_other_can_be_had() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: thread stacks count against `ulimit -d` on Linux");
+        return;
+    }
     let f = fixture("20k", &[]);
     let bucket = f.0.join("bkt");
     let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
