@@ -124,16 +124,7 @@ impl Slab {
 
     /// The field's logical bytes: the value, with its escapes undone.
     pub(super) fn logical(&self, f: Field) -> LogicalBytes<'_> {
-        LogicalBytes {
-            raw: self.raw(f),
-            mode: self.mode(f),
-            at: 0,
-            closed: false,
-            last: b'[',
-            pending: [0; 6],
-            pending_len: 0,
-            pending_at: 0,
-        }
+        LogicalBytes::new(self.raw(f), self.mode(f))
     }
 
     /// How the field's bytes are read: as they stand, or through its
@@ -197,6 +188,29 @@ pub(super) struct LogicalBytes<'a> {
     pending: [u8; 6],
     pending_len: u8,
     pending_at: u8,
+}
+
+/// The characters of a JSON string with its escapes undone, `raw` being its
+/// bytes between the quotes: what [`Slab::logical`] reads a string field as,
+/// for a string that is not a field. The row parser reads a member name that
+/// holds a backslash through this, so it finds the column [`text_of`] named.
+pub(super) fn json_string(raw: &[u8]) -> LogicalBytes<'_> {
+    LogicalBytes::new(raw, Mode::Json)
+}
+
+impl<'a> LogicalBytes<'a> {
+    fn new(raw: &'a [u8], mode: Mode) -> Self {
+        LogicalBytes {
+            raw,
+            mode,
+            at: 0,
+            closed: false,
+            last: b'[',
+            pending: [0; 6],
+            pending_len: 0,
+            pending_at: 0,
+        }
+    }
 }
 
 impl LogicalBytes<'_> {

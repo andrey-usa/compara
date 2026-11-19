@@ -28,6 +28,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A JSON key written with an escape was never read: Python's `json.dumps`
+  writes every non-ASCII name that way by default (`"caf\u00e9"`), PHP
+  writes `/` as `\/`. The column was listed but had no values on either
+  side, so its changes went unreported with exit 0, and the same name
+  written plainly on the other side made every row changed. A key is now
+  the name its escapes spell, a key column's included.
 - A nested JSON value (an object or an array) was compared as written, its
   spacing included, so the same records pretty-printed and compact compared
   as changed in every row with one: 133,212 rows changed of 298,486

@@ -841,6 +841,87 @@ fn the_same_records_written_pretty_and_compact_are_the_same_table() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// A member name is the name its escapes spell. Python's `json.dumps` writes
+/// every non-ASCII name escaped by default, a character past U+FFFF as a
+/// surrogate pair, and PHP escapes `/`. Such a name was looked up as written
+/// and named no column: its changes went unreported with exit 0, and the same
+/// name written plainly on the other side made every row changed. A key
+/// column may be one, and the files are past the size a file is split at.
+#[test]
+fn a_json_name_written_with_escapes_is_the_name_it_spells() {
+    let dir = std::env::temp_dir().join(format!("compara-escaped-names-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("a temp dir");
+    let rows = 60_000;
+    // `escaped` spells the names as Python and PHP do; `change` alters the
+    // `café` value of every 1000th row and the emoji's of every 1500th.
+    let table = |escaped: bool, change: bool| {
+        let (key, cafe, slash, emoji) = if escaped {
+            ("cl\\u00e9", "caf\\u00e9", "a\\/b", "\\ud83d\\ude00 x")
+        } else {
+            ("cl\u{e9}", "caf\u{e9}", "a/b", "\u{1f600} x")
+        };
+        let mut text = String::with_capacity(rows * 96);
+        for i in 0..rows {
+            let c = if change && i % 1000 == 0 { "z" } else { "c" };
+            let e = if change && i % 1500 == 0 { "z" } else { "e" };
+            text.push_str(&format!(
+                "{{\"{key}\":{i},\"{cafe}\":\"{c}{i}\",\"{slash}\":\"slash {i}\",\
+                 \"{emoji}\":\"{e}{i}\",\"note\":\"a row of some length\"}}\n"
+            ));
+        }
+        let path = dir.join(format!("{escaped}-{change}.ndjson"));
+        fs::write(&path, text).unwrap();
+        path
+    };
+    let a = table(true, false);
+    let a_raw = table(false, false);
+    let b = table(true, true);
+    let b_raw = table(false, true);
+    assert!(fs::metadata(&a).unwrap().len() > 4 << 20);
+    // Rows 0, 3000, 6000, ... change both columns.
+    let n = rows as i64;
+    let changed = n / 1000 + n / 1500 - n / 3000;
+    for (x, y, want) in [
+        (&a, &b, changed),
+        (&a, &b_raw, changed),
+        (&a_raw, &b, changed),
+        (&a, &a_raw, 0),
+    ] {
+        for threads in [1usize, 2, 4] {
+            for engine in ["auto", "turbo"] {
+                let mut opt = options(&["cl\u{e9}"]);
+                opt.engine = engine.to_string();
+                opt.threads = Some(threads);
+                let result = run(x, y, &mut opt);
+                let said = format!("{} {} {engine} {threads}", x.display(), y.display());
+                assert_eq!(result.counts.matched, n, "{said}: {}", answer(&result));
+                assert_eq!(result.counts.changed, want, "{said}: {}", answer(&result));
+                let per: Vec<(&str, i64)> = result
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.changed))
+                    .collect();
+                let (cafe, emoji) = if want == 0 {
+                    (0, 0)
+                } else {
+                    (n / 1000, n / 1500)
+                };
+                assert_eq!(
+                    per,
+                    [
+                        ("caf\u{e9}", cafe),
+                        ("a/b", 0),
+                        ("\u{1f600} x", emoji),
+                        ("note", 0)
+                    ],
+                    "{said}"
+                );
+            }
+        }
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
 /// A JSON table's columns are the keys of all its objects, not of the first.
 ///
 /// A writer that leaves a null field out of its object (Spark's does, and

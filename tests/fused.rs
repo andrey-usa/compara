@@ -133,6 +133,27 @@ impl Fixture {
         Fixture(dir)
     }
 
+    /// The key and the compared column named with escapes in A, as Python's
+    /// `json.dumps` writes a non-ASCII name, and plainly in B.
+    fn with_escaped_names() -> Fixture {
+        let dir = std::env::temp_dir().join(format!(
+            "compara-fused-esc-{}-{}",
+            std::process::id(),
+            fixture_id()
+        ));
+        fs::create_dir_all(&dir).expect("a temp directory");
+        let mut a = String::new();
+        let mut b = String::new();
+        for i in 0..6000 {
+            a.push_str(&format!("{{\"cl\\u00e9\":{i},\"v\\u00e9\":\"a{i}\"}}\n"));
+            let v = if i % 3 == 0 { "c" } else { "a" };
+            b.push_str(&format!("{{\"cl\u{e9}\":{i},\"v\u{e9}\":\"{v}{i}\"}}\n"));
+        }
+        fs::write(dir.join("a.json"), a).expect("a.json");
+        fs::write(dir.join("b.json"), b).expect("b.json");
+        Fixture(dir)
+    }
+
     /// Past the chunking threshold, so four threads sweep four chunks, with a
     /// repeat after every third key: changed, and removed where the key is
     /// missing from B. Each part's first picks include repeats, so the report's
@@ -336,6 +357,21 @@ fn fused_ndjson_counts_match() {
     let fx = Fixture::with_ndjson();
     let args = ["compare", "a.json", "b.json", "-k", "id", "--summary"];
     let (code, out, _) = run(&fx.0, &args, false);
+    let (fcode, fout, ferr) = run(&fx.0, &args, true);
+    assert_eq!(fcode, code, "fused run failed: {ferr}");
+    assert_eq!(counts(&fout), counts(&out), "fused ndjson disagrees");
+}
+
+#[test]
+fn fused_ndjson_reads_a_name_by_what_its_escapes_spell() {
+    let fx = Fixture::with_escaped_names();
+    let args = ["compare", "a.json", "b.json", "-k", "cl\u{e9}", "--summary"];
+    let (code, out, err) = run(&fx.0, &args, false);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        counts(&out).contains("matched 6,000 (changed 2,000) | added 0 | removed 0"),
+        "{out}"
+    );
     let (fcode, fout, ferr) = run(&fx.0, &args, true);
     assert_eq!(fcode, code, "fused run failed: {ferr}");
     assert_eq!(counts(&fout), counts(&out), "fused ndjson disagrees");

@@ -16,7 +16,7 @@ use super::field::{
     ABSENT, Delims, Field, Scan, Swar, Wide, next_of1, next_of1_with, next_of2, next_of2_with,
     next_of3_with, pack, skip_quoted, skip_quoted_with,
 };
-use super::slab::{Dialect, Slab, text_of};
+use super::slab::{Dialect, Slab, json_string, text_of};
 use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1235,7 +1235,8 @@ pub(super) enum RowParser {
         /// every slot is a filled key column the rest of the object is skipped.
         key_size: usize,
         /// What the table answers for `wanted[i]`: `i` itself unless the same
-        /// name also fills an earlier slot, and -1 for a missing column. Names
+        /// name also fills an earlier slot, and -1 for a missing column or a
+        /// name holding a backslash, which is never guessed. Names
         /// arrive in the same order row after row, usually slot order, so the
         /// member after slot `i` is tried as `i + 1` first, and a right guess
         /// has to give exactly the slot the table would.
@@ -1803,6 +1804,7 @@ impl RowParser {
             RowParser::Json { wanted, .. } => wanted
                 .iter()
                 .map(|w| match w {
+                    Some(w) if w.contains('\\') => -1,
                     Some(w) => parser.slot_for(w.as_bytes()).map_or(-1, |s| s as i32),
                     None => -1,
                 })
@@ -2068,7 +2070,7 @@ impl RowParser {
                 }
             }
             let key_from = pos + 1;
-            let key_end = skip_json_string(scan, data, pos, end).0;
+            let (key_end, key_escaped) = skip_json_string(scan, data, pos, end);
             // A row cut off right after a key's opening quote has no key.
             if key_end > end || key_end <= key_from {
                 break;
@@ -2125,9 +2127,15 @@ impl RowParser {
                     Some(pack(from as u64, (pos - from) as u64, false))
                 }
             };
+            // A name written with an escape is looked up as what it spells.
+            // It holds a backslash as written, so it can equal as written
+            // only a wanted name holding one, and those are never guessed.
             if let Some(field) = field
                 && let Some(slot) = match wanted.get(guess) {
-                    Some(Some(w)) if w.as_bytes() == key => usize::try_from(canon[guess]).ok(),
+                    Some(Some(w)) if w.as_bytes() == key && canon[guess] >= 0 => {
+                        Some(canon[guess] as usize)
+                    }
+                    _ if key_escaped => self.slot_for_escaped(key),
                     _ => self.slot_for(key),
                 }
             {
@@ -2156,6 +2164,44 @@ impl RowParser {
             }
         }
         end_of_json_row(scan, data, pos, end, *array, open)
+    }
+
+    /// [`Self::slot_for`] for a member name that holds a backslash: the slot
+    /// of the name its escapes spell, as the header and the later-key walk
+    /// read it ([`text_of`]). Looked up as written, `caf\u00e9` (how Python's
+    /// `json.dumps` writes `café` by default) named no column, and that
+    /// column's values were read on neither side.
+    ///
+    /// Out of line: a writer that escapes a name escapes it in every row, but
+    /// most writers escape none, and their parse keeps one test of a flag it
+    /// already has.
+    #[cold]
+    #[inline(never)]
+    fn slot_for_escaped(&self, key: &[u8]) -> Option<usize> {
+        // Undoing an escape never lengthens a name, so most fit here.
+        let mut stack = [0u8; 128];
+        let mut chars = json_string(key);
+        let mut n = 0;
+        while n < stack.len() {
+            match chars.next() {
+                Some(b) => stack[n] = b,
+                None => return self.slot_for_name(&stack[..n]),
+            }
+            n += 1;
+        }
+        let mut heap = stack.to_vec();
+        heap.extend(chars);
+        self.slot_for_name(&heap)
+    }
+
+    /// A decoded name's slot. One that is not UTF-8 (an escaped lone
+    /// surrogate) is looked up as [`text_of`] made it a column name: with
+    /// the replacement character.
+    fn slot_for_name(&self, name: &[u8]) -> Option<usize> {
+        match std::str::from_utf8(name) {
+            Ok(_) => self.slot_for(name),
+            Err(_) => self.slot_for(String::from_utf8_lossy(name).as_bytes()),
+        }
     }
 
     pub(super) fn slot_for(&self, key: &[u8]) -> Option<usize> {
@@ -3249,6 +3295,59 @@ mod tests {
         parser.parse(slab.data(), next, text.len(), &mut out);
         assert_eq!(slab.raw(out[0]), b"2");
         assert_eq!(slab.raw(out[1]), b"b");
+    }
+
+    #[test]
+    fn a_name_is_read_as_what_its_escapes_spell() {
+        // How writers spell names: Python's json.dumps escapes every
+        // non-ASCII character, one past U+FFFF as a surrogate pair; PHP
+        // escapes `/`. A name too long for the lookup's stack buffer, and an
+        // escaped lone surrogate, which the header names lossily. A name
+        // holding the six bytes `\u00e9` itself (`\\u00e9` as written) is a
+        // column of its own, and a name that spells it with an escape does
+        // not land there.
+        let long = "\u{e9}".repeat(100);
+        let text = format!(
+            "{{\"caf\\u00e9\":\"1\",\"a\\/b\":\"2\",\"\\ud83d\\ude00\":\"3\",\"q\\\"\":\"4\",\
+             \"{}\":\"5\",\"caf\\\\u00e9\":\"6\",\"\\ud800\":\"7\",\"plain\":\"8\"}}\n\
+             {{\"caf\u{e9}\":\"9\",\"caf\\u00E9\":\"10\",\"plain\":\"11\"}}\n",
+            "\\u00e9".repeat(100)
+        );
+        let slab = json_slab(&text);
+        let names = json_header(&slab, Path::new("x")).expect("a header");
+        let lone = String::from_utf8_lossy(b"\xed\xa0\x80").into_owned();
+        assert_eq!(
+            names,
+            [
+                "caf\u{e9}",
+                "a/b",
+                "\u{1f600}",
+                "q\"",
+                &long,
+                "caf\\u00e9",
+                &lone,
+                "plain"
+            ]
+        );
+        for key_size in [0, 1] {
+            let parser =
+                RowParser::json(names.iter().cloned().map(Some).collect(), key_size, false);
+            let mut out = vec![ABSENT; names.len()];
+            let next = parser.parse(slab.data(), 0, text.len(), &mut out);
+            let got: Vec<&[u8]> = out.iter().map(|&f| slab.raw(f)).collect();
+            assert_eq!(got, [b"1", b"2", b"3", b"4", b"5", b"6", b"7", b"8"]);
+            // The same name raw and then escaped: the escaped one is the
+            // last value, and the literal `\u00e9` column has none.
+            parser.parse(slab.data(), next, text.len(), &mut out);
+            let got: Vec<&[u8]> = out.iter().map(|&f| slab.raw(f)).collect();
+            let none: &[u8] = b"";
+            let want: [&[u8]; 8] = if key_size == 1 {
+                [b"9", none, none, none, none, none, none, b"11"]
+            } else {
+                [b"10", none, none, none, none, none, none, b"11"]
+            };
+            assert_eq!(got, want, "key size {key_size}");
+        }
     }
 
     #[test]
