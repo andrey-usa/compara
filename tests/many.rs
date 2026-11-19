@@ -265,6 +265,61 @@ fn parts_that_are_not_one_table_are_refused_by_name() {
     assert!(got.2.contains("\"a_rows\":3"), "{}", got.2);
 }
 
+/// A pretty-printed JSON part (`jq .`) puts an object inside an array on a
+/// line of its own, and a line that opened with a brace was taken for a row:
+/// the partition values went into those objects too, so a partitioned table
+/// and the flat file holding the same rows and columns disagreed on every row
+/// with such an array. Several objects on a line got the values in the first
+/// alone. Only a row's own object gets them now, in every layout.
+#[test]
+fn partition_values_go_into_a_json_row_and_nowhere_inside_it() {
+    let d = scratch("json-partitions");
+    let rows = |day: u32| -> Vec<String> {
+        (0..6)
+            .map(|i| {
+                let id = day * 10 + i;
+                format!(
+                    "{{\"id\":{id},\"tags\":[{{\"t\":{i}}},{{\"t\":\"x}}{{\"}}],\"v\":{}}}",
+                    i % 3
+                )
+            })
+            .collect()
+    };
+    let pretty = |row: &str| {
+        let v: serde_json::Value = serde_json::from_str(row).unwrap();
+        serde_json::to_string_pretty(&v).unwrap()
+    };
+    let mut flat = String::new();
+    for day in [1u32, 2] {
+        for row in rows(day) {
+            flat.push_str(&format!("{},\"day\":\"{day}\"}}\n", &row[..row.len() - 1]));
+        }
+        let lines = rows(day);
+        for (layout, text) in [
+            (
+                "pretty",
+                lines.iter().map(|r| pretty(r) + "\n").collect::<String>(),
+            ),
+            ("packed", lines.join(" ") + "\n"),
+            ("ndjson", lines.join("\n") + "\n"),
+        ] {
+            let dir = d.0.join(layout).join(format!("day={day}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("part-0.json"), text).unwrap();
+        }
+    }
+    let flat_path = d.0.join("flat.ndjson");
+    std::fs::write(&flat_path, flat).unwrap();
+    let flat_path = flat_path.to_string_lossy().into_owned();
+    let key = ["-k", "id,day"];
+    for layout in ["pretty", "packed", "ndjson"] {
+        let got = compare(&d.0.join(layout).to_string_lossy(), &flat_path, &key);
+        assert_eq!(got.0, 0, "{layout}: {}", got.1);
+        assert!(got.2.contains("\"matched\":12"), "{layout}: {}", got.2);
+        assert!(got.2.contains("\"changed\":0"), "{layout}: {}", got.2);
+    }
+}
+
 /// `name=value` directories are columns: keyed on one, rows that repeat a key
 /// in different partitions are different rows, and the answer is the one a
 /// flat file holding the column gives -- for Parquet, CSV and JSON parts,

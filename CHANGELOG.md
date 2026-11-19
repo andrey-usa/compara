@@ -36,6 +36,11 @@ All notable changes to this project are documented here. The format follows
   read however its characters are escaped (`\u00e9` or `é`, `\/` or
   `/`), as a top-level string always was. Key order and a number's
   spelling still count. The report and export show a nested value compact.
+- The parts of a Hive-partitioned JSON table gave their partition values
+  to every line that opened with a brace: in a pretty-printed part, the
+  objects inside a row's arrays too, and in a part with several objects on
+  a line, the first alone. A row's own object gets them now, after its
+  members.
 - A JSON file of pretty-printed objects one after another, as `jq .`
   writes them, was read a line at a time: two objects were six rows, and
   two such files that differed compared as identical (exit 0). Its rows are

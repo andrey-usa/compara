@@ -519,9 +519,9 @@ impl Combined {
 
     /// Copies a text part to `out` at `base`, each row given the partition
     /// values as fields of its own -- the header the names -- minding quoted
-    /// fields that hold newlines; JSON rows get them as their first keys.
-    /// Columns the first part already has are left as they are. The bytes
-    /// written.
+    /// fields that hold newlines; a JSON row gets them as its last members
+    /// (see [`JsonRows`]). Columns the first part already has are left as
+    /// they are. The bytes written.
     fn with_partitions(
         &mut self,
         input: Box<dyn Read>,
@@ -539,6 +539,10 @@ impl Combined {
         let mut delimiter = b',';
         let mut json = false;
         let mut take: Vec<usize> = Vec::new();
+        let mut rows = JsonRows::default();
+        let mut closes: Vec<(usize, bool)> = Vec::new();
+        // What a JSON row gets before its closing brace, once `take` is known.
+        let mut members: Option<Vec<u8>> = None;
         let mut put = |w: &mut dyn Write, bytes: &[u8]| -> std::io::Result<()> {
             written += bytes.len() as u64;
             w.write_all(bytes)
@@ -558,26 +562,21 @@ impl Combined {
                 let text = String::from_utf8_lossy(body);
                 let trimmed = text.trim_start_matches('\u{feff}').trim_start();
                 json = trimmed.starts_with('{');
-                delimiter = crate::columns::detect_delimiter(&text);
-                let partitions = &self.partitions;
-                let has = |n: &str| {
-                    if json {
-                        trimmed.contains(&format!("\"{n}\":"))
-                            || trimmed.contains(&format!("\"{n}\" :"))
-                    } else {
+                if !json {
+                    delimiter = crate::columns::detect_delimiter(&text);
+                    let partitions = &self.partitions;
+                    let has = |n: &str| {
                         text.split(delimiter as char)
                             .any(|c| c.trim().trim_matches('"') == n)
-                    }
-                };
-                take = self
-                    .text_partitions
-                    .get_or_insert_with(|| {
-                        (0..partitions.len())
-                            .filter(|&i| !has(&partitions[i]))
-                            .collect()
-                    })
-                    .clone();
-                if !json {
+                    };
+                    take = self
+                        .text_partitions
+                        .get_or_insert_with(|| {
+                            (0..partitions.len())
+                                .filter(|&i| !has(&partitions[i]))
+                                .collect()
+                        })
+                        .clone();
                     put(&mut w, body)?;
                     for &i in &take {
                         put(&mut w, &[delimiter])?;
@@ -588,25 +587,35 @@ impl Combined {
                 }
             }
             if json {
-                match body.iter().position(|b| !b.is_ascii_whitespace()) {
-                    Some(at) if body[at] == b'{' && !take.is_empty() => {
-                        put(&mut w, &body[..=at])?;
-                        for (k, &i) in take.iter().enumerate() {
-                            if k > 0 {
-                                put(&mut w, b",")?;
-                            }
-                            put(&mut w, &json_string(&self.partitions[i]))?;
-                            put(&mut w, b":")?;
-                            put(&mut w, &json_string(&values[i]))?;
-                        }
-                        let rest = &body[at + 1..];
-                        if rest.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'}') {
+                // The line as it is, up to each brace that closes a row, and
+                // before that brace the members the row is given.
+                closes.clear();
+                let mut from = 0;
+                rows.walk(body, &mut closes);
+                for &(at, filled) in &closes {
+                    if members.is_none() {
+                        // The first row is read: the columns it has are the
+                        // part's, as a CSV part's header is.
+                        let partitions = &self.partitions;
+                        let names = &rows.names;
+                        let take = self.text_partitions.get_or_insert_with(|| {
+                            (0..partitions.len())
+                                .filter(|&i| !names.contains(&partitions[i]))
+                                .collect()
+                        });
+                        members = Some(json_members(partitions, take, values));
+                    }
+                    let members = members.as_deref().unwrap_or_default();
+                    put(&mut w, &body[from..at])?;
+                    if !members.is_empty() {
+                        if filled {
                             put(&mut w, b",")?;
                         }
-                        put(&mut w, rest)?;
+                        put(&mut w, members)?;
                     }
-                    _ => put(&mut w, body)?,
+                    from = at;
                 }
+                put(&mut w, &body[from..])?;
             } else {
                 put(&mut w, body)?;
                 quoted ^= body.iter().filter(|&&b| b == b'"').count() % 2 == 1;
@@ -830,6 +839,243 @@ fn json_string(value: &str) -> Vec<u8> {
     serde_json::to_vec(value).unwrap_or_else(|_| b"\"\"".to_vec())
 }
 
+/// The partition columns `take` names as JSON members, `"date":"2026-10-01"`,
+/// comma-separated.
+fn json_members(names: &[String], take: &[usize], values: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (k, &i) in take.iter().enumerate() {
+        if k > 0 {
+            out.push(b',');
+        }
+        out.extend(json_string(&names[i]));
+        out.push(b':');
+        out.extend(json_string(&values[i]));
+    }
+    out
+}
+
+/// A stream of JSON objects read a line at a time, for where its rows close.
+///
+/// A row's partition values go into the row, so the copy has to know which
+/// braces are a row's. A line was taken for a row when it opened with a
+/// brace: in a pretty-printed stream (`jq .`) an object in an array opens a
+/// line too, and the values went into every such object as well; of several
+/// rows on a line, the first alone got them. Only the depth tells a row from
+/// an object inside one, and only a walk from the start of the part knows
+/// it: brackets, braces and strings, across lines. The values go in before
+/// a row's closing brace, where the walk has seen the row's members, so
+/// that the first row's names, which decide the columns a part already has,
+/// are known by then.
+#[derive(Default)]
+struct JsonRows {
+    depth: u32,
+    string: bool,
+    /// The byte just read was a backslash inside a string. One that ends a
+    /// line escapes the line feed, as the reader takes it.
+    escape: bool,
+    /// A row has opened and nothing but space has followed yet.
+    opened: bool,
+    /// The row being read has a member, so what is added follows a comma.
+    filled: bool,
+    /// Reading the first row: its member names are kept.
+    first: Option<FirstRow>,
+    first_done: bool,
+    /// The first row's member names, its escapes undone, once it has closed.
+    names: Vec<String>,
+}
+
+/// The first row's member names as written, quotes included, while it is
+/// read.
+#[derive(Default)]
+struct FirstRow {
+    names: Vec<Vec<u8>>,
+    /// The name being read.
+    name: Option<Vec<u8>>,
+    /// Outside any value: the next string is a member's name.
+    name_next: bool,
+}
+
+/// Whether `bytes` hold no bracket, brace or backslash, and their quotes in
+/// pairs: the parity of the quotes and whether there is any of the others,
+/// both zero for yes.
+///
+/// Written so the compiler vectorises it, which it did only this way: the
+/// comparisons joined by `|`, not `matches!` or `||` (a branch in the loop),
+/// and the two bytes returned from a function of its own rather than tested
+/// where it is called (narrowed to bits, the loop went a byte at a time).
+/// Otherwise the scan of a newline-delimited part took 14 instructions a
+/// byte, a third more CPU for a partitioned gigabyte than reading it.
+#[inline(never)]
+fn plain(bytes: &[u8]) -> (u8, u8) {
+    let (mut quotes, mut stops) = (0u8, 0u8);
+    for &b in bytes {
+        quotes ^= u8::from(b == b'"');
+        // `[` and `]` are `{` and `}` without the 0x20 bit.
+        let folded = b | 0x20;
+        stops |= u8::from(folded == b'{') | u8::from(folded == b'}') | u8::from(b == b'\\');
+    }
+    (quotes, stops)
+}
+
+/// The bytes that open or close a string, an object or an array: all the
+/// walk past the first row stops at.
+const STRUCTURE: [bool; 256] = {
+    let mut t = [false; 256];
+    t[b'"' as usize] = true;
+    t[b'{' as usize] = true;
+    t[b'}' as usize] = true;
+    t[b'[' as usize] = true;
+    t[b']' as usize] = true;
+    t
+};
+
+impl JsonRows {
+    /// Walks one line, noting where each row closes and whether it had a
+    /// member: the offset of its closing brace.
+    fn walk(&mut self, line: &[u8], closes: &mut Vec<(usize, bool)>) {
+        self.escape = false;
+        if self.first_done && !self.string && self.settled(line, closes) {
+            return;
+        }
+        let mut at = 0;
+        while at < line.len() {
+            if self.string {
+                if self.escape {
+                    self.escape = false;
+                    self.keep_name(line[at]);
+                    at += 1;
+                    continue;
+                }
+                let stop = if self.first.is_some() {
+                    at
+                } else {
+                    match line[at..].iter().position(|&b| b == b'"' || b == b'\\') {
+                        Some(k) => at + k,
+                        None => return,
+                    }
+                };
+                let b = line[stop];
+                self.keep_name(b);
+                at = stop + 1;
+                if b == b'\\' {
+                    self.escape = true;
+                } else if b == b'"' {
+                    self.string = false;
+                    if let Some(first) = &mut self.first
+                        && let Some(name) = first.name.take()
+                    {
+                        first.names.push(name);
+                    }
+                }
+                continue;
+            }
+            if self.opened {
+                if line[at].is_ascii_whitespace() {
+                    at += 1;
+                    continue;
+                }
+                self.opened = false;
+                self.filled = line[at] != b'}';
+            }
+            let b = line[at];
+            if self.depth == 1
+                && let Some(first) = &mut self.first
+            {
+                // The first row's members, a byte at a time: a string after
+                // the brace or a comma is a name.
+                match b {
+                    b'"' if first.name_next => first.name = Some(Vec::new()),
+                    b',' => first.name_next = true,
+                    _ if b.is_ascii_whitespace() => {}
+                    _ => first.name_next = false,
+                }
+            } else if !STRUCTURE[b as usize] {
+                match line[at..].iter().position(|&b| STRUCTURE[b as usize]) {
+                    Some(k) => at += k,
+                    None => return,
+                }
+                continue;
+            }
+            match line[at] {
+                b'"' => {
+                    self.string = true;
+                    self.keep_name(b'"');
+                }
+                b'{' | b'[' => {
+                    if self.depth == 0 {
+                        self.opened = true;
+                        if !self.first_done {
+                            self.first = Some(FirstRow {
+                                name_next: true,
+                                ..FirstRow::default()
+                            });
+                        }
+                    }
+                    self.depth += 1;
+                }
+                // A stray closing bracket does not take the depth below the
+                // rows'.
+                b'}' | b']' => match self.depth {
+                    0 => {}
+                    1 => {
+                        self.depth = 0;
+                        if let Some(first) = self.first.take() {
+                            self.first_done = true;
+                            self.names = first
+                                .names
+                                .iter()
+                                .filter_map(|n| serde_json::from_slice::<String>(n).ok())
+                                .collect();
+                        }
+                        closes.push((at, self.filled));
+                    }
+                    _ => self.depth -= 1,
+                },
+                _ => {}
+            }
+            at += 1;
+        }
+    }
+
+    /// The two lines a stream mostly has, settled without a walk: a whole
+    /// row, `{` first and `}` last (newline-delimited JSON), and a line of
+    /// members (most of a pretty-printed row), with no other bracket, no
+    /// backslash and the quotes in pairs between. Then every string opens
+    /// and closes on the line and nothing between changes the depth. Asking
+    /// that is one pass the compiler vectorises; the walk stops at every
+    /// quote, and on a newline-delimited part, where one comes every few
+    /// bytes, it cost half a second of CPU a gigabyte. False: walk the line.
+    fn settled(&mut self, line: &[u8], closes: &mut Vec<(usize, bool)>) -> bool {
+        let Some(first) = line.iter().position(|b| !b.is_ascii_whitespace()) else {
+            return true;
+        };
+        let last = line
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .unwrap_or(first);
+        let row = self.depth == 0 && last > first && line[first] == b'{' && line[last] == b'}';
+        let inner = if row { &line[first + 1..last] } else { line };
+        if plain(inner) != (0, 0) {
+            return false;
+        }
+        if row {
+            let filled = inner.iter().any(|b| !b.is_ascii_whitespace());
+            closes.push((last, filled));
+        } else if self.opened {
+            self.opened = false;
+            self.filled = true;
+        }
+        true
+    }
+
+    /// Keeps a byte of the first row's member name being read.
+    fn keep_name(&mut self, b: u8) {
+        if let Some(name) = self.first.as_mut().and_then(|f| f.name.as_mut()) {
+            name.push(b);
+        }
+    }
+}
+
 fn copy_buffered(input: &mut impl Read, out: File, at: u64) -> std::io::Result<u64> {
     let mut w = std::io::BufWriter::with_capacity(1 << 20, crate::memory::WriteBehind::at(out, at));
     let n = std::io::copy(input, &mut w)?;
@@ -943,5 +1189,48 @@ mod tests {
         assert_eq!(first_record(b"\"a\nx\",b\r\n1,2"), Some(9));
         assert_eq!(first_record(b"a,b"), None);
         assert_eq!(bare_header(b"\xEF\xBB\xBFa,b\r\n"), b"a,b");
+    }
+
+    /// Each line's row closes, as (line, offset, the row had a member).
+    fn closes(text: &str) -> (Vec<(usize, usize, bool)>, Vec<String>) {
+        let mut rows = JsonRows::default();
+        let mut out = Vec::new();
+        for (n, line) in text.split('\n').enumerate() {
+            let mut at = Vec::new();
+            rows.walk(line.as_bytes(), &mut at);
+            out.extend(at.into_iter().map(|(i, filled)| (n, i, filled)));
+        }
+        (out, rows.names)
+    }
+
+    #[test]
+    fn a_json_row_closes_at_its_own_brace_and_nowhere_inside_it() {
+        // Pretty-printed: an object in an array opens and closes lines of its
+        // own; a brace in a string, escaped quote and all, is text.
+        let pretty =
+            "{\n  \"d\\u0061y\": 1,\n  \"t\": [\n    {\n      \"x\": \"}\\\"{\"\n    }\n  ]\n}\n{}";
+        let (got, names) = closes(pretty);
+        assert_eq!(got, vec![(7, 0, true), (8, 1, false)]);
+        // The first row's names, escapes undone: `day` is a column it has.
+        assert_eq!(names, vec!["day".to_string(), "t".to_string()]);
+        // Newline-delimited, several on a line, and a nested one: each row's
+        // own closing brace, whichever way the line is settled.
+        let lines = "{\"a\":1}\n{\"a\":2} {\"a\":{\"b\":3}}\n {\"a\":\"[\"} \n{\"a\":\"\\\\\"}";
+        let (got, names) = closes(lines);
+        assert_eq!(
+            got,
+            vec![
+                (0, 6, true),
+                (1, 6, true),
+                (1, 20, true),
+                (2, 9, true),
+                (3, 9, true)
+            ]
+        );
+        assert_eq!(names, vec!["a".to_string()]);
+        // A backslash that ends a line escapes the line feed, not the next
+        // line's first byte.
+        let (got, _) = closes("{\"a\":\"x\\\n\"}\n{\"a\":1}");
+        assert_eq!(got, vec![(1, 1, true), (2, 6, true)]);
     }
 }
