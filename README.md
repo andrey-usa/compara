@@ -83,18 +83,18 @@ changed and `--export-dir` for the rows.
 
 ## Benchmarks
 
-Two tables of 20 columns compared on a composite key (`-k account_id,txn_id -i updated_at`), every tool's unchanged, changed, added and removed counts checked identical, on GitHub's `ubuntu-24.04, image 20261111.370.1` (Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz, 4 cores, 15 GB), [bench-contenders run 44398184156](https://github.com/andrey-usa/compara/actions/runs/44398184156), 2026-11-18:
+Two tables of 20 columns compared on a composite key (`-k account_id,txn_id -i updated_at`), every tool's unchanged, changed, added and removed counts checked identical, on GitHub's `ubuntu-24.04, image 20261111.370.1` (AMD EPYC 9V45 96-Core Processor, 4 cores, 15 GB), [bench-contenders run 44629611468](https://github.com/andrey-usa/compara/actions/runs/44629611468), 2026-11-19:
 
 | input, both files | compara 0.7.0 | DuckDB 2.0.0 | Polars 2.1.0 | qsv 29.0.0 |
 |---|---|---|---|---|
-| 1M rows, CSV, 368 MB | **0.13 s** · 0.4 s · 411 MB (56 private) | 3.26 s · 9.2 s · 1,164 MB (1,103 private) | 3.22 s · 12.1 s · 2,208 MB (2,145 private) | 0.96 s · 2.6 s · 132 MB (102 private) |
-| 1M rows, Parquet, 161 MB | **0.18 s** · 0.5 s · 320 MB (180 private) | 1.67 s · 2.8 s · 1,231 MB (1,171 private) | 3.00 s · 10.2 s · 2,234 MB (2,170 private) | not run |
-| 10M rows, CSV, 3,679 MB | **1.15 s** · 3.9 s · 4,030 MB (511 private) | 25.67 s · 94.5 s · 8,832 MB (8,760 private) | out of memory after 14 s, at 13,335 MB | 11.46 s · 30.6 s · 982 MB (953 private) |
-| 10M rows, Parquet, 1,609 MB | **1.55 s** · 5.2 s · 2,738 MB (1,340 private) | 10.27 s · 37.3 s · 7,057 MB (6,985 private) | out of memory after 11 s, at 13,336 MB | not run |
+| 1M rows, CSV, 368 MB | **0.09 s** · 0.2 s · 411 MB (56 private) | 2.10 s · 5.7 s · 1,167 MB (1,107 private) | 2.31 s · 8.9 s · 2,294 MB (2,232 private) | 0.60 s · 1.5 s · 173 MB (143 private) |
+| 1M rows, Parquet, 161 MB | **0.12 s** · 0.3 s · 319 MB (181 private) | 1.19 s · 2.1 s · 1,198 MB (1,139 private) | 2.34 s · 8.2 s · 2,457 MB (2,393 private) | not run |
+| 10M rows, CSV, 3,679 MB | **0.70 s** · 2.2 s · 4,031 MB (511 private) | 16.46 s · 59.2 s · 8,832 MB (8,771 private) | out of memory after 13 s, at 13,343 MB | 8.68 s · 19.9 s · 1,430 MB (1,401 private) |
+| 10M rows, Parquet, 1,609 MB | **0.87 s** · 2.7 s · 2,731 MB (1,337 private) | 7.27 s · 25.8 s · 6,950 MB (6,891 private) | out of memory after 11 s, at 13,345 MB | not run |
 
 Each cell: wall time, best of 3 · CPU time (user and system) · peak memory (RSS, and in brackets the private part of it), of the best run; fastest in bold. DuckDB and Polars run from Python, and their time starts at their first read, after the interpreter's start and the import; qsv is a binary and is timed as a whole process, like compara, runs on CSV only, and is given the files with the ignored column and the repeated keys already taken out (the page says how). A tool the runner's kernel stopped for lack of memory says so.
 
-Where another tool did better in this run (by more than 2%): peak memory on 1M rows, CSV, 368 MB: qsv 132 MB, compara 411 MB; peak memory on 10M rows, CSV, 3,679 MB: qsv 982 MB, compara 4,030 MB.
+Where another tool did better in this run (by more than 2%): peak memory on 1M rows, CSV, 368 MB: qsv 173 MB, compara 411 MB; peak memory on 10M rows, CSV, 3,679 MB: qsv 1,430 MB, compara 4,031 MB.
 
 The method, every run and object storage: [Benchmarks](https://andrey-usa.github.io/compara/benchmarks/results.html).
 
