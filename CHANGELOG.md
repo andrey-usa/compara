@@ -63,6 +63,10 @@ All notable changes to this project are documented here. The format follows
   they do after any failure, and their reads no longer stop at five minutes
   a request, which cut off an 8 MB part on a link under 28 KB/s. A server
   sending 1 KB a second is waited for.
+- A connection dropped or reset on a URL's first request, for the end of
+  the object (its size, and a Parquet footer), failed the compare: exit 2,
+  "error decoding response body". It is asked again, as every later range
+  is.
 - A JSON file of pretty-printed objects one after another, as `jq .`
   writes them, was read a line at a time: two objects were six rows, and
   two such files that differed compared as identical (exit 0). Its rows are

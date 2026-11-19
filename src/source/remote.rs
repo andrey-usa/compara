@@ -947,8 +947,11 @@ async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, Fetc
                 .send()
                 .await
                 .map_err(|e| {
+                    // A connection made and then dropped or reset is worth
+                    // another try; one that could not be made, a refused
+                    // redirect or a malformed request is not.
                     stall_of(&e, false).unwrap_or_else(|| {
-                        if e.is_timeout() {
+                        if e.is_timeout() || (e.is_request() && !e.is_connect()) {
                             FetchError::Transient(said(&e))
                         } else {
                             FetchError::Other(said(&e))
@@ -982,8 +985,9 @@ async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, Fetc
                             "{spec}: a partial response without a total size"
                         ))
                     })?;
+                // An answer cut off is asked for again, as a part's is.
                 let bytes = response.bytes().await.map_err(|e| {
-                    stall_of(&e, true).unwrap_or_else(|| FetchError::Other(e.to_string()))
+                    stall_of(&e, true).unwrap_or_else(|| FetchError::Transient(e.to_string()))
                 })?;
                 return Ok(Got::Tail(total, bytes.to_vec(), etag));
             }

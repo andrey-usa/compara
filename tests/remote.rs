@@ -814,6 +814,38 @@ fn a_stalled_server_is_asked_again_and_a_slow_one_waited_for() {
     }
 }
 
+/// The first request, for the end of the object, is asked again when its
+/// connection drops part-way through the answer or closes before it, as any
+/// later range is: one such drop had failed the compare (exit 2, "error
+/// decoding response body", or "connection closed before message
+/// completed").
+#[test]
+fn the_end_of_an_object_is_asked_again_when_its_connection_drops() {
+    let f = fixture("20k", &[]);
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let want = compare(&local("t_a.csv"), &local("t_b.csv"), &KEY, &[], None);
+    for mode in ["drop", "reset"] {
+        // The first ranged request: A's end or B's.
+        let Some(server) = Server::start(&f.0, &["--fault", mode]) else {
+            eprintln!("skipping: no python to run the object server");
+            return;
+        };
+        let u = &server.url;
+        let got = compare_urls(
+            &format!("{u}/bkt/t_a.csv"),
+            &format!("{u}/bkt/t_b.csv"),
+            &[],
+        );
+        assert_eq!(
+            (want.0, &want.2, &want.3),
+            (got.0, &got.2, &got.3),
+            "{mode}: {}",
+            got.1
+        );
+    }
+}
+
 /// A prefix, a glob, or a name that is a prefix rather than an object reads
 /// every part under it as one table, the local directory's answer; Parquet
 /// parts only as far as the comparison reads them, gzip parts expanded.
