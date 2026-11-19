@@ -713,3 +713,28 @@ fn a_json_key_with_no_value_names_no_column() {
     let (_, rows, _) = run(&["head", "--csv"], &path);
     assert_eq!(rows, "id,p,b\n1,v,\n2,,x\n3,,\n");
 }
+
+/// A later object's name written with an escape is the name its escapes
+/// spell, never the first object's name at that place that merely looks the
+/// same as written: `a\\\\b` as written spells `a\\b`, a column of its own
+/// beside the first object's `a\b`.
+#[test]
+fn an_escaped_name_is_not_taken_for_the_first_objects_name_at_its_place() {
+    let dir = std::env::temp_dir().join(format!(
+        "compara-inspect-{}-{}",
+        std::process::id(),
+        fixture_id()
+    ));
+    std::fs::create_dir_all(&dir).expect("a temp directory");
+    let file = dir.join("names.json");
+    std::fs::write(
+        &file,
+        "{\"id\":1,\"a\\\\\\\\b\":1}\n{\"id\":2,\"a\\\\b\":5}\n",
+    )
+    .expect("the file");
+    let (code, stdout, stderr) = run(&["columns"], &file);
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(code, 0, "{stderr}");
+    let names: Vec<&str> = stdout.lines().collect();
+    assert_eq!(names, ["id", "a\\\\b", "a\\b"], "{stdout}");
+}
