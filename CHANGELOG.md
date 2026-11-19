@@ -67,6 +67,13 @@ All notable changes to this project are documented here. The format follows
   the object (its size, and a Parquet footer), failed the compare: exit 2,
   "error decoding response body". It is asked again, as every later range
   is.
+- A URL's object overwritten part-way through the read, on a server that
+  does not check `If-Match`, was read as one file stitched from two
+  versions: 200,000 rows came out with 23,133 duplicate keys, exit 1. Each
+  ranged answer's ETag, and the object size it gives, are now checked
+  against those of the first, and a change is the same error as a refused
+  `If-Match`: the object changed while it was being read. An answer for
+  bytes other than those asked is asked for again, then an error.
 - A JSON file of pretty-printed objects one after another, as `jq .`
   writes them, was read a line at a time: two objects were six rows, and
   two such files that differed compared as identical (exit 0). Its rows are

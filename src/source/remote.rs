@@ -222,6 +222,7 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
                 &file,
                 std::iter::once(footer_at..tail_at).collect(),
                 etag.as_deref(),
+                size,
                 spec,
             )
             .await?;
@@ -240,7 +241,7 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
     let ranges = coalesce(ranges, tail_at);
     let fetched: u64 = ranges.iter().map(|r| r.end - r.start).sum::<u64>() + tail.len() as u64;
     room_for(fetched, spec)?;
-    fetch_ranges(&reader, &file, ranges, etag.as_deref(), spec).await?;
+    fetch_ranges(&reader, &file, ranges, etag.as_deref(), size, spec).await?;
     file.sync_data().ok();
     let secs = started.elapsed().as_secs_f64();
     if public {
@@ -559,6 +560,7 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
                         range: at..tail_at,
                         shift: base,
                         etag: p.etag.as_deref(),
+                        size: p.size,
                         spec: &p.name,
                     });
                 }
@@ -582,6 +584,7 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
                         range,
                         shift: base,
                         etag: p.etag.as_deref(),
+                        size: p.size,
                         spec: &p.name,
                     });
                 }
@@ -596,6 +599,7 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
                         range: 0..rest,
                         shift: base,
                         etag: p.etag.as_deref(),
+                        size: p.size,
                         spec: &p.name,
                     });
                 }
@@ -658,6 +662,7 @@ async fn append_whole(
                         &file,
                         std::iter::once(0..rest).collect(),
                         etag.as_deref(),
+                        size,
                         name,
                     )
                     .await?;
@@ -1040,6 +1045,7 @@ async fn fetch_ranges(
     file: &File,
     ranges: Vec<Range<u64>>,
     etag: Option<&str>,
+    size: u64,
     spec: &str,
 ) -> Result<()> {
     let jobs = ranges
@@ -1049,6 +1055,7 @@ async fn fetch_ranges(
             range,
             shift: 0,
             etag,
+            size,
             spec,
         })
         .collect();
@@ -1056,12 +1063,14 @@ async fn fetch_ranges(
 }
 
 /// A range of one object, written to the local file `shift` bytes further on
-/// than it sits in the object.
+/// than it sits in the object, which is of the version its end was: that
+/// answer's strong validator, if it had one, and size.
 struct Job<'a> {
     reader: &'a Reader,
     range: Range<u64>,
     shift: u64,
     etag: Option<&'a str>,
+    size: u64,
     spec: &'a str,
 }
 
@@ -1152,6 +1161,7 @@ struct Piece {
     part: Range<u64>,
     shift: u64,
     etag: Option<String>,
+    size: u64,
     spec: String,
 }
 
@@ -1199,9 +1209,16 @@ impl Lanes {
         });
         let work = futures::stream::iter(taken)
             .map(|p| async move {
-                fetch_part(&p.reader, out, p.part.clone(), p.shift, p.etag.as_deref())
-                    .await
-                    .map_err(|e| e.into_error(&p.spec))?;
+                fetch_part(
+                    &p.reader,
+                    out,
+                    p.part.clone(),
+                    p.shift,
+                    p.etag.as_deref(),
+                    p.size,
+                )
+                .await
+                .map_err(|e| e.into_error(&p.spec))?;
                 self.done.fetch_add(p.part.end - p.part.start, Relaxed);
                 Ok::<(), Error>(())
             })
@@ -1299,6 +1316,7 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
                     part: at..end,
                     shift: job.shift,
                     etag: job.etag.map(str::to_string),
+                    size: job.size,
                     spec: job.spec.to_string(),
                 });
                 at = end;
@@ -1445,21 +1463,23 @@ const WRITES_QUEUED: usize = 0;
 /// (`COMPARA_PROGRESS`; 0 for never).
 const PROGRESS_EVERY_SECS: f64 = 10.0;
 
-/// One part, pinned to the version of the object the first request saw: a
-/// part of a later version fails rather than lands beside parts of the
-/// earlier one. A plain HTTP part that fails in transit or with a 5xx or 429
-/// is tried again, three times, a little later each time; object_store does
-/// that for its own.
+/// One part, pinned to the version of the object the first request saw (its
+/// `etag`, its `size`): a part of a later version fails rather than lands
+/// beside parts of the earlier one, whether the server refuses it on the
+/// `If-Match` asked or sends it under its own validator or size. A plain HTTP
+/// part that fails in transit or with a 5xx or 429 is tried again, three
+/// times, a little later each time; object_store does that for its own.
 async fn fetch_part(
     reader: &Reader,
     out: &Out<'_>,
     part: Range<u64>,
     shift: u64,
     etag: Option<&str>,
+    size: u64,
 ) -> std::result::Result<(), FetchError> {
     let mut attempt = 0u32;
     loop {
-        let result = fetch_part_once(reader, out, part.clone(), shift, etag).await;
+        let result = fetch_part_once(reader, out, part.clone(), shift, etag, size).await;
         let retryable = match &result {
             Err(FetchError::Transient(_) | FetchError::Stalled { .. }) => {
                 matches!(reader, Reader::Http(..))
@@ -1480,6 +1500,7 @@ async fn fetch_part_once(
     part: Range<u64>,
     shift: u64,
     etag: Option<&str>,
+    size: u64,
 ) -> std::result::Result<(), FetchError> {
     let mut at = part.start;
     let mut to = out.part();
@@ -1495,6 +1516,10 @@ async fn fetch_part_once(
                     },
                 )
                 .await?;
+            // A store that does not check If-Match still says what it sent.
+            if got.meta.size != size || other_version(etag, got.meta.e_tag.as_deref()) {
+                return Err(FetchError::Other(changed()));
+            }
             let mut stream = got.into_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
@@ -1530,6 +1555,33 @@ async fn fetch_part_once(
                     Refused(status.as_u16())
                 });
             }
+            // A server that does not check If-Match still says what it sent:
+            // its validator, and the object's size after the range.
+            let header = |name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|v: &reqwest::header::HeaderValue| v.to_str().ok())
+            };
+            let range = header(reqwest::header::CONTENT_RANGE).map(content_range);
+            if other_version(etag, header(reqwest::header::ETAG))
+                || matches!(range, Some(Some((_, Some(total)))) if total != size)
+            {
+                return Err(FetchError::Other(changed()));
+            }
+            match range {
+                Some(Some((span, _))) if span == part => {}
+                // No Content-Range: the length is checked as it comes.
+                None => {}
+                _ => {
+                    return Err(FetchError::Transient(format!(
+                        "the answer to bytes {}-{} was {}",
+                        part.start,
+                        part.end - 1,
+                        header(reqwest::header::CONTENT_RANGE).unwrap_or("unreadable")
+                    )));
+                }
+            }
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| {
@@ -1553,6 +1605,33 @@ async fn fetch_part_once(
         )));
     }
     Ok(())
+}
+
+/// Whether an answer's validator, `answered`, says it is of another version
+/// of the object than `etag`, the end's: compared by the tag, for a weak one
+/// (`W/"…"`) names a version too. Without both there is nothing to compare.
+fn other_version(etag: Option<&str>, answered: Option<&str>) -> bool {
+    match (etag, answered) {
+        (Some(want), Some(got)) => got.trim().trim_start_matches("W/") != want.trim(),
+        _ => false,
+    }
+}
+
+/// A Content-Range header, `bytes <first>-<last>/<size>`: the bytes it holds,
+/// and the object's size unless `*`; None if it is not one.
+fn content_range(value: &str) -> Option<(Range<u64>, Option<u64>)> {
+    let (unit, rest) = value.trim().split_once(' ')?;
+    let (span, total) = rest.trim().split_once('/')?;
+    let (first, last) = span.split_once('-')?;
+    let (first, end) = (
+        first.parse::<u64>().ok()?,
+        last.parse::<u64>().ok()?.checked_add(1)?,
+    );
+    let total = match total {
+        "*" => None,
+        t => Some(t.parse::<u64>().ok()?),
+    };
+    (unit.eq_ignore_ascii_case("bytes") && first < end).then_some((first..end, total))
 }
 
 /// The error a request ends with after `attempt` retries: no longer worth
@@ -2272,6 +2351,35 @@ mod tests {
         assert_eq!(part_from(Some(" 262144 ")), 262_144);
         assert_eq!(part_from(Some("1")), MIN_PART);
         assert_eq!(part_from(Some("0")), MIN_PART);
+    }
+
+    #[test]
+    fn a_content_range_is_the_bytes_held_and_the_size() {
+        assert_eq!(
+            content_range("bytes 0-65535/4140750"),
+            Some((0..65536, Some(4_140_750)))
+        );
+        assert_eq!(content_range(" bytes 7-7/*"), Some((7..8, None)));
+        for bad in [
+            "bytes */4140750",
+            "bytes 9-8/10",
+            "items 0-1/2",
+            "bytes 0-18446744073709551615/1",
+            "bytes 0-1",
+            "",
+        ] {
+            assert_eq!(content_range(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn another_validator_is_another_version_and_none_says_nothing() {
+        let tag = Some("\"abc-1\"");
+        assert!(!other_version(tag, Some("\"abc-1\"")));
+        assert!(!other_version(tag, Some("W/\"abc-1\"")));
+        assert!(other_version(tag, Some("\"abc-2\"")));
+        assert!(!other_version(tag, None));
+        assert!(!other_version(None, Some("\"abc-2\"")));
     }
 
     #[test]

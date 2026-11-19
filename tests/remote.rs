@@ -846,6 +846,46 @@ fn the_end_of_an_object_is_asked_again_when_its_connection_drops() {
     }
 }
 
+/// An object overwritten part-way through the read, on a server that does
+/// not check If-Match, is an error over HTTP and S3, as on one that does:
+/// each part's ETag, and the object's size its range came with, are the
+/// end's or the part is of another version. It had been read as one file
+/// stitched from two (exit 1, thousands of keys changed, added and
+/// duplicated). With no ETag at all, a size that changed is caught the same
+/// way; the same size under no validator cannot be told apart.
+#[test]
+fn an_overwrite_is_caught_where_the_server_does_not_check_if_match() {
+    let f = fixture("20k", &[]);
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    for (extra, s3) in [
+        (&[][..], false),
+        (&[][..], true),
+        (&["--no-etag", "--grow"][..], false),
+    ] {
+        let mut args = vec!["--overwrite-after", "10", "--ignore-if-match"];
+        args.extend(extra);
+        let Some(server) = Server::start(&f.0, &args) else {
+            eprintln!("skipping: no python to run the object server");
+            return;
+        };
+        let u = &server.url;
+        let mut env = if s3 { s3_env(u) } else { Vec::new() };
+        env.push(("COMPARA_FETCH_PART", "65536".into()));
+        let a = if s3 {
+            "s3://bkt/t_a.csv".to_string()
+        } else {
+            format!("{u}/bkt/t_a.csv")
+        };
+        let (code, err, ..) = compare_urls(&a, &local("t_b.csv"), &borrowed(&env));
+        assert_eq!(code, 2, "{extra:?}, s3 {s3}: {err}");
+        assert!(
+            err.contains("t_a.csv: the object changed while it was being read"),
+            "{extra:?}, s3 {s3}: {err}"
+        );
+    }
+}
+
 /// A prefix, a glob, or a name that is a prefix rather than an object reads
 /// every part under it as one table, the local directory's answer; Parquet
 /// parts only as far as the comparison reads them, gzip parts expanded.
