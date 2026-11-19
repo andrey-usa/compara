@@ -74,6 +74,12 @@ All notable changes to this project are documented here. The format follows
   against those of the first, and a change is the same error as a refused
   `If-Match`: the object changed while it was being read. An answer for
   bytes other than those asked is asked for again, then an error.
+- A ranged answer that ran past the range asked (from a server or proxy
+  that ignores where a range ends) was written past it, over the next part
+  where that had come in first: a wrong answer, no error. For the end of
+  the object, whose bytes are placed by their count, all of them landed
+  early: A 199,955 rows of 200,000, exit 1. Such an answer is asked for
+  again, over HTTP and from the stores, and none of it is written.
 - A JSON file of pretty-printed objects one after another, as `jq .`
   writes them, was read a line at a time: two objects were six rows, and
   two such files that differed compared as identical (exit 0). Its rows are

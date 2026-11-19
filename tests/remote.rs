@@ -886,6 +886,51 @@ fn an_overwrite_is_caught_where_the_server_does_not_check_if_match() {
     }
 }
 
+/// An answer that runs 1,000 bytes past the range asked is asked for again,
+/// and nothing of it written: not over the next part, which had kept the
+/// extra bytes when it was in first (a wrong answer, at 8 of 15 requests
+/// tried), and not for the end of the object, whose bytes are placed by
+/// their count, so all of them landed 1,000 bytes early (A 199,955 rows of
+/// 200,000). Over HTTP and S3, for the end (request 0) and for parts.
+#[test]
+fn an_answer_past_its_range_is_asked_for_again_and_never_written() {
+    let f = fixture("20k", &[]);
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let want = compare(&local("t_a.csv"), &local("t_b.csv"), &KEY, &[], None);
+    for (at, s3) in [
+        ("0", false),
+        ("5", false),
+        ("20", false),
+        ("40", false),
+        ("0", true),
+        ("20", true),
+    ] {
+        let Some(server) = Server::start(&f.0, &["--fault", "overlong", "--fault-at", at]) else {
+            eprintln!("skipping: no python to run the object server");
+            return;
+        };
+        let u = &server.url;
+        let mut env = if s3 { s3_env(u) } else { Vec::new() };
+        env.push(("COMPARA_FETCH_PART", "65536".into()));
+        let (a, b) = if s3 {
+            (
+                "s3://bkt/t_a.csv".to_string(),
+                "s3://bkt/t_b.csv".to_string(),
+            )
+        } else {
+            (format!("{u}/bkt/t_a.csv"), format!("{u}/bkt/t_b.csv"))
+        };
+        let got = compare_urls(&a, &b, &borrowed(&env));
+        assert_eq!(
+            (want.0, &want.2, &want.3),
+            (got.0, &got.2, &got.3),
+            "request {at}, s3 {s3}: {}",
+            got.1
+        );
+    }
+}
+
 /// A prefix, a glob, or a name that is a prefix rather than an object reads
 /// every part under it as one table, the local directory's answer; Parquet
 /// parts only as far as the comparison reads them, gzip parts expanded.

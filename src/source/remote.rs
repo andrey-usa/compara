@@ -881,7 +881,9 @@ fn brief(e: &str) -> String {
 
 /// The object's size and its last [`TAIL`] bytes (all of it, if smaller). A
 /// plain HTTP server that answers 5xx or 429, or drops the connection, is
-/// asked again, three times, a little later each time, as a range is.
+/// asked again, three times, a little later each time, as a range is, and so
+/// is any server whose answer does not hold the bytes it says it does;
+/// object_store asks again itself after its own failures.
 async fn tail(reader: &Reader, spec: &str) -> std::result::Result<Got, FetchError> {
     let mut attempt = 0u32;
     loop {
@@ -891,7 +893,7 @@ async fn tail(reader: &Reader, spec: &str) -> std::result::Result<Got, FetchErro
             Err(Refused(status)) => *status >= 500 || *status == 429,
             _ => false,
         };
-        if !retryable || attempt >= 3 || !matches!(reader, Reader::Http(..)) {
+        if !retryable || attempt >= 3 {
             return result.map_err(|e| gave_up(e, attempt));
         }
         attempt += 1;
@@ -942,7 +944,9 @@ async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, Fetc
             };
             let size = got.meta.size;
             let etag = got.meta.e_tag.clone();
+            let span = got.range.clone();
             let bytes = got.bytes().await?;
+            the_end(&span, size, bytes.len())?;
             Ok(Got::Tail(size, bytes.to_vec(), etag))
         }
         Reader::Http(client, url) => {
@@ -979,21 +983,24 @@ async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, Fetc
                 return Err(Refused(status.as_u16()));
             }
             if status == reqwest::StatusCode::PARTIAL_CONTENT {
-                let total = response
+                let (span, total) = match response
                     .headers()
                     .get(reqwest::header::CONTENT_RANGE)
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.rsplit('/').next())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .ok_or_else(|| {
-                        FetchError::Other(format!(
-                            "{spec}: a partial response without a total size"
-                        ))
-                    })?;
+                    .and_then(content_range)
+                {
+                    Some((span, Some(total))) => (span, total),
+                    _ => {
+                        return Err(FetchError::Other(
+                            "a partial response without a total size".into(),
+                        ));
+                    }
+                };
                 // An answer cut off is asked for again, as a part's is.
                 let bytes = response.bytes().await.map_err(|e| {
                     stall_of(&e, true).unwrap_or_else(|| FetchError::Transient(e.to_string()))
                 })?;
+                the_end(&span, total, bytes.len())?;
                 return Ok(Got::Tail(total, bytes.to_vec(), etag));
             }
             // The server sent the whole object: it does not do ranges, so this
@@ -1037,6 +1044,21 @@ async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, Fetc
             Ok(Got::Whole(path, written))
         }
     }
+}
+
+/// Whether the answer for the end of an object of `size` bytes, `len` bytes
+/// said to be `span`, is that: its bytes are placed by their count, so a
+/// body that ran past its range (or fell short of it) would put every byte
+/// out of place. Asked for again if not.
+fn the_end(span: &Range<u64>, size: u64, len: usize) -> std::result::Result<(), FetchError> {
+    if span.end == size && span.end - span.start == len as u64 {
+        return Ok(());
+    }
+    Err(FetchError::Transient(format!(
+        "the end of the object came as {len} bytes for bytes {}-{} of {size}",
+        span.start,
+        span.end.saturating_sub(1)
+    )))
 }
 
 /// Fetches `ranges` into `file` at their offsets, in parts, several at a time.
@@ -1468,7 +1490,9 @@ const PROGRESS_EVERY_SECS: f64 = 10.0;
 /// beside parts of the earlier one, whether the server refuses it on the
 /// `If-Match` asked or sends it under its own validator or size. A plain HTTP
 /// part that fails in transit or with a 5xx or 429 is tried again, three
-/// times, a little later each time; object_store does that for its own.
+/// times, a little later each time, and so is any part that runs past its
+/// range or ends short of it; object_store asks again itself after its own
+/// failures.
 async fn fetch_part(
     reader: &Reader,
     out: &Out<'_>,
@@ -1480,12 +1504,11 @@ async fn fetch_part(
     let mut attempt = 0u32;
     loop {
         let result = fetch_part_once(reader, out, part.clone(), shift, etag, size).await;
-        let retryable = match &result {
-            Err(FetchError::Transient(_) | FetchError::Stalled { .. }) => {
-                matches!(reader, Reader::Http(..))
-            }
-            _ => false,
-        };
+        // A store's own failures come back as Other, asked again already.
+        let retryable = matches!(
+            &result,
+            Err(FetchError::Transient(_) | FetchError::Stalled { .. })
+        );
         if !retryable || attempt >= 3 {
             return result.map_err(|e| gave_up(e, attempt));
         }
@@ -1524,6 +1547,9 @@ async fn fetch_part_once(
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
                 let len = chunk.len() as u64;
+                if at + len > part.end {
+                    return Err(FetchError::Transient("a range ran past its end".into()));
+                }
                 to.put(at + shift, chunk).await?;
                 at += len;
             }
