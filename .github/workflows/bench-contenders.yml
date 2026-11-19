@@ -60,10 +60,13 @@ jobs:
 
       # Each tool in a cgroup of 13 GB of the runner's 16: a tool that needs
       # more is stopped and recorded as out of memory, and the runner lives.
-      - name: Benchmark (1M and 10M rows, CSV and Parquet, three rounds)
+      # Every run starts with its inputs in a stated page-cache state, warm
+      # and cold, so what one tool leaves in memory does not decide how fast
+      # the next one reads; each tool's number is its median of five.
+      - name: Benchmark (1M and 10M rows, CSV and Parquet, five rounds, warm and cold)
         run: |
           python3 scripts/bench_contenders.py --compara target/release/compara \
-            --gen target/release/compara-gen-data --qsv "$RUNNER_TEMP/qsv/qsv" --rows 1m,10m --runs 3 \
+            --gen target/release/compara-gen-data --qsv "$RUNNER_TEMP/qsv/qsv" --rows 1m,10m --runs 5 --cache warm,cold \
             --work "$RUNNER_TEMP/bench" --delete --memory-max 13G --json bench-results.json --notices
 
       - name: Publish table

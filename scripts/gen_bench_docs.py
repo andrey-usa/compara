@@ -47,6 +47,32 @@ def fetch(run):
     return doc
 
 
+def median_run(runs):
+    """The median run (the lower middle one when their number is even), so every
+    figure beside the median wall is from one real run."""
+    walls = sorted(r["wall_s"] for r in runs)
+    mid = walls[(len(walls) - 1) // 2]
+    run = next(r for r in runs if r["wall_s"] == mid)
+    return {**run, "wall_s": mid, "wall_min_s": walls[0], "wall_max_s": walls[-1], "n": len(runs)}
+
+
+def normalise(doc):
+    """Results from before the runs had a stated cache state (and before the
+    harness reported medians) are read the same way: each tool's median of its
+    runs, under the state "unstated", which the docs then say."""
+    if doc.get("cache"):
+        return doc
+    doc["cache"] = ["unstated"]
+    for inp in doc["inputs"]:
+        for n, r in inp["tools"].items():
+            if not r.get("failed"):
+                m = median_run(r["runs"])
+                r.update({k: m[k] for k in ("wall_s", "cpu_s", "peak_rss_mb", "wall_min_s", "wall_max_s", "n")})
+                r["peak_private_mb"] = m.get("peak_private_mb")
+                r["cache"] = {"unstated": dict(r)}
+    return doc
+
+
 def mb(n):
     return f"{n / 1e6:,.0f} MB"
 
@@ -61,11 +87,17 @@ def memory(r):
     return f"{r['peak_rss_mb']:,} MB" + (f" ({own:,} private)" if own is not None else "")
 
 
-def cell(r, best):
+def spread(r):
+    """A median wall with the fastest and slowest run beside it."""
+    return f"{r['wall_s']:.2f} s ({r['wall_min_s']:.2f}-{r['wall_max_s']:.2f})"
+
+
+def cell(r, best, states):
     if r.get("failed"):
         return f"{r['failed']} after {r['wall_s']:.0f} s, at {r['peak_rss_mb']:,} MB"
-    wall = f"{r['wall_s']:.2f} s"
-    return f"{'**' + wall + '**' if best else wall} · {r['cpu_s']:.1f} s · {memory(r)}"
+    head = spread(r)
+    rest = "".join(f" · {st} {spread(r['cache'][st])}" for st in states[1:] if st in r.get("cache", {}))
+    return f"{'**' + head + '**' if best else head}{rest} · {r['cpu_s']:.1f} s · {memory(r)}"
 
 
 def label(inp):
@@ -83,7 +115,8 @@ def main():
     if not args:
         sys.exit(__doc__)
     src = args[0]
-    doc = json.load(open(src)) if os.path.exists(src) else fetch(src)
+    doc = normalise(json.load(open(src)) if os.path.exists(src) else fetch(src))
+    states = doc["cache"]
     run = doc.get("run_id")
     if not run:
         sys.exit("these results name no run: the docs cite one for every number")
@@ -110,9 +143,10 @@ def main():
         here = [n for n in names if n in rs]
         done = [n for n in here if not rs[n].get("failed")]
         fastest = min(rs[n]["wall_s"] for n in done)
-        table.append(f"| {label(inp)} | " + " | ".join(cell(rs[n], rs[n].get("wall_s") == fastest and n in done)
+        table.append(f"| {label(inp)} | " + " | ".join(cell(rs[n], rs[n].get("wall_s") == fastest and n in done, states)
                                                          if n in rs else "not run" for n in names) + " |")
-        for key, what_, fmt in (("wall_s", "wall time", lambda x: f"{x:.2f} s"),
+        head_wall = "wall time" if states == ["unstated"] else f"wall time from a {states[0]} page cache"
+        for key, what_, fmt in (("wall_s", head_wall, lambda x: f"{x:.2f} s"),
                                 ("cpu_s", "CPU time", lambda x: f"{x:.1f} s"),
                                 ("peak_rss_mb", "peak memory", lambda x: f"{x:,} MB"),
                                 ("peak_private_mb", "peak private memory", lambda x: f"{x:,} MB")):
@@ -120,12 +154,33 @@ def main():
             for n in done[1:] if done and done[0] == "compara" and mine is not None else []:
                 if rs[n].get(key) is not None and rs[n][key] < mine * (1 - TIE):
                     losses.append(f"{what_} on {label(inp)}: {NAMES[n]} {fmt(rs[n][key])}, compara {fmt(mine)}")
+        # Wall time is compared in every cache state the run measured, each by its median.
+        for st in states[1:]:
+            mine = rs["compara"].get("cache", {}).get(st, {}).get("wall_s")
+            for n in done[1:] if done and done[0] == "compara" and mine is not None else []:
+                theirs = rs[n].get("cache", {}).get(st, {}).get("wall_s")
+                if theirs is not None and theirs < mine * (1 - TIE):
+                    losses.append(f"wall time from a {st} page cache on {label(inp)}: {NAMES[n]} {theirs:.2f} s, "
+                                  f"compara {mine:.2f} s")
     loss_line = ("Where another tool did better in this run (by more than 2%): " + "; ".join(losses) + "."
                  if losses else "No other tool did better than compara by more than 2% on any measure in this run.")
-    note = ("Each cell: wall time, best of {runs} · CPU time (user and system) · peak memory (RSS, and "
-            "in brackets the private part of it), of the best run; fastest in bold. DuckDB and Polars run from Python, and their time starts at their first "
+    if states == ["unstated"]:
+        cache_note = ("These runs did not set the page cache before each run, so a run's wall time depends "
+                      "on what the tool before it left in memory. ")
+        first = "wall time"
+    else:
+        cache_note = (f"Every run starts from a stated page cache: {states[0]} (its inputs read to the end just "
+                      "before) is the first figure" + (", cold (its inputs dropped from the page cache, so read "
+                      "from the disk) the second" if "cold" in states[1:] else "") + ". ")
+        first = f"wall time from a {states[0]} page cache"
+    floors = "; ".join(f"{label(inp)} {inp['disk_read_s']:.2f} s" for inp in inputs if inp.get("disk_read_s"))
+    floor_note = (f" Reading both inputs from a cold cache alone took (median): {floors}." if floors else "")
+    note = ("Each cell: {first}, median of {runs} runs (fastest-slowest in brackets) · CPU time (user and "
+            "system) · peak memory (RSS, and in brackets the private part of it), of the median run; fastest "
+            "median in bold. {cache_note}DuckDB and Polars run from Python, and their time starts at their first "
             "read, after the interpreter's start and the import; qsv is a binary and is timed as a whole process, like compara, runs on CSV only, and is given the files with the ignored column and the repeated keys already taken out (the page says how). A tool the runner's kernel stopped for "
-            "lack of memory says so.").format(runs=doc["runs"])
+            "lack of memory says so.{floor_note}").format(runs=doc["runs"], first=first, cache_note=cache_note,
+                                                         floor_note=floor_note)
 
     readme = ["## Benchmarks", "",
               f"{what}, on GitHub's `{runner}` ({machine}), {link}, {date}:", ""] + table + [
@@ -139,28 +194,47 @@ def main():
         text = text[:start] + "\n".join(readme) + ("\n" + text[nxt + 1:] if nxt >= 0 else "")
         open(p, "w").write(text)
 
-    runs = ["| input | tool | every run: wall · CPU · peak memory |", "|---|---|---|"]
+    def one(x):
+        faults = f" · {x['major_faults']:,} major faults" if x.get("major_faults") is not None else ""
+        return f"{x['wall_s']:.2f} s · {x['cpu_s']:.1f} s · {memory(x)}{faults}"
+
+    runs = ["| input | tool | page cache | every run: wall · CPU · peak memory · major page faults |",
+            "|---|---|---|---|"]
     for inp in inputs:
         for n in (n for n in names if n in inp["tools"]):
             r = inp["tools"][n]
-            every = cell(r, False) if r.get("failed") else "; ".join(
-                f"{x['wall_s']:.2f} s · {x['cpu_s']:.1f} s · {memory(x)}" for x in r["runs"])
-            runs.append(f"| {label(inp)} | {NAMES[n]} | {every} |")
+            if r.get("failed"):
+                runs.append(f"| {label(inp)} | {NAMES[n]} | {r.get('cache', '-')} | {cell(r, False, states)} |")
+                continue
+            for st in states:
+                every = "; ".join(one(x) for x in r["runs"] if x.get("cache", "unstated") == st)
+                runs.append(f"| {label(inp)} | {NAMES[n]} | {st} | {every} |")
     gate = "; ".join(
         f"{label(inp)}: " + ", ".join(f"{v_:,} {k}" for k, v_ in inp["tools"]["compara"]["counts"].items())
         for inp in inputs)
     page = ["# Benchmarks", "", f"Numbers: {link}, {date}.", "",
             f"{what}. Run on GitHub's `{runner}`: {machine}, {env['os']}.", ""] + table + ["", note, "",
             "## Every run", "",
-            f"The runs go round the tools in turn ({doc['runs']} rounds), so a slow minute on the runner "
-            "falls on all of them.", ""] + runs + ["",
+            f"The runs go round the tools in turn ({doc['runs']} rounds"
+            + (f", each tool once in each page-cache state per round: {', '.join(states)}" if states != ["unstated"] else "")
+            + "), so a slow minute on the runner falls on all of them.", ""] + runs + ["",
             "## Versions", "",
             f"compara built from the run's commit ({v['compara']}); DuckDB {v.get('duckdb')} and Polars "
             f"{v.get('polars')} installed from PyPI at their latest in the run, on Python {v.get('python')}."
             + (f" qsv {ver['qsv']} is its release binary, as downloaded in the run." if v.get("qsv") else ""), "",
             "## Method", "",
             "Each pair is written by `compara-gen-data` (seed 7) in each format, and every tool reads the "
-            "same files. Each tool runs in a process of its own; CPU time and peak RSS are that "
+            "same files. "
+            + ("Before each run the files that tool reads are put in a stated page-cache state: warm, read "
+               "to the end just before the run; cold, dropped from the page cache (`posix_fadvise` "
+               "DONTNEED), so the tool reads them from the runner's disk. The state is set for every tool "
+               "alike, so no tool starts warmer because of what the one before it did (in runs before this "
+               "was done, a tool killed for memory left the next one's inputs evicted: compara's 10M-row "
+               "CSV took 0.70 s in one round and 9.33 s in the next, run 44629611468). Each run records the "
+               "share of its inputs in the page cache as it starts and its major page faults. Each round "
+               "also times reading both inputs from a cold cache, the least any tool's cold run can take. "
+               if states != ["unstated"] else "")
+            + "Each tool runs in a process of its own; CPU time and peak RSS are that "
             "process's (`wait4`). Peak RSS counts the pages of files a tool maps, which the kernel can drop "
             "and read again under memory pressure: compara maps both inputs, so most of its RSS is the "
             "files themselves. The private part is the tool's own memory (heap, stacks; `RssAnon` of its "
