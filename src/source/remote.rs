@@ -49,87 +49,56 @@ pub(super) fn fetch(spec: &str, want: &Want) -> Result<Source> {
     runtime("download")?.block_on(fetch_async(spec, want))
 }
 
-/// Worker threads a transfer's runtime runs on.
-const WORKERS: usize = 4;
-
-/// The runtime a transfer runs on: `WORKERS` threads, or the calling thread
-/// alone where the system refuses them. tokio starts its threads itself and
-/// panics, exit 101, when one is refused: a thread wants a stack, and under a
-/// data limit stacks count against (`ulimit -d`, or the one set from a
-/// container's) or a process limit there may be none. So the workers, and one
-/// more for a name lookup ([`look_up`]), are asked for here first, held at
-/// once; if one is refused, the transfer runs on this thread, with its
-/// requests still in flight together, to the same bytes.
+/// The runtime a transfer runs on: the calling thread's own, which drives the
+/// requests in flight; a large read spreads its parts over more threads, each
+/// with a runtime of its own ([`fetch_jobs`]), and A and B are read at once
+/// on two threads where the system gives two (`cmd_compare`).
+///
+/// Not a multi-thread runtime: tokio starts its threads itself and panics,
+/// exit 101, when the system refuses one (a thread wants a stack, and under a
+/// data limit, `ulimit -d` or a container's, stacks count against it), and a
+/// refusal while the runtime is being built leaves the build waiting, on
+/// unwinding, for the workers it did start: a hang. Checking first that the
+/// threads can be had holds none of them; A's and B's checks both passed and
+/// their two runtimes then took more than was left. Nothing here asks tokio
+/// for a thread: a name lookup gets a thread of its own or this one
+/// ([`look_up`]).
 fn runtime(what: &str) -> Result<tokio::runtime::Runtime> {
-    let built = if threads_available(WORKERS + 1).is_ok() {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(WORKERS)
-            .enable_all()
-            .build()
-    } else {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-    };
-    built.map_err(|e| Error::new(format!("cannot start the {what} runtime: {e}")))
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::new(format!("cannot start the {what} runtime: {e}")))
 }
 
-/// Whether the transfer runs on the calling thread alone ([`runtime`]): there
-/// is no thread to hand blocking work to, and tokio panics if asked for one.
-fn on_one_thread() -> bool {
-    tokio::runtime::Handle::try_current()
-        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread)
-}
-
-/// The addresses of `host`, looked up by the system off the runtime's threads,
-/// or on the only one when there is no other ([`on_one_thread`]): the lookup
-/// then holds up the requests in flight, for the time a lookup takes.
+/// The addresses of `host`, looked up by the system on a thread started for
+/// it, so that the requests in flight go on meanwhile, or on the runtime's
+/// own when the system refuses one: the lookup then holds them up for the
+/// time it takes. Not on tokio's blocking pool, which panics when refused.
 async fn look_up(host: String) -> std::io::Result<Vec<std::net::SocketAddr>> {
     use std::net::ToSocketAddrs;
-    let find = move || {
-        (host.as_str(), 0u16)
-            .to_socket_addrs()
-            .map(|a| a.collect::<Vec<_>>())
-    };
-    if on_one_thread() {
-        return find();
+    fn find(host: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        (host, 0u16).to_socket_addrs().map(|a| a.collect())
     }
-    tokio::task::spawn_blocking(find)
-        .await
-        .map_err(std::io::Error::other)?
-}
-
-/// Whether `n` threads can be had at once: each is started and waits until the
-/// last has been, or one is refused.
-fn threads_available(n: usize) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let done = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        let mut held = Vec::with_capacity(n);
-        let mut refused = Ok(());
-        for _ in 0..n {
-            let spawned = std::thread::Builder::new().spawn_scoped(scope, || {
-                while !done.load(Ordering::Acquire) {
-                    std::thread::park();
-                }
-            });
-            match spawned {
-                Ok(h) => held.push(h),
-                Err(e) => {
-                    refused = Err(e);
-                    break;
-                }
-            }
-        }
-        done.store(true, Ordering::Release);
-        for h in &held {
-            h.thread().unpark();
-        }
-        refused
-    })
+    let (sent, found) = futures::channel::oneshot::channel();
+    let asked = host.clone();
+    let spawned = std::thread::Builder::new()
+        .name("compara-lookup".into())
+        .spawn(move || {
+            // The receiver is gone if the request was given up meanwhile.
+            let _ = sent.send(find(&asked));
+        });
+    match spawned {
+        Ok(_) => match found.await {
+            Ok(result) => result,
+            // The thread ended without an answer: look it up here.
+            Err(_) => find(&host),
+        },
+        Err(_) => find(&host),
+    }
 }
 
 /// How the bytes are asked for.
+#[derive(Clone)]
 enum Reader {
     Store(Arc<dyn ObjectStore>, ObjectPath),
     Http(reqwest::Client, String),
@@ -1067,6 +1036,16 @@ struct Job<'a> {
     spec: &'a str,
 }
 
+/// Bytes per ranged request: [`PART`], or `COMPARA_FETCH_PART`, so that a
+/// small file can be read in many parts in a test.
+fn part_size() -> u64 {
+    std::env::var("COMPARA_FETCH_PART")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(PART)
+}
+
 fn concurrency() -> usize {
     std::env::var("COMPARA_FETCH_CONCURRENCY")
         .ok()
@@ -1075,37 +1054,250 @@ fn concurrency() -> usize {
         .unwrap_or(CONCURRENCY)
 }
 
-/// Fetches every job into `file`, cut into parts of at most [`PART`] bytes,
+/// Threads one transfer's parts are read on at most. With two or more, the
+/// calling thread writes what they read, as it did under tokio's multi-thread
+/// runtime with four workers.
+const LANES: usize = 4;
+
+/// A part of a job, owned, for whichever lane takes it.
+struct Piece {
+    reader: Reader,
+    part: Range<u64>,
+    shift: u64,
+    etag: Option<String>,
+    spec: String,
+}
+
+/// What the lanes of one transfer share: the parts, the next one to take, the
+/// bytes read, and, once one fails, its error and a stop for the others.
+struct Lanes {
+    pieces: Vec<Piece>,
+    next: std::sync::atomic::AtomicUsize,
+    done: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicBool,
+    error: std::sync::Mutex<Option<Error>>,
+    stop: std::sync::Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+}
+
+type Signal<T> = futures::future::Shared<futures::channel::oneshot::Receiver<T>>;
+
+impl Lanes {
+    /// The first failure is the transfer's; every lane stops at once.
+    fn fail(&self, e: Error) {
+        use std::sync::PoisonError;
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(e);
+        if let Some(stop) = self
+            .stop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = stop.send(());
+        }
+    }
+
+    /// Takes parts until none are left, `width` in flight, until a lane fails.
+    async fn run(&self, out: &Out<'_>, width: usize, stop: Signal<()>) {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        let taken = std::iter::from_fn(|| {
+            if self.failed.load(Acquire) {
+                return None;
+            }
+            self.pieces.get(self.next.fetch_add(1, Relaxed))
+        });
+        let work = futures::stream::iter(taken)
+            .map(|p| async move {
+                fetch_part(&p.reader, out, p.part.clone(), p.shift, p.etag.as_deref())
+                    .await
+                    .map_err(|e| e.into_error(&p.spec))?;
+                self.done.fetch_add(p.part.end - p.part.start, Relaxed);
+                Ok::<(), Error>(())
+            })
+            .buffer_unordered(width.max(1))
+            .try_collect::<Vec<()>>();
+        if let futures::future::Either::Left((Err(e), _)) =
+            futures::future::select(std::pin::pin!(work), stop).await
+        {
+            self.fail(e);
+        }
+    }
+}
+
+/// Where a lane puts what it reads: in the file, or with the thread that
+/// writes it.
+enum Out<'a> {
+    File(&'a File),
+    Writer(futures::channel::mpsc::Sender<Wrote>),
+}
+
+/// What a lane hands the writer: bytes for a place in the file, or a part
+/// that is all there ([`crate::memory::write_behind`]).
+enum Wrote {
+    Bytes(u64, bytes::Bytes),
+    Part(u64, u64),
+}
+
+/// [`Out`] for one part in flight.
+enum PartOut<'a> {
+    File(&'a File),
+    Writer(futures::channel::mpsc::Sender<Wrote>),
+}
+
+impl Out<'_> {
+    fn part(&self) -> PartOut<'_> {
+        match self {
+            Out::File(file) => PartOut::File(file),
+            Out::Writer(to) => PartOut::Writer(to.clone()),
+        }
+    }
+}
+
+impl PartOut<'_> {
+    async fn put(&mut self, at: u64, bytes: bytes::Bytes) -> std::result::Result<(), FetchError> {
+        use futures::SinkExt;
+        match self {
+            PartOut::File(file) => {
+                write_at(file, &bytes, at).map_err(|e| FetchError::Other(e.to_string()))
+            }
+            // The writer stops only on its own failure, which is the error
+            // the transfer reports.
+            PartOut::Writer(to) => to
+                .send(Wrote::Bytes(at, bytes))
+                .await
+                .map_err(|_| FetchError::Other("the file's writer stopped".into())),
+        }
+    }
+
+    async fn written(&mut self, from: u64, len: u64) {
+        use futures::SinkExt;
+        match self {
+            PartOut::File(file) => crate::memory::write_behind(file, from, len, None),
+            PartOut::Writer(to) => {
+                let _ = to.send(Wrote::Part(from, len)).await;
+            }
+        }
+    }
+}
+
+/// Fetches every job into `file`, cut into parts of at most [`part_size`] bytes,
 /// [`concurrency`] at a time across all of them: many small objects keep as
 /// many requests in flight as one large one.
+///
+/// Where there are cores for them and the system gives them, up to [`LANES`]
+/// threads read the parts, each taking the next as it has room and driving
+/// its requests on a runtime of its own, and this thread writes what they
+/// read: reading the responses runs on several cores, and the file has one
+/// writer, as under tokio's multi-thread runtime. A thread the system refuses
+/// is a lane fewer, never an error; with none, this thread reads and writes.
+/// Every lane goes on driving its runtime until all are through, for its
+/// connections may be serving another lane's requests.
 async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> {
-    let parts: Vec<(&Job, Range<u64>)> = jobs
+    use futures::FutureExt;
+    use std::sync::atomic::Ordering::Relaxed;
+    let part = part_size();
+    let pieces: Vec<Piece> = jobs
         .iter()
         .flat_map(|job| {
             let mut out = Vec::new();
             let mut at = job.range.start;
             while at < job.range.end {
-                let end = (at + PART).min(job.range.end);
-                out.push((job, at..end));
+                let end = (at + part).min(job.range.end);
+                out.push(Piece {
+                    reader: job.reader.clone(),
+                    part: at..end,
+                    shift: job.shift,
+                    etag: job.etag.map(str::to_string),
+                    spec: job.spec.to_string(),
+                });
                 at = end;
             }
             out
         })
         .collect();
-    let total: u64 = parts.iter().map(|(_, r)| r.end - r.start).sum();
-    let done = std::sync::atomic::AtomicU64::new(0);
-    let done = &done;
-    let work = futures::stream::iter(parts)
-        .map(|(job, part)| async move {
-            let len = part.end - part.start;
-            fetch_part(job.reader, file, part, job.shift, job.etag)
-                .await
-                .map_err(|e| e.into_error(job.spec))?;
-            done.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
-            Ok::<(), Error>(())
-        })
-        .buffer_unordered(concurrency())
-        .try_collect::<Vec<()>>();
+    let total: u64 = pieces.iter().map(|p| p.part.end - p.part.start).sum();
+    let width = concurrency();
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let lanes = LANES.min(cores).min(pieces.len()).min(width);
+    let (stop_tx, stop_rx) = futures::channel::oneshot::channel::<()>();
+    let stop = stop_rx.shared();
+    let (go_tx, go_rx) = futures::channel::oneshot::channel::<usize>();
+    let go = go_rx.shared();
+    let (end_tx, end_rx) = futures::channel::oneshot::channel::<()>();
+    let end = end_rx.shared();
+    let (to_writer, mut writes) = futures::channel::mpsc::channel::<Wrote>(WRITES_QUEUED);
+    let shared = Arc::new(Lanes {
+        pieces,
+        next: Default::default(),
+        done: Default::default(),
+        failed: Default::default(),
+        error: Default::default(),
+        stop: std::sync::Mutex::new(Some(stop_tx)),
+    });
+    let mut others = Vec::new();
+    if lanes > 1 {
+        for _ in 0..lanes {
+            let (sent, result) = futures::channel::oneshot::channel::<()>();
+            let (lane, stop, go, end) = (shared.clone(), stop.clone(), go.clone(), end.clone());
+            let out = Out::Writer(to_writer.clone());
+            let spawned = std::thread::Builder::new()
+                .name("compara-fetch".into())
+                .spawn(move || {
+                    // A lane whose runtime cannot start takes no parts; the
+                    // others, or this thread, take them.
+                    if let Ok(rt) = runtime("download") {
+                        rt.block_on(async {
+                            if let Ok(width) = go.await {
+                                lane.run(&out, width, stop).await;
+                            }
+                            drop(out);
+                            let _ = sent.send(());
+                            let _ = end.await;
+                        });
+                    } else {
+                        drop(out);
+                        let _ = sent.send(());
+                    }
+                });
+            match spawned {
+                Ok(thread) => others.push((thread, result)),
+                Err(_) => break,
+            }
+        }
+    }
+    drop(to_writer);
+    let _ = go_tx.send(width.div_ceil(others.len().max(1)));
+    let work = async {
+        if !others.is_empty() {
+            while let Some(wrote) = writes.next().await {
+                match wrote {
+                    Wrote::Bytes(at, bytes) => {
+                        if let Err(e) = write_at(file, &bytes, at) {
+                            shared.fail(Error::new(format!("{label}: {e}")));
+                            break;
+                        }
+                    }
+                    Wrote::Part(from, len) => crate::memory::write_behind(file, from, len, None),
+                }
+            }
+            drop(writes);
+            for (_, result) in &mut others {
+                if result.await.is_err() {
+                    // The lane's thread ended without saying it was through:
+                    // a panic, which its parts must not pass as fetched.
+                    shared.fail(Error::new(format!(
+                        "{label}: a download thread stopped before its parts were in"
+                    )));
+                }
+            }
+        }
+        // What no lane took (none started, or none could run): here.
+        shared.run(&Out::File(file), width, stop.clone()).await;
+    };
     // A long download says how far it has got, every so often, so a log --
     // a CI job's, a pod's -- shows it moving.
     let started = Instant::now();
@@ -1113,6 +1305,7 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(PROGRESS_EVERY_SECS);
+    let done = &shared.done;
     let ticker = async {
         if every <= 0.0 {
             return std::future::pending::<()>().await;
@@ -1121,7 +1314,7 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
         every.tick().await;
         loop {
             every.tick().await;
-            let got = done.load(std::sync::atomic::Ordering::Relaxed);
+            let got = done.load(Relaxed);
             let secs = started.elapsed().as_secs_f64();
             eprintln!(
                 "{label}: {} of {} ({}%) in {secs:.0}s, {}/s",
@@ -1132,13 +1325,34 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
             );
         }
     };
-    let work = std::pin::pin!(work);
-    let ticker = std::pin::pin!(ticker);
-    match futures::future::select(work, ticker).await {
-        futures::future::Either::Left((result, _)) => result.map(|_| ()),
-        futures::future::Either::Right(((), _)) => unreachable!("the ticker never ends"),
+    futures::future::select(std::pin::pin!(work), std::pin::pin!(ticker)).await;
+    let _ = end_tx.send(());
+    for (thread, _) in others {
+        let _ = thread.join();
     }
+    if let Some(e) = shared
+        .error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        return Err(e);
+    }
+    if done.load(Relaxed) != total {
+        return Err(Error::new(format!(
+            "{label}: {} of {} downloaded, and no error said why",
+            human(done.load(Relaxed)),
+            human(total)
+        )));
+    }
+    Ok(())
 }
+
+/// Writes queued for the writer besides the one each lane and each part in
+/// flight may have waiting: none. Responses come in pieces of up to a few
+/// hundred KB; 16 more raised the peak RSS of reading 1 GiB from 25 to 32 MB
+/// and left the time as it was (local, indicative).
+const WRITES_QUEUED: usize = 0;
 
 /// How often, in seconds, a download in progress says how far it has got
 /// (`COMPARA_PROGRESS`; 0 for never).
@@ -1151,14 +1365,14 @@ const PROGRESS_EVERY_SECS: f64 = 10.0;
 /// that for its own.
 async fn fetch_part(
     reader: &Reader,
-    file: &File,
+    out: &Out<'_>,
     part: Range<u64>,
     shift: u64,
     etag: Option<&str>,
 ) -> std::result::Result<(), FetchError> {
     let mut attempt = 0u32;
     loop {
-        let result = fetch_part_once(reader, file, part.clone(), shift, etag).await;
+        let result = fetch_part_once(reader, out, part.clone(), shift, etag).await;
         let retryable = match &result {
             Err(FetchError::Transient(_)) => matches!(reader, Reader::Http(..)),
             _ => false,
@@ -1176,12 +1390,13 @@ async fn fetch_part(
 
 async fn fetch_part_once(
     reader: &Reader,
-    file: &File,
+    out: &Out<'_>,
     part: Range<u64>,
     shift: u64,
     etag: Option<&str>,
 ) -> std::result::Result<(), FetchError> {
     let mut at = part.start;
+    let mut to = out.part();
     match reader {
         Reader::Store(store, path) => {
             let got = store
@@ -1197,8 +1412,9 @@ async fn fetch_part_once(
             let mut stream = got.into_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
-                write_at(file, &chunk, at + shift).map_err(|e| FetchError::Other(e.to_string()))?;
-                at += chunk.len() as u64;
+                let len = chunk.len() as u64;
+                to.put(at + shift, chunk).await?;
+                at += len;
             }
         }
         Reader::Http(client, url) => {
@@ -1232,12 +1448,13 @@ async fn fetch_part_once(
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| FetchError::Transient(e.to_string()))?;
-                write_at(file, &chunk, at + shift).map_err(|e| FetchError::Other(e.to_string()))?;
-                at += chunk.len() as u64;
+                let len = chunk.len() as u64;
+                to.put(at + shift, chunk).await?;
+                at += len;
             }
         }
     }
-    crate::memory::write_behind(file, part.start + shift, at - part.start, None);
+    to.written(part.start + shift, at - part.start).await;
     if at != part.end {
         return Err(FetchError::Transient(format!(
             "a range ended early: {} of {} bytes",
@@ -1343,8 +1560,9 @@ fn metadata_url_via(url: &url::Url, proxied: bool) -> Option<String> {
 /// Name resolution that leaves out metadata addresses (see [`metadata_address`]).
 struct NoMetadata;
 
-/// Name resolution as the system does it, by [`look_up`] all the same: on one
-/// thread the client's own resolver would ask tokio for a thread it cannot have.
+/// Name resolution as the system does it, by [`look_up`] all the same: the
+/// client's own resolver asks tokio's blocking pool for a thread, and tokio
+/// panics when the system refuses one.
 struct System;
 
 impl reqwest::dns::Resolve for System {
@@ -1514,15 +1732,14 @@ fn client_options() -> object_store::ClientOptions {
             options = options.with_proxy_excludes(excludes);
         }
     }
-    // The store's own resolver hands each lookup to a thread, and shuffles
-    // what it finds; on one thread there is none to hand it to.
-    if on_one_thread() {
-        options = options.with_dns_resolver(Arc::new(StoreLookUp));
-    }
-    options
+    // The store's own resolver hands each lookup to tokio's blocking pool,
+    // which panics when the system refuses it a thread.
+    options.with_dns_resolver(Arc::new(StoreLookUp))
 }
 
-/// A store's name resolution on one thread ([`client_options`]).
+/// A store's name resolution: [`look_up`], with the addresses shuffled as the
+/// store's own resolver shuffles them, so that parts spread over a service's
+/// addresses rather than all going to the first.
 #[derive(Debug)]
 struct StoreLookUp;
 
@@ -1530,9 +1747,27 @@ impl object_store::client::DnsResolver for StoreLookUp {
     fn resolve(&self, host: &str) -> object_store::client::DnsFuture {
         let host = host.to_string();
         Box::pin(async move {
-            let found = look_up(host).await?;
-            Ok(found.into_iter().map(|a| a.ip()).collect())
+            let mut found: Vec<_> = look_up(host).await?.into_iter().map(|a| a.ip()).collect();
+            shuffle(&mut found);
+            Ok(found)
         })
+    }
+}
+
+/// `items` in a random order (Fisher-Yates, from a seed the standard
+/// library's hasher draws at random for each call).
+fn shuffle<T>(items: &mut [T]) {
+    use std::hash::{BuildHasher, Hasher};
+    let mut seed = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+        | 1;
+    for i in (1..items.len()).rev() {
+        // xorshift64
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        items.swap(i, (seed % (i as u64 + 1)) as usize);
     }
 }
 
@@ -1901,6 +2136,25 @@ fn ini_section(text: &str, name: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shuffle_keeps_every_address_and_moves_them() {
+        let start: Vec<u32> = (0..8).collect();
+        let mut moved = false;
+        for _ in 0..64 {
+            let mut v = start.clone();
+            shuffle(&mut v);
+            let mut sorted = v.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, start);
+            moved |= v != start;
+        }
+        assert!(moved, "64 shuffles of 8 left them all in place");
+        let mut one = [7u8];
+        shuffle(&mut one);
+        assert_eq!(one, [7]);
+        shuffle::<u8>(&mut []);
+    }
 
     #[test]
     fn library_errors_lose_the_url_twice_and_the_os_error_number() {

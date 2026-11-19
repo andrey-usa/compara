@@ -121,21 +121,48 @@ fn compare(
 /// The program run where the system refuses every thread it asks for: each
 /// asks for a stack (`RUST_MIN_STACK`) larger than the data limit.
 fn without_threads() -> Command {
+    with_stacks_of(8u64 << 30)
+}
+
+/// The program run where the system gives it about `n` threads and refuses
+/// more: each asks for a stack of a little under 1/n of the data limit, which
+/// leaves the rest of the process room for its heap.
+fn with_threads(n: u64) -> Command {
+    with_stacks_of((4u64 << 30) * 10 / (n * 10 + 6))
+}
+
+/// The program under a 4 GiB data limit, which thread stacks count against,
+/// each thread asking for a stack of `bytes`.
+fn with_stacks_of(bytes: u64) -> Command {
     let mut cmd = Command::new("bash");
     cmd.args(["-c", "ulimit -d 4194304; exec \"$0\" \"$@\""])
         .arg(env!("CARGO_BIN_EXE_compara"))
-        .env("RUST_MIN_STACK", (8u64 << 30).to_string());
+        .env("RUST_MIN_STACK", bytes.to_string());
     cmd
 }
 
 /// [`compare`], run as `cmd`.
 fn compare_by(
+    cmd: Command,
+    a: &str,
+    b: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    stdin: Option<&[u8]>,
+) -> (i32, String, String, String) {
+    compare_within(cmd, a, b, args, env, stdin, None)
+}
+
+/// [`compare_by`], killed if it has not exited within `limit`: exit -2, and
+/// stderr says so.
+fn compare_within(
     mut cmd: Command,
     a: &str,
     b: &str,
     args: &[&str],
     env: &[(&str, &str)],
     stdin: Option<&[u8]>,
+    limit: Option<std::time::Duration>,
 ) -> (i32, String, String, String) {
     let out_dir = std::env::temp_dir().join(format!(
         "compara-remote-out-{}-{}",
@@ -163,8 +190,29 @@ fn compare_by(
     if let Some(bytes) = stdin {
         child.stdin.take().unwrap().write_all(bytes).unwrap();
     }
-    let out = child.wait_with_output().unwrap();
-    let code = out.status.code().unwrap_or(-1);
+    let mut killed = None;
+    if let Some(limit) = limit {
+        let started = std::time::Instant::now();
+        // The pipes are drained by wait_with_output after; a comparison's
+        // stdout and stderr are a few lines, well inside a pipe's buffer.
+        while child.try_wait().unwrap().is_none() {
+            if started.elapsed() > limit {
+                let _ = child.kill();
+                killed = Some(limit);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let mut out = child.wait_with_output().unwrap();
+    let code = match killed {
+        Some(limit) => {
+            out.stderr
+                .extend(format!("\n(killed: no exit within {limit:?})").bytes());
+            -2
+        }
+        None => out.status.code().unwrap_or(-1),
+    };
     let mut summary = String::new();
     let mut rows = String::new();
     if let Ok(text) = std::fs::read_to_string(&json) {
@@ -416,6 +464,72 @@ fn urls_are_read_on_one_thread_when_no_other_can_be_had() {
         assert_eq!(want.0, got.0, "{a} {b}: exit; stderr {}", got.1);
         assert_eq!(want.2, got.2, "{a} {b}: summary");
         assert_eq!(want.3, got.3, "{a} {b}: rows");
+    }
+}
+
+/// Where the system gives some threads but not as many as the reads could
+/// use, two URLs still read to the local answer, the transfers spread over
+/// the threads there are: never a panic (exit 101, or 2 for B) or a hang. A
+/// check that a runtime's threads could be had, then a multi-thread runtime
+/// starting them, did all three: the check held none, so A's and B's both
+/// passed and their runtimes then took more than was left; tokio panics when
+/// refused a thread, and when refused one while the runtime is being built,
+/// waits on unwinding for the workers it did start.
+#[test]
+fn urls_read_to_the_local_answer_under_a_partial_thread_budget() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: thread stacks count against `ulimit -d` on Linux");
+        return;
+    }
+    let f = fixture("20k", &[]);
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let want = compare(&local("t_a.csv"), &local("t_b.csv"), &KEY, &[], None);
+    assert!(!want.2.is_empty());
+    let Some(server) = Server::start(&f.0, &[]) else {
+        eprintln!("skipping: no python to run the object server");
+        return;
+    };
+    // By name, so each connection's lookup wants a thread too, over plain
+    // HTTP and S3; in parts small enough that each read is spread over
+    // several threads.
+    let named = server.url.replace("127.0.0.1", "localhost");
+    let part = ("COMPARA_FETCH_PART", "262144".to_string());
+    let http = vec![part.clone()];
+    let mut s3 = s3_env(&named);
+    s3.push(part);
+    let cases = [
+        (
+            format!("{named}/bkt/t_a.csv"),
+            format!("{named}/bkt/t_b.csv"),
+            borrowed(&http),
+        ),
+        (
+            "s3://bkt/t_a.csv".to_string(),
+            "s3://bkt/t_b.csv".to_string(),
+            borrowed(&s3),
+        ),
+    ];
+    for n in 6..=11 {
+        for i in 0..3 {
+            let (a, b, env) = &cases[i % 2];
+            let got = compare_within(
+                with_threads(n),
+                a,
+                b,
+                &KEY,
+                env,
+                None,
+                Some(std::time::Duration::from_secs(60)),
+            );
+            assert_eq!(
+                want.0, got.0,
+                "{a}, about {n} threads: exit; stderr {}",
+                got.1
+            );
+            assert_eq!(want.2, got.2, "{a}, about {n} threads: summary");
+            assert_eq!(want.3, got.3, "{a}, about {n} threads: rows");
+        }
     }
 }
 

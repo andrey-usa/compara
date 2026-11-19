@@ -51,6 +51,11 @@ All notable changes to this project are documented here. The format follows
   thread"); they now do that work on the thread they have, with the same
   answer. A URL input or output is read and written on that thread too,
   where it was a panic and exit 101 ("OS can't spawn worker thread").
+  Where the system gives some threads but not as many as two URL inputs
+  could use, they no longer exit 101, 2 ("reading B panicked") or hang:
+  each thread a transfer reads on is one compara starts itself, and one
+  refused is a thread fewer, with the same answer. Where threads are
+  plentiful, reads are as fast as before.
 - The names of the JSON columns found past a file's first object are held
   to one budget for the file, shared by every thread reading it: 64 MB,
   or a quarter of `--memory` (or of the heap limit) when that is less.
