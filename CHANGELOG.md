@@ -53,6 +53,16 @@ All notable changes to this project are documented here. The format follows
   objects inside a row's arrays too, and in a part with several objects on
   a line, the first alone. A row's own object gets them now, after its
   members.
+- A URL whose server stopped sending (an answer's headers and then
+  nothing, or no answer at all) held the compare for good, its progress
+  line counting on. A read now waits 30 s for the answer and for each piece
+  of it, what AWS's Java SDK waits and `curl --speed-time`'s default
+  (`COMPARA_READ_TIMEOUT=<seconds>` waits longer), then asks again as for a
+  dropped connection; when the fourth try stalls too, the error names the
+  URL and says it stalled. Object stores wait the same and ask again as
+  they do after any failure, and their reads no longer stop at five minutes
+  a request, which cut off an 8 MB part on a link under 28 KB/s. A server
+  sending 1 KB a second is waited for.
 - A JSON file of pretty-printed objects one after another, as `jq .`
   writes them, was read a line at a time: two objects were six rows, and
   two such files that differed compared as identical (exit 0). Its rows are

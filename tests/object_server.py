@@ -13,6 +13,19 @@ Authorization header nor a query string, as a private bucket refuses an
 unsigned GET. Every request is appended to --log as one JSON line: method,
 path, range asked, bytes sent.
 
+--overwrite-after N serves every object, after N GETs, as a newer version:
+other bytes (digits in its second half moved on by one; --grow adds a line
+too) under another ETag, or none with --no-etag. A GET whose If-Match names
+the older ETag is refused with 412, unless --ignore-if-match, as some servers
+do not check it.
+
+--fault MODE misbehaves on the ranged GETs picked by --fault-at K (counted
+from 0 across the server) and --fault-every N (then every N-th; 0 for that
+one only): `silent` sends nothing at all; `stall` the headers and then
+nothing; `drop` half the body, then closes the connection; `reset` closes
+it before answering; `overlong` sends 1,000 bytes past the range asked, its
+Content-Length saying so; `dribble` sends the body 1 KB a second.
+
 Prints `LISTENING <url>` once it is ready.
 """
 import argparse
@@ -21,8 +34,10 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
@@ -38,9 +53,32 @@ def main() -> None:
                     help="answer every N-th ranged GET after the first with a 503, once per range")
     ap.add_argument("--overwrite-after", type=int, default=0,
                     help="after N GETs, serve every object as a new version (a new ETag)")
+    ap.add_argument("--ignore-if-match", action="store_true")
+    ap.add_argument("--no-etag", action="store_true")
+    ap.add_argument("--grow", action="store_true")
+    ap.add_argument("--fault", choices=["silent", "stall", "drop", "reset", "overlong", "dribble"])
+    ap.add_argument("--fault-at", type=int, default=0)
+    ap.add_argument("--fault-every", type=int, default=0)
     args = ap.parse_args()
     lock = threading.Lock()
     gets = [0]
+    ranged = [0]
+    newer = {}
+
+    def newer_version(full):
+        """The bytes of the object's newer version (--overwrite-after)."""
+        with lock:
+            if full not in newer:
+                with open(full, "rb") as f:
+                    b = bytearray(f.read())
+                for i in range(len(b) // 2, len(b), 7):
+                    if 0x30 <= b[i] <= 0x38:
+                        b[i] += 1
+                if args.grow:
+                    b += b"x" * 99 + b"\n"
+                newer[full] = bytes(b)
+            return newer[full]
+
     root_real = os.path.realpath(args.root)
 
     def inside(*parts):
@@ -122,14 +160,23 @@ def main() -> None:
                 return self.list_bucket(bucket_only, parts.query)
             if full is None:
                 return self.refuse(404)
-            size = os.path.getsize(full)
             st = os.stat(full)
+            asked = self.headers.get("Range")
             with lock:
                 gets[0] += 1
                 n = gets[0]
+                fault = None
+                if asked and not head:
+                    i = ranged[0]
+                    ranged[0] += 1
+                    picked = i == args.fault_at or (
+                        args.fault_every and i > args.fault_at
+                        and (i - args.fault_at) % args.fault_every == 0)
+                    fault = args.fault if picked else None
             version = 2 if args.overwrite_after and n > args.overwrite_after else 1
-            etag = self.etag_of(full, version)
-            asked = self.headers.get("Range")
+            data = newer_version(full) if version == 2 else None
+            size = len(data) if data is not None else st.st_size
+            etag = None if args.no_etag else self.etag_of(full, version)
             if args.flaky and asked and n > 1 and n % args.flaky == 0:
                 # Once per range: a retry of it gets through.
                 with lock:
@@ -138,8 +185,13 @@ def main() -> None:
                 if first:
                     return self.refuse(503)
             wanted = self.headers.get("If-Match")
-            if wanted and wanted != etag:
+            if wanted and wanted != etag and not args.ignore_if_match:
                 return self.refuse(412)
+            if fault == "reset":
+                return self.close_now()
+            if fault == "silent":
+                time.sleep(3600)
+                return self.close_now()
             start, end, partial = 0, size, False
             if asked and not args.no_ranges and not head:
                 m = re.fullmatch(r"bytes=(\d*)-(\d*)", asked.strip())
@@ -159,28 +211,55 @@ def main() -> None:
                     self.end_headers()
                     return self.record(asked, 0)
                 partial = True
+            if head:
+                body = b""
+            elif data is not None:
+                body = data[start:end]
+            else:
+                with open(full, "rb") as f:
+                    f.seek(start)
+                    body = f.read(end - start)
+            if fault == "overlong":
+                body += b"9" * 1000
             self.send_response(206 if partial else 200)
-            self.send_header("Content-Length", str(end - start))
+            self.send_header("Content-Length", str(end - start if head else len(body)))
             if partial:
                 self.send_header("Content-Range", f"bytes {start}-{end - 1}/{size}")
             self.send_header("Accept-Ranges", "none" if args.no_ranges else "bytes")
-            self.send_header("ETag", etag)
+            if etag:
+                self.send_header("ETag", etag)
             self.send_header("Last-Modified", email.utils.formatdate(st.st_mtime, usegmt=True))
             self.send_header("Content-Type", "application/octet-stream")
             self.end_headers()
             sent = 0
-            if not head:
-                with open(full, "rb") as f:
-                    f.seek(start)
-                    left = end - start
-                    while left:
-                        chunk = f.read(min(left, 1 << 20))
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        left -= len(chunk)
-                        sent += len(chunk)
+            if head:
+                pass
+            elif fault == "stall":
+                self.wfile.flush()
+                time.sleep(3600)
+                return self.close_now()
+            elif fault == "drop":
+                self.wfile.write(body[: len(body) // 2])
+                self.wfile.flush()
+                return self.close_now()
+            elif fault == "dribble":
+                for i in range(0, len(body), 1024):
+                    self.wfile.write(body[i:i + 1024])
+                    self.wfile.flush()
+                    sent += len(body[i:i + 1024])
+                    time.sleep(1)
+            else:
+                self.wfile.write(body)
+                sent = len(body)
             self.record(asked, sent)
+
+        def close_now(self):
+            """The connection closed at once, with nothing more sent."""
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.close_connection = True
 
         def body(self):
             n = int(self.headers.get("Content-Length") or 0)

@@ -704,6 +704,116 @@ fn transient_failures_are_retried_and_an_overwrite_is_caught() {
     assert!(err.contains("changed while it was being read"), "{err}");
 }
 
+/// `compare_within` a minute, of the program as it is, over `a` and `b`.
+fn compare_urls(a: &str, b: &str, env: &[(&str, &str)]) -> (i32, String, String, String) {
+    compare_within(
+        Command::new(env!("CARGO_BIN_EXE_compara")),
+        a,
+        b,
+        &KEY,
+        env,
+        None,
+        Some(std::time::Duration::from_secs(60)),
+    )
+}
+
+/// A server that stops answering is given up on after the read timeout (1 s
+/// here) and asked again: a part whose answer never comes, or stops after
+/// its headers, still reads to the local answer, over HTTP and S3, where it
+/// had hung for good. One that stalls every time is an error within seconds
+/// that names the URL, says it stalled and what to do. One that keeps
+/// sending, if only 1 KB a second, is waited for: the timeout is the wait for
+/// each piece, not for the whole.
+#[test]
+fn a_stalled_server_is_asked_again_and_a_slow_one_waited_for() {
+    let f = fixture("20k", &[]);
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let want = compare(&local("t_a.csv"), &local("t_b.csv"), &KEY, &[], None);
+    let quick = [
+        ("COMPARA_READ_TIMEOUT", "1"),
+        ("COMPARA_FETCH_PART", "65536"),
+    ];
+    for (mode, s3) in [
+        ("stall", false),
+        ("silent", false),
+        ("stall", true),
+        ("silent", true),
+    ] {
+        let Some(server) = Server::start(&f.0, &["--fault", mode, "--fault-at", "10"]) else {
+            eprintln!("skipping: no python to run the object server");
+            return;
+        };
+        let u = &server.url;
+        let mut env = if s3 { s3_env(u) } else { Vec::new() };
+        env.extend(quick.iter().map(|(k, v)| (*k, v.to_string())));
+        let (a, b) = if s3 {
+            (
+                "s3://bkt/t_a.csv".to_string(),
+                "s3://bkt/t_b.csv".to_string(),
+            )
+        } else {
+            (format!("{u}/bkt/t_a.csv"), format!("{u}/bkt/t_b.csv"))
+        };
+        let got = compare_urls(&a, &b, &borrowed(&env));
+        assert_eq!(
+            (want.0, &want.2, &want.3),
+            (got.0, &got.2, &got.3),
+            "{mode}, s3 {s3}: {}",
+            got.1
+        );
+    }
+
+    let Some(server) = Server::start(&f.0, &["--fault", "stall", "--fault-every", "1"]) else {
+        return;
+    };
+    let u = &server.url;
+    let started = std::time::Instant::now();
+    let (code, err, ..) = compare_urls(
+        &format!("{u}/bkt/t_a.csv"),
+        &format!("{u}/bkt/t_b.csv"),
+        &quick,
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("/bkt/t_") && err.contains("stopped sending: nothing came for 1 s (4 tries)"),
+        "{err}"
+    );
+    assert!(err.contains("COMPARA_READ_TIMEOUT"), "{err}");
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    drop(server);
+
+    let small = fixture("30", &[]);
+    let bucket = small.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let want = compare(&local("t_a.csv"), &local("t_b.csv"), &KEY, &[], None);
+    for s3 in [false, true] {
+        // About 6 KB a side: 6 s at 1 KB a second, twice the timeout.
+        let Some(server) = Server::start(&small.0, &["--fault", "dribble", "--fault-every", "1"])
+        else {
+            return;
+        };
+        let u = &server.url;
+        let mut env = if s3 { s3_env(u) } else { Vec::new() };
+        env.push(("COMPARA_READ_TIMEOUT", "3".into()));
+        let (a, b) = if s3 {
+            (
+                "s3://bkt/t_a.csv".to_string(),
+                "s3://bkt/t_b.csv".to_string(),
+            )
+        } else {
+            (format!("{u}/bkt/t_a.csv"), format!("{u}/bkt/t_b.csv"))
+        };
+        let got = compare_urls(&a, &b, &borrowed(&env));
+        assert_eq!(
+            (want.0, &want.2, &want.3),
+            (got.0, &got.2, &got.3),
+            "dribble, s3 {s3}: {}",
+            got.1
+        );
+    }
+}
+
 /// A prefix, a glob, or a name that is a prefix rather than an object reads
 /// every part under it as one table, the local directory's answer; Parquet
 /// parts only as far as the comparison reads them, gzip parts expanded.

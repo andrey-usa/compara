@@ -44,6 +44,12 @@ const CONCURRENCY: usize = 16;
 const TAIL: u64 = 64 << 10;
 /// Two wanted ranges closer than this are fetched as one.
 const GAP: u64 = 256 << 10;
+/// How long a read waits for the server's answer, and then for each next
+/// piece of it, before taking the server for stalled and asking again: what
+/// AWS's Java SDK waits on a socket, and `curl --speed-time`'s default. The
+/// wait starts again with every piece, so a slow transfer that keeps moving
+/// is never cut off.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(super) fn fetch(spec: &str, want: &Want) -> Result<Source> {
     runtime("download")?.block_on(fetch_async(spec, want))
@@ -122,7 +128,7 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
         if let Some(why) = metadata_url(&url).filter(|_| !link_local_allowed()) {
             return Err(Error::new(why));
         }
-        Reader::Http(http_client()?, spec.to_string())
+        Reader::Http(http_client(true)?, spec.to_string())
     } else {
         store_for(spec, &url).await?
     };
@@ -143,7 +149,7 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
         }
         // No credentials anywhere: a public bucket reads unsigned.
         Err(FetchError::Other(message)) if store_scheme && no_credentials(&message) => {
-            let unsigned = store_signed(spec, &url, false).await?;
+            let unsigned = store_signed(spec, &url, false, true).await?;
             match tail(&unsigned, spec).await {
                 Ok(found) => {
                     reader = unsigned;
@@ -322,7 +328,8 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
             let message = explain(&e.to_string());
             // No credentials anywhere: a public bucket lists unsigned.
             let retried = if no_credentials(&message) {
-                let Reader::Store(unsigned, _) = store_signed(root, &url, false).await? else {
+                let Reader::Store(unsigned, _) = store_signed(root, &url, false, true).await?
+                else {
                     unreachable!("store_signed returns a store");
                 };
                 list(unsigned.clone()).await.ok().map(|l| (unsigned, l))
@@ -700,7 +707,7 @@ async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
     let fail = |e: String| Error::new(format!("cannot write {dest}: {e}"));
     if plain {
         let body = std::fs::read(from)?;
-        let response = http_client()?
+        let response = http_client(false)?
             .put(dest)
             .body(body)
             .send()
@@ -711,8 +718,8 @@ async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
         }
         return Ok(size);
     }
-    let Reader::Store(store, path) = store_for(dest, &url).await? else {
-        unreachable!("store_for returns a store");
+    let Reader::Store(store, path) = store_signed(dest, &url, true, false).await? else {
+        unreachable!("store_signed returns a store");
     };
     if size <= one_shot {
         let bytes = std::fs::read(from)?;
@@ -773,6 +780,12 @@ enum FetchError {
     Refused(u16),
     /// Worth another try: a dropped connection, a 5xx, a 429.
     Transient(String),
+    /// Nothing came for [`read_timeout`]: worth another try too, and said
+    /// as a stall when the last one also fails ([`stalled`]); `answered`
+    /// when the answer had begun.
+    Stalled {
+        answered: bool,
+    },
     Other(String),
 }
 use FetchError::Refused;
@@ -783,6 +796,9 @@ impl FetchError {
             Refused(404) => Error::new(format!("not found: {spec}")),
             Refused(status) => Error::new(format!("{spec}: HTTP {status}")),
             FetchError::Transient(e) | FetchError::Other(e) => Error::new(format!("{spec}: {e}")),
+            FetchError::Stalled { answered } => {
+                Error::new(format!("{spec}: {}", stalled(answered, "1 try")))
+            }
         }
     }
 }
@@ -792,7 +808,16 @@ impl From<object_store::Error> for FetchError {
         match e {
             object_store::Error::NotFound { .. } => Refused(404),
             object_store::Error::Precondition { .. } => FetchError::Other(changed()),
-            e => FetchError::Other(explain(&e.to_string())),
+            e => {
+                let message = explain(&e.to_string());
+                match store_stalled(&e) {
+                    // The store has asked again already, as for any failure.
+                    Some(answered) if !no_credentials(&message) => {
+                        FetchError::Other(stalled(answered, "the store asked again too"))
+                    }
+                    _ => FetchError::Other(message),
+                }
+            }
         }
     }
 }
@@ -857,15 +882,12 @@ async fn tail(reader: &Reader, spec: &str) -> std::result::Result<Got, FetchErro
     loop {
         let result = tail_once(reader, spec).await;
         let retryable = match &result {
-            Err(FetchError::Transient(_)) => true,
+            Err(FetchError::Transient(_) | FetchError::Stalled { .. }) => true,
             Err(Refused(status)) => *status >= 500 || *status == 429,
             _ => false,
         };
         if !retryable || attempt >= 3 || !matches!(reader, Reader::Http(..)) {
-            return result.map_err(|e| match e {
-                FetchError::Transient(m) => FetchError::Other(m),
-                e => e,
-            });
+            return result.map_err(|e| gave_up(e, attempt));
         }
         attempt += 1;
         tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
@@ -925,11 +947,13 @@ async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, Fetc
                 .send()
                 .await
                 .map_err(|e| {
-                    if e.is_timeout() {
-                        FetchError::Transient(said(&e))
-                    } else {
-                        FetchError::Other(said(&e))
-                    }
+                    stall_of(&e, false).unwrap_or_else(|| {
+                        if e.is_timeout() {
+                            FetchError::Transient(said(&e))
+                        } else {
+                            FetchError::Other(said(&e))
+                        }
+                    })
                 })?;
             let status = response.status();
             if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
@@ -958,10 +982,9 @@ async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, Fetc
                             "{spec}: a partial response without a total size"
                         ))
                     })?;
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| FetchError::Other(e.to_string()))?;
+                let bytes = response.bytes().await.map_err(|e| {
+                    stall_of(&e, true).unwrap_or_else(|| FetchError::Other(e.to_string()))
+                })?;
                 return Ok(Got::Tail(total, bytes.to_vec(), etag));
             }
             // The server sent the whole object: it does not do ranges, so this
@@ -979,11 +1002,13 @@ async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, Fetc
             let mut response = response;
             let result: std::result::Result<(), FetchError> = async {
                 while let Some(chunk) = response.chunk().await.map_err(|e| {
-                    if e.is_timeout() || e.is_body() {
-                        FetchError::Transient(e.to_string())
-                    } else {
-                        FetchError::Other(e.to_string())
-                    }
+                    stall_of(&e, true).unwrap_or_else(|| {
+                        if e.is_timeout() || e.is_body() {
+                            FetchError::Transient(e.to_string())
+                        } else {
+                            FetchError::Other(e.to_string())
+                        }
+                    })
                 })? {
                     std::io::Write::write_all(&mut file, &chunk)
                         .map_err(|e| FetchError::Other(format!("{spec}: {e}")))?;
@@ -1054,6 +1079,55 @@ fn part_from(value: Option<&str>) -> u64 {
 /// The smallest part [`part_size`] takes: a 1 GiB file is then at most
 /// 16,384 requests, where `COMPARA_FETCH_PART=1` would have been a billion.
 const MIN_PART: u64 = 64 << 10;
+
+/// How long a read waits for the server: [`READ_TIMEOUT`], or
+/// `COMPARA_READ_TIMEOUT` seconds.
+fn read_timeout() -> std::time::Duration {
+    read_timeout_from(std::env::var("COMPARA_READ_TIMEOUT").ok().as_deref())
+}
+
+/// [`read_timeout`] from the variable's value, if it has a positive one; at
+/// most a day, for a deadline past what a clock can count would panic.
+fn read_timeout_from(value: Option<&str>) -> std::time::Duration {
+    value
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|&secs| secs > 0.0)
+        .map_or(READ_TIMEOUT, |secs| {
+            std::time::Duration::from_secs_f64(secs.min(86_400.0))
+        })
+}
+
+/// A stall, if that is what `e` is: the read timeout ran out waiting for an
+/// answer, or, `answered`, for the next piece of one. A connection that could
+/// not be made in time says so in its own words ([`said`]).
+fn stall_of(e: &reqwest::Error, answered: bool) -> Option<FetchError> {
+    (e.is_timeout() && !e.is_connect()).then_some(FetchError::Stalled { answered })
+}
+
+/// A store's error that is a stall, as [`stall_of`] tells one, wherever in
+/// its chain the client's error is; `answered` when it came while reading an
+/// answer (the store says so for a body it was reading).
+fn store_stalled(e: &object_store::Error) -> Option<bool> {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(c) = cause {
+        if let Some(r) = c.downcast_ref::<reqwest::Error>() {
+            return (r.is_timeout() && !r.is_connect()).then(|| r.is_body() || r.is_decode());
+        }
+        cause = c.source();
+    }
+    None
+}
+
+/// A stall, said: what stalled, for how long, `tries`, and what to do.
+fn stalled(answered: bool, tries: &str) -> String {
+    let secs = read_timeout().as_secs_f64();
+    let what = if answered {
+        format!("the server stopped sending: nothing came for {secs} s")
+    } else {
+        format!("no answer from the server within {secs} s")
+    };
+    format!("{what} ({tries}); try again later, or wait longer with COMPARA_READ_TIMEOUT=<seconds>")
+}
 
 fn concurrency() -> usize {
     std::env::var("COMPARA_FETCH_CONCURRENCY")
@@ -1383,14 +1457,13 @@ async fn fetch_part(
     loop {
         let result = fetch_part_once(reader, out, part.clone(), shift, etag).await;
         let retryable = match &result {
-            Err(FetchError::Transient(_)) => matches!(reader, Reader::Http(..)),
+            Err(FetchError::Transient(_) | FetchError::Stalled { .. }) => {
+                matches!(reader, Reader::Http(..))
+            }
             _ => false,
         };
         if !retryable || attempt >= 3 {
-            return result.map_err(|e| match e {
-                FetchError::Transient(m) => FetchError::Other(m),
-                e => e,
-            });
+            return result.map_err(|e| gave_up(e, attempt));
         }
         attempt += 1;
         tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
@@ -1434,10 +1507,9 @@ async fn fetch_part_once(
             if let Some(tag) = etag {
                 request = request.header(reqwest::header::IF_MATCH, tag);
             }
-            let response = request
-                .send()
-                .await
-                .map_err(|e| FetchError::Transient(said(&e)))?;
+            let response = request.send().await.map_err(|e| {
+                stall_of(&e, false).unwrap_or_else(|| FetchError::Transient(said(&e)))
+            })?;
             let status = response.status();
             if status == reqwest::StatusCode::PRECONDITION_FAILED {
                 return Err(FetchError::Other(changed()));
@@ -1456,7 +1528,9 @@ async fn fetch_part_once(
             }
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| FetchError::Transient(e.to_string()))?;
+                let chunk = chunk.map_err(|e| {
+                    stall_of(&e, true).unwrap_or_else(|| FetchError::Transient(e.to_string()))
+                })?;
                 let len = chunk.len() as u64;
                 if at + len > part.end {
                     return Err(FetchError::Transient("a range ran past its end".into()));
@@ -1475,6 +1549,22 @@ async fn fetch_part_once(
         )));
     }
     Ok(())
+}
+
+/// The error a request ends with after `attempt` retries: no longer worth
+/// another try.
+fn gave_up(e: FetchError, attempt: u32) -> FetchError {
+    match e {
+        FetchError::Transient(m) => FetchError::Other(m),
+        FetchError::Stalled { answered } => {
+            let tries = match attempt {
+                0 => "1 try".to_string(),
+                n => format!("{} tries", n + 1),
+            };
+            FetchError::Other(stalled(answered, &tries))
+        }
+        e => e,
+    }
 }
 
 fn changed() -> String {
@@ -1673,10 +1763,17 @@ fn plain(text: &str) -> String {
     out
 }
 
-fn http_client() -> Result<reqwest::Client> {
+/// A client to read with, which waits [`read_timeout`] for the server's
+/// answer and then for each piece of it, or to upload with, which does not:
+/// that wait runs from the request's first byte to its answer, and a large
+/// body takes longer than that to send.
+fn http_client(reading: bool) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(concat!("compara/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(30));
+    if reading {
+        builder = builder.read_timeout(read_timeout());
+    }
     if link_local_allowed() {
         builder = builder.dns_resolver(Arc::new(System));
     } else {
@@ -1729,12 +1826,24 @@ fn allow_http(prefix: &str, endpoints: &[&str]) -> bool {
             .any(|k| std::env::var(k).is_ok_and(|v| v.trim().starts_with("http://")))
 }
 
-fn client_options() -> object_store::ClientOptions {
-    let mut options = object_store::ClientOptions::new()
-        .with_connect_timeout(std::time::Duration::from_secs(30))
-        // A part is eight megabytes; on a slow link that is not quick, and the
-        // default request timeout would cut it off.
-        .with_timeout(std::time::Duration::from_secs(300));
+/// A store's client: for `reading`, one that waits [`read_timeout`] for each
+/// read, the store asking again as it does after any failure, and sets no
+/// limit on a whole request, which a slow link that keeps moving would pass;
+/// for uploading, one whose requests have five minutes each (see
+/// [`http_client`]).
+fn client_options(reading: bool) -> object_store::ClientOptions {
+    let mut options =
+        object_store::ClientOptions::new().with_connect_timeout(std::time::Duration::from_secs(30));
+    options = if reading {
+        options
+            .with_timeout_disabled()
+            .with_read_timeout(read_timeout())
+    } else {
+        // A request carries up to 32 MB (a part, or a small file whole); on
+        // a slow link that is not quick, and the default request timeout
+        // would cut it off.
+        options.with_timeout(std::time::Duration::from_secs(300))
+    };
     if let Some(proxy) = proxy_from_env() {
         options = options.with_proxy_url(proxy);
         if let Some(excludes) = ["NO_PROXY", "no_proxy"]
@@ -1783,9 +1892,10 @@ fn shuffle<T>(items: &mut [T]) {
     }
 }
 
-/// A signed store for the URL's cloud, configured from the environment.
+/// A signed store for the URL's cloud, configured from the environment, to
+/// read from.
 async fn store_for(spec: &str, url: &url::Url) -> Result<Reader> {
-    store_signed(spec, url, true).await
+    store_signed(spec, url, true, true).await
 }
 
 /// Whether a store error is the absence of credentials, the one an unsigned
@@ -1795,8 +1905,9 @@ fn no_credentials(message: &str) -> bool {
 }
 
 /// A store as [`store_for`] builds it, or with `signed` false one that sends
-/// its requests unsigned: a public bucket's, read with no credentials at all.
-async fn store_signed(spec: &str, url: &url::Url, signed: bool) -> Result<Reader> {
+/// its requests unsigned: a public bucket's, read with no credentials at all;
+/// `reading` or written to ([`client_options`]).
+async fn store_signed(spec: &str, url: &url::Url, signed: bool, reading: bool) -> Result<Reader> {
     let (scheme, path) = object_store::ObjectStoreScheme::parse(url)
         .map_err(|e| Error::new(format!("{spec}: {e}")))?;
     let fail = |e: object_store::Error| Error::new(format!("{spec}: {}", explain(&e.to_string())));
@@ -1804,7 +1915,7 @@ async fn store_signed(spec: &str, url: &url::Url, signed: bool) -> Result<Reader
         object_store::ObjectStoreScheme::AmazonS3 => {
             let mut b = object_store::aws::AmazonS3Builder::from_env()
                 .with_url(spec)
-                .with_client_options(client_options());
+                .with_client_options(client_options(reading));
             for (key, value) in aws_profile() {
                 b = b.with_config(*key, value);
             }
@@ -1832,7 +1943,7 @@ async fn store_signed(spec: &str, url: &url::Url, signed: bool) -> Result<Reader
                 // The bucket says where it is; a request to the wrong region
                 // comes back as a redirect object_store does not follow.
                 if let Ok(region) =
-                    object_store::aws::resolve_bucket_region(bucket, &client_options()).await
+                    object_store::aws::resolve_bucket_region(bucket, &client_options(reading)).await
                 {
                     b = b.with_region(region);
                 }
@@ -1846,7 +1957,8 @@ async fn store_signed(spec: &str, url: &url::Url, signed: bool) -> Result<Reader
             let mut b = object_store::gcp::GoogleCloudStorageBuilder::from_env()
                 .with_url(spec)
                 .with_client_options(
-                    client_options().with_allow_http(allow_http("GOOGLE", &["GOOGLE_BASE_URL"])),
+                    client_options(reading)
+                        .with_allow_http(allow_http("GOOGLE", &["GOOGLE_BASE_URL"])),
                 );
             if !signed {
                 b = b.with_skip_signature(true);
@@ -1856,7 +1968,7 @@ async fn store_signed(spec: &str, url: &url::Url, signed: bool) -> Result<Reader
         object_store::ObjectStoreScheme::MicrosoftAzure => {
             let mut b = object_store::azure::MicrosoftAzureBuilder::from_env()
                 .with_url(spec)
-                .with_client_options(client_options().with_allow_http(allow_http(
+                .with_client_options(client_options(reading).with_allow_http(allow_http(
                     "AZURE",
                     &[
                         "AZURE_STORAGE_ENDPOINT",
@@ -2156,6 +2268,24 @@ mod tests {
         assert_eq!(part_from(Some(" 262144 ")), 262_144);
         assert_eq!(part_from(Some("1")), MIN_PART);
         assert_eq!(part_from(Some("0")), MIN_PART);
+    }
+
+    #[test]
+    fn a_read_waits_thirty_seconds_unless_told_a_positive_time() {
+        use std::time::Duration;
+        assert_eq!(read_timeout_from(None), READ_TIMEOUT);
+        assert_eq!(READ_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(
+            read_timeout_from(Some(" 2.5 ")),
+            Duration::from_millis(2500)
+        );
+        for never in ["0", "-1", "soon", "NaN", ""] {
+            assert_eq!(read_timeout_from(Some(never)), READ_TIMEOUT, "{never}");
+        }
+        // A deadline past what the clock counts would panic.
+        for huge in ["1e300", "inf"] {
+            assert_eq!(read_timeout_from(Some(huge)), Duration::from_secs(86_400));
+        }
     }
 
     #[test]
