@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- A JSON file that names columns with escapes, as Python's `json.dumps`
+  does by default for any name outside ASCII, is compared in a quarter
+  fewer instructions where an ignored value differs in every row: the
+  check that a matched row is unchanged gave up at such a name and parsed
+  both rows instead. 200,000 rows with one such name: 4,080.6M
+  instructions to 2,997.9M (callgrind, one thread).
 - In a container (or under `ulimit -d`), a pair whose key indexes
   cannot fit the heap goes to the sortmerge engine once its rows
   are counted, instead of after building indexes it then throws away:

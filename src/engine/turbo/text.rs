@@ -2430,8 +2430,9 @@ fn json_value_end<S: Scan>(scan: S, d: &[u8], mut at: usize, end: usize) -> usiz
 /// The member of `d`'s object whose value holds byte `diff`, walking from `at`
 /// (the row start, or just past a value already skipped): its value's bounds.
 /// `None` where `diff` falls in a name or the punctuation between members, in a
-/// tracked member, or anywhere the walk cannot follow -- an escaped name
-/// included, as the tail check treats one. `d` ends at the last wanted value, so
+/// tracked member, or anywhere the walk cannot follow. A name written with an
+/// escape is the name it spells, as the row parser reads it: equal bytes in
+/// both rows, so the same name in both. `d` ends at the last wanted value, so
 /// a value that runs to its end is not a gap.
 #[inline(always)]
 fn json_member_at<S: Scan>(
@@ -2459,7 +2460,7 @@ fn json_member_at<S: Scan>(
         }
         let kq = at;
         let (kend, escaped) = skip_json_string(scan, d, at, end);
-        if escaped || kend >= end || kend >= diff {
+        if kend >= end || kend >= diff {
             return None;
         }
         at = kend;
@@ -2481,7 +2482,13 @@ fn json_member_at<S: Scan>(
             return None;
         }
         if diff < v_end {
-            if p.slot_for(&d[kq + 1..kend - 1]).is_some() {
+            let name = &d[kq + 1..kend - 1];
+            let tracked = if escaped {
+                p.slot_for_escaped(name)
+            } else {
+                p.slot_for(name)
+            };
+            if tracked.is_some() {
                 return None;
             }
             return Some((at, v_end));
@@ -2889,6 +2896,115 @@ mod tests {
         assert!(
             agreed > 1000,
             "too few rows proved equal to test anything: {agreed}"
+        );
+    }
+
+    /// The JSON proof holds only where the two rows parse to the same
+    /// tracked values, with names spelled plainly and with escapes: a tracked
+    /// name is tracked however it is written, and an untracked one is passed
+    /// over however it is written. Rows differ in a value, a name's
+    /// spelling, a member left out or a tracked name repeated at the end.
+    #[test]
+    fn the_json_proof_holds_only_where_the_parsed_rows_agree() {
+        use super::super::slab::same_bytes;
+        let p = RowParser::json(
+            ["id", "amount", "not\u{e9}"]
+                .iter()
+                .map(|w| Some(w.to_string()))
+                .collect(),
+            1,
+            false,
+        );
+        // Each member's spellings: tracked ones first, then two untracked.
+        let spellings: [&[&str]; 5] = [
+            &["id", "\\u0069d"],
+            &["amount", "\\u0061mount", "am\\u006Fu\\u006et"],
+            &["not\u{e9}", "not\\u00e9", "not\\u00E9"],
+            &["updated_at", "upd\\u0061ted_at"],
+            &["x\\/y", "x/y"],
+        ];
+        let values = [
+            "\"a\"",
+            "\"b\"",
+            "1",
+            "\"caf\\u00e9\"",
+            "\"caf\u{e9}\"",
+            "null",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let text = |members: &[(usize, usize, usize)]| {
+            let body: Vec<String> = members
+                .iter()
+                .map(|&(m, sp, v)| format!("\"{}\":{}", spellings[m][sp], values[v]))
+                .collect();
+            format!("{{{}}}\n", body.join(","))
+        };
+        let (mut proved, mut proved_escaped) = (0, 0);
+        for _ in 0..20_000 {
+            let mut order = [0usize, 1, 2, 3, 4];
+            for i in (1..order.len()).rev() {
+                order.swap(i, next(i + 1));
+            }
+            let a_members: Vec<(usize, usize, usize)> = order[..2 + next(4)]
+                .iter()
+                .map(|&m| (m, next(spellings[m].len()), next(values.len())))
+                .collect();
+            let mut b_members = a_members.clone();
+            let i = next(b_members.len());
+            match next(5) {
+                0 => b_members[i].2 = next(values.len()),
+                1 => b_members[i].1 = next(spellings[b_members[i].0].len()),
+                2 => {
+                    b_members.remove(i);
+                }
+                3 => b_members.push((next(3), next(2), next(values.len()))),
+                _ => {}
+            }
+            let (a_row, b_row) = (text(&a_members), text(&b_members));
+            let mut a = a_row.clone().into_bytes();
+            a.extend_from_slice(&[b' '; 80]);
+            let mut b = b"{\"pad\":0}\n".to_vec();
+            let b_lo = b.len();
+            b.extend_from_slice(b_row.as_bytes());
+            let b_hi = b.len();
+            b.extend_from_slice(&[b' '; 80]);
+            let holds = json_rows_match_with(Swar, &p, &a, 0, a_row.len(), &b, b_lo, b_hi);
+            if let Some(w) = Wide::detect() {
+                // Safety: `w` proves AVX2, or NEON on aarch64.
+                let counted =
+                    unsafe { json_rows_match_wide(w, &p, &a, 0, a_row.len(), &b, b_lo, b_hi) };
+                assert_eq!(counted, holds, "A {a_row:?} B {b_row:?}");
+            }
+            if !holds {
+                continue;
+            }
+            let (sa, sb) = (
+                Slab::owned(a.clone(), Dialect::Json),
+                Slab::owned(b.clone(), Dialect::Json),
+            );
+            let (mut fa, mut fb) = ([ABSENT; 3], [ABSENT; 3]);
+            p.parse(sa.data(), 0, a_row.len(), &mut fa);
+            p.parse(sb.data(), b_lo, b_hi, &mut fb);
+            for k in 0..3 {
+                assert!(
+                    same_bytes(&sa, fa[k], &sb, fb[k]),
+                    "proved, but slot {k} differs: A {a_row:?} B {b_row:?}"
+                );
+            }
+            proved += 1;
+            if a_row.contains('\\') {
+                proved_escaped += 1;
+            }
+        }
+        assert!(
+            proved > 2000 && proved_escaped > 1000,
+            "too few rows proved to test anything: {proved}, {proved_escaped} with an escape"
         );
     }
 
