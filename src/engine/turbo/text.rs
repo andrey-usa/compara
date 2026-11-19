@@ -606,7 +606,11 @@ pub(super) fn json_later_keys(
             continue;
         }
         let next = end_of_json_row(scan, data, pos.min(end), end, array, false);
-        pos = if next > pos { next } else { pos + 1 };
+        pos = if next > pos || data.get(next) == Some(&b'{') {
+            next
+        } else {
+            pos + 1
+        };
     }
     Ok((in_order(later), rows))
 }

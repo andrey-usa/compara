@@ -842,21 +842,25 @@ fn a_stream_of_pretty_json_objects_is_read_as_its_objects() {
         }
     }
     // Several compact objects to a line are a stream too: the second and
-    // third on each line were dropped.
-    let line = |v: u8| {
-        (0..300)
-            .map(|i| format!("{{\"id\":{i},\"v\":{}}}", if i == 7 { v } else { 1 }))
-            .collect::<Vec<_>>()
-            .chunks(3)
-            .map(|c| c.join(" ") + "\n")
-            .collect::<String>()
-    };
-    let f = json_fixture(&line(1), &line(2));
-    let r = compare(&f.a, &f.b, &mut Options::with_key(["id"])).expect("compare");
-    assert_eq!(
-        (r.counts.a_rows, r.counts.b_rows, r.counts.changed),
-        (300, 300, 1)
-    );
+    // third on each line were dropped. Written back to back with nothing
+    // between (`}{`), the key walk stepped into the second and refused it.
+    for between in [" ", ""] {
+        let line = |v: u8| {
+            (0..300)
+                .map(|i| format!("{{\"id\":{i},\"v\":{}}}", if i == 7 { v } else { 1 }))
+                .collect::<Vec<_>>()
+                .chunks(3)
+                .map(|c| c.join(between) + "\n")
+                .collect::<String>()
+        };
+        let f = json_fixture(&line(1), &line(2));
+        let r = compare(&f.a, &f.b, &mut Options::with_key(["id"])).expect("compare");
+        assert_eq!(
+            (r.counts.a_rows, r.counts.b_rows, r.counts.changed),
+            (300, 300, 1),
+            "objects joined by {between:?}"
+        );
+    }
 }
 
 /// A file read a line at a time whose lines are not one object each is
