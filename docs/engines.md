@@ -42,12 +42,16 @@ end in a carriage return alone (the classic Mac ending, Excel's "CSV
 one of them and says so, and `--engine turbo` declines it.
 
 **Nested JSON.** A value that is an object or an array is compared as its
-JSON text, as written: any difference inside it is a change to that column,
-and the report and export show the text. The same object written with its
-keys in another order, or with other spacing, is a change too, so JSON
-compares best flat, one scalar per key. For two files written by different
-tools, flatten nested values into top-level keys first (`jq`, or the writer's
-own option), and each nested field becomes a column compared on its own.
+JSON text: any difference inside it is a change to that column, and the
+report and export show the text. The space between its tokens is not part
+of it, and a string's characters are read however they are escaped
+(`\u00e9` or `é`, `\/` or `/`), so the same records written pretty or
+compact, by `jq` or by Python, are the same table. The order of an object's
+keys and the spelling of a number (`1.0`, `1`) are as written, as a
+top-level number's is: the same object with its keys in another order is a
+change. To compare those by value, flatten nested values into top-level keys
+first (`jq`, or the writer's own option), and each nested field becomes a
+column compared on its own.
 
 The Parquet reader is written here rather than taken from a crate, to keep that
 representation instead of converting to Arrow arrays. It reads PLAIN,

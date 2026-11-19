@@ -28,6 +28,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A nested JSON value (an object or an array) was compared as written, its
+  spacing included, so the same records pretty-printed and compact compared
+  as changed in every row with one: 133,212 rows changed of 298,486
+  matched, where the records differ in 2,925 (local). The space between
+  its tokens is no longer part of the value, and a string inside it is
+  read however its characters are escaped (`\u00e9` or `é`, `\/` or
+  `/`), as a top-level string always was. Key order and a number's
+  spelling still count. The report and export show a nested value compact.
 - A JSON file of pretty-printed objects one after another, as `jq .`
   writes them, was read a line at a time: two objects were six rows, and
   two such files that differed compared as identical (exit 0). Its rows are

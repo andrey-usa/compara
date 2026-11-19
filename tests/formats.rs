@@ -736,8 +736,8 @@ fn a_csv_only_engine_named_for_parquet_or_json_is_refused() {
 /// A nested object or array is a cell of its JSON text, in newline-delimited
 /// JSON and in a top-level array alike. Before, it was read as absent, so two
 /// different objects compared as the same missing value and the change went
-/// unreported. The text is compared as written: the same object with another
-/// key order or spacing is a change, which is what the README says.
+/// unreported. The same object with its keys in another order is a change,
+/// as docs/engines.md says.
 #[test]
 fn a_nested_json_value_is_compared_as_its_text() {
     let dir = std::env::temp_dir().join(format!("compara-nested-{}", std::process::id()));
@@ -779,6 +779,64 @@ fn a_nested_json_value_is_compared_as_its_text() {
         let shown = whole(&result);
         assert!(shown.contains(r#"{\"a\":1,\"b\":[1,2]}"#), "{shown}");
         assert!(shown.contains(r#"{\"a\":1,\"b\":[1,3]}"#), "{shown}");
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// The same records written by two writers: one compact with every non-ASCII
+/// character escaped and `/` too (Python's `json.dumps` and PHP's defaults),
+/// the other pretty-printed one object after another (`jq .`). A nested value
+/// is the same value whatever the space between its tokens or the spelling of
+/// its strings' characters; read as written, every nested cell differed. Key
+/// order and a number's spelling are still a change, and the key column may
+/// be a nested value itself: it hashes as it compares.
+#[test]
+fn the_same_records_written_pretty_and_compact_are_the_same_table() {
+    let dir = std::env::temp_dir().join(format!("compara-pretty-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("a temp dir");
+    let a = dir.join("a.ndjson");
+    let b = dir.join("b.json");
+    fs::write(
+        &a,
+        concat!(
+            "{\"k\":{\"n\":1},\"m\":{\"s\":\"caf\\u00e9 \\/ \\u003c\",\"l\":[1,2]},\"v\":\"x\"}\n",
+            "{\"k\":{\"n\":2},\"m\":[{\"t\":\"x}{\"},{\"t\":\"\\\"\"}],\"v\":\"y\"}\n",
+            "{\"k\":{\"n\":3},\"m\":{\"a\":1,\"b\":2},\"v\":\"z\"}\n",
+            "{\"k\":{\"n\":4},\"m\":[1.0,2],\"v\":\"w\"}\n",
+            "{\"k\":{\"n\":5},\"m\":[1,2],\"v\":\"u\"}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &b,
+        concat!(
+            // unchanged: spacing, `é`, `/` and `<` as themselves
+            "{\n  \"k\": {\n    \"n\": 1\n  },\n  \"m\": {\n    \"s\": \"caf\u{e9} / <\",\n",
+            "    \"l\": [\n      1,\n      2\n    ]\n  },\n  \"v\": \"x\"\n}\n",
+            // unchanged: objects in an array open their own lines
+            "{\n  \"k\": {\"n\": 2},\n  \"m\": [\n    {\n      \"t\": \"x}{\"\n    },\n",
+            "    {\n      \"t\": \"\\u0022\"\n    }\n  ],\n  \"v\": \"y\"\n}\n",
+            // changed: the keys in another order
+            "{\n  \"k\": {\"n\": 3},\n  \"m\": {\"b\": 2, \"a\": 1},\n  \"v\": \"z\"\n}\n",
+            // changed: 1.0 written 1
+            "{\n  \"k\": {\"n\": 4},\n  \"m\": [1, 2],\n  \"v\": \"w\"\n}\n",
+            // changed: one element
+            "{\n  \"k\": {\"n\": 5},\n  \"m\": [1, 3],\n  \"v\": \"u\"\n}\n",
+        ),
+    )
+    .unwrap();
+    for threads in [1usize, 4] {
+        let mut opt = options(&["k"]);
+        opt.threads = Some(threads);
+        let result = run(&a, &b, &mut opt);
+        assert_eq!(result.counts.matched, 5, "{}", answer(&result));
+        assert_eq!(result.counts.changed, 3, "{}", answer(&result));
+        let m = result.columns.iter().find(|c| c.name == "m").unwrap();
+        assert_eq!(m.changed, 3, "{}", answer(&result));
+        // The report shows a nested value in its one spelling.
+        let shown = whole(&result);
+        assert!(shown.contains(r#"{\"b\":2,\"a\":1}"#), "{shown}");
+        assert!(shown.contains(r#"[1.0,2]"#), "{shown}");
     }
     fs::remove_dir_all(&dir).ok();
 }

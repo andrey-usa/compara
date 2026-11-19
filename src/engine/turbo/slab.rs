@@ -124,17 +124,60 @@ impl Slab {
 
     /// The field's logical bytes: the value, with its escapes undone.
     pub(super) fn logical(&self, f: Field) -> LogicalBytes<'_> {
-        let escaped = is_real(f) && is_escaped(f);
         LogicalBytes {
             raw: self.raw(f),
-            dialect: if escaped { self.dialect } else { Dialect::Raw },
+            mode: self.mode(f),
             at: 0,
             closed: false,
-            pending: [0; 4],
+            last: b'[',
+            pending: [0; 6],
             pending_len: 0,
             pending_at: 0,
         }
     }
+
+    /// How the field's bytes are read: as they stand, or through its
+    /// dialect's escapes, or as a JSON object or array.
+    ///
+    /// The JSON reader flags a nested value as escaped, because its bytes are
+    /// not its value as they stand: its spacing is not part of it. A string
+    /// carries the same flag when it holds a backslash, and both may open with
+    /// a bracket. What tells them apart is the byte before: a string's field
+    /// starts just past its opening quote, and a nested value's at its own
+    /// bracket, which follows the colon or a space, never a quote.
+    #[inline]
+    fn mode(&self, f: Field) -> Mode {
+        if !is_real(f) || !is_escaped(f) {
+            return Mode::Raw;
+        }
+        match self.dialect {
+            Dialect::Raw => Mode::Raw,
+            Dialect::Csv => Mode::Csv,
+            Dialect::Json => {
+                let (at, data) = (offset_of(f), self.data());
+                if matches!(data.get(at), Some(b'{' | b'[')) && at > 0 && data[at - 1] != b'"' {
+                    Mode::Nested
+                } else {
+                    Mode::Json
+                }
+            }
+        }
+    }
+}
+
+/// How [`LogicalBytes`] reads a field's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The bytes are the value.
+    Raw,
+    /// A quoted CSV field with a doubled quote, or text after its closing one.
+    Csv,
+    /// A JSON string with a backslash escape.
+    Json,
+    /// A JSON object or array, read as its text with the spacing between its
+    /// tokens dropped and each string spelled one way; see
+    /// [`LogicalBytes::next_nested`].
+    Nested,
 }
 
 /// A field's bytes with its escapes undone, one byte at a time and without
@@ -142,20 +185,27 @@ impl Slab {
 /// the small pending buffer is for.
 pub(super) struct LogicalBytes<'a> {
     raw: &'a [u8],
-    dialect: Dialect,
+    mode: Mode,
     at: usize,
     /// CSV: the field's closing quote has been passed, and what follows it up
-    /// to the delimiter is content as it stands.
+    /// to the delimiter is content as it stands. Nested JSON: inside a string.
     closed: bool,
-    pending: [u8; 4],
+    /// Nested JSON: the last byte given outside a string.
+    last: u8,
+    /// Up to six bytes: `\u001f`, the longest spelling a nested string's
+    /// character is given.
+    pending: [u8; 6],
     pending_len: u8,
     pending_at: u8,
 }
 
 impl LogicalBytes<'_> {
-    /// True when the bytes are the value, so a caller may take the slice whole.
-    pub(super) fn is_plain(&self) -> bool {
-        self.dialect == Dialect::Raw
+    /// Returns the first of `bytes` and holds the rest.
+    fn give(&mut self, bytes: &[u8]) -> u8 {
+        self.pending[..bytes.len()].copy_from_slice(bytes);
+        self.pending_len = bytes.len() as u8;
+        self.pending_at = 1;
+        bytes[0]
     }
 
     /// Encodes one code point, returning its first byte and holding the rest.
@@ -191,10 +241,7 @@ impl LogicalBytes<'_> {
                 4
             }
         };
-        self.pending = buf;
-        self.pending_len = n;
-        self.pending_at = 1;
-        buf[0]
+        self.give(&buf[..n])
     }
 }
 
@@ -209,9 +256,9 @@ impl Iterator for LogicalBytes<'_> {
         }
         let b = *self.raw.get(self.at)?;
         self.at += 1;
-        match self.dialect {
-            Dialect::Raw => Some(b),
-            Dialect::Csv => {
+        match self.mode {
+            Mode::Raw => Some(b),
+            Mode::Csv => {
                 if b != b'"' || self.closed {
                     return Some(b);
                 }
@@ -229,7 +276,8 @@ impl Iterator for LogicalBytes<'_> {
                 self.at += 1;
                 Some(b)
             }
-            Dialect::Json => {
+            Mode::Nested => self.next_nested(b),
+            Mode::Json => {
                 if b != b'\\' {
                     return Some(b);
                 }
@@ -252,26 +300,112 @@ impl Iterator for LogicalBytes<'_> {
                         // character either way, and both spellings have to
                         // compare equal.
                         Some(cp) => self.hold(cp),
-                        None => {
-                            // Not four hex digits: it was never an escape, so
-                            // both bytes are the value.
-                            self.pending = [b'u', 0, 0, 0];
-                            self.pending_len = 1;
-                            self.pending_at = 0;
-                            b'\\'
-                        }
+                        // Not four hex digits: it was never an escape, so
+                        // both bytes are the value.
+                        None => self.give(b"\\u"),
                     },
                     // Not an escape this dialect defines: both bytes are content.
-                    other => {
-                        self.pending = [other, 0, 0, 0];
-                        self.pending_len = 1;
-                        self.pending_at = 0;
-                        b'\\'
-                    }
+                    other => self.give(&[b'\\', other]),
                 })
             }
         }
     }
+}
+
+impl LogicalBytes<'_> {
+    /// One byte of a nested JSON value's text, `b` being the next as written.
+    ///
+    /// Two writers of the same records space them differently -- `jq .`
+    /// indents, `jq -c` and most NDJSON writers leave no space at all -- and
+    /// spell a string's characters differently: `é` or `é`, `\/` or `/`.
+    /// RFC 8259 makes the space between tokens insignificant, and a character
+    /// is the same character however it is escaped, so neither is a change.
+    /// Read as written, the same records pretty and compact differed in every
+    /// nested cell. What is left is the order of an object's keys, a repeated
+    /// key and the spelling of a number, which stay as written: compara reads
+    /// a top-level number as its text too, and a value read in key order has
+    /// one hash that does not need the members sorted.
+    ///
+    /// Outside a string, space is dropped, except one where it parts two runs
+    /// of number or literal bytes: `[1 2]` is not JSON, and it is not `[12]`.
+    /// Inside one, an escape is undone and the character given in one
+    /// spelling: UTF-8, or for the quote, the backslash and the control
+    /// characters (which a string cannot hold as they are) a short escape
+    /// where JSON has one and `\u00xx` where not. So a quote never stands in a
+    /// string as itself, and the text keeps its tokens.
+    fn next_nested(&mut self, mut b: u8) -> Option<u8> {
+        if self.closed {
+            match b {
+                b'"' => {
+                    self.closed = false;
+                    self.last = b;
+                }
+                b'\\' => return Some(self.nested_escape()),
+                _ => {}
+            }
+            return Some(b);
+        }
+        if is_space(b) {
+            while self.raw.get(self.at).is_some_and(|&c| is_space(c)) {
+                self.at += 1;
+            }
+            let next = *self.raw.get(self.at)?;
+            if in_scalar(self.last) && in_scalar(next) {
+                self.last = b' ';
+                return Some(b' ');
+            }
+            self.at += 1;
+            b = next;
+        }
+        self.closed = b == b'"';
+        self.last = b;
+        Some(b)
+    }
+
+    /// A nested string's escape, its backslash just read: the character it
+    /// stands for, in the one spelling [`Self::next_nested`] gives it.
+    fn nested_escape(&mut self) -> u8 {
+        let Some(&e) = self.raw.get(self.at) else {
+            return b'\\';
+        };
+        self.at += 1;
+        let cp = match e {
+            b'"' | b'\\' | b'b' | b'f' | b'n' | b'r' | b't' => return self.give(&[b'\\', e]),
+            b'/' => return b'/',
+            b'u' => match self.take_escape() {
+                Some(cp) => cp,
+                None => return self.give(b"\\u"),
+            },
+            other => return self.give(&[b'\\', other]),
+        };
+        let short = match cp {
+            0x22 => b'"',
+            0x5C => b'\\',
+            0x08 => b'b',
+            0x0C => b'f',
+            0x0A => b'n',
+            0x0D => b'r',
+            0x09 => b't',
+            0..=0x1F => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let (hi, lo) = (HEX[(cp >> 4) as usize], HEX[(cp & 0xF) as usize]);
+                return self.give(&[b'\\', b'u', b'0', b'0', hi, lo]);
+            }
+            _ => return self.hold(cp),
+        };
+        self.give(&[b'\\', short])
+    }
+}
+
+/// JSON's insignificant space.
+fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Whether `b` belongs to a number or a literal: not space, punctuation or a
+/// quote.
+fn in_scalar(b: u8) -> bool {
+    !is_space(b) && !matches!(b, b'{' | b'}' | b'[' | b']' | b',' | b':' | b'"')
 }
 
 impl LogicalBytes<'_> {
@@ -318,17 +452,25 @@ pub(super) fn same_bytes(a: &Slab, x: Field, b: &Slab, y: Field) -> bool {
     if !is_escaped(x) && !is_escaped(y) {
         return a.raw(x) == b.raw(y);
     }
+    // The same bytes read the same way are the same value, and two nested
+    // values a writer spelled alike, as one writer does, are equal without
+    // reading them a byte at a time.
+    if a.mode(x) == b.mode(y) && a.raw(x) == b.raw(y) {
+        return true;
+    }
     a.logical(x).eq(b.logical(y))
 }
 
 /// The field decoded. Only the report sections and the normalising paths call
 /// this; the fast path never builds a string for a cell at all.
 pub(super) fn text_of(slab: &Slab, f: Field) -> String {
-    let logical = slab.logical(f);
-    if logical.is_plain() {
+    // Asked of the field word, not of a `LogicalBytes` built to answer it: a
+    // plain field, every column name the key walk reads among them, is the
+    // common case.
+    if slab.mode(f) == Mode::Raw {
         return String::from_utf8_lossy(slab.raw(f)).into_owned();
     }
-    let bytes: Vec<u8> = logical.collect();
+    let bytes: Vec<u8> = slab.logical(f).collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -340,8 +482,7 @@ pub(super) fn text_of(slab: &Slab, f: Field) -> String {
 /// would be paid ten million times to report a failure that cannot happen,
 /// because nothing of that size is being held.
 pub(super) fn text_of_checked(slab: &Slab, f: Field, what: &str) -> crate::Result<String> {
-    let logical = slab.logical(f);
-    if logical.is_plain() {
+    if slab.mode(f) == Mode::Raw {
         return match std::str::from_utf8(slab.raw(f)) {
             Ok(s) => crate::alloc::string(s, what),
             // Lossy replacement allocates its own string; it is reached only by
@@ -351,7 +492,7 @@ pub(super) fn text_of_checked(slab: &Slab, f: Field, what: &str) -> crate::Resul
         };
     }
     let mut bytes: Vec<u8> = crate::alloc::sized(f_len_hint(f), what)?;
-    bytes.extend(logical);
+    bytes.extend(slab.logical(f));
     match String::from_utf8(bytes) {
         Ok(s) => Ok(s),
         Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
@@ -401,5 +542,76 @@ mod tests {
         // do; substituting a replacement character here would make the same
         // file hash differently in two ports.
         assert_eq!(bytes(br"\ud83dx", Dialect::Json), b"\xed\xa0\xbdx");
+    }
+
+    /// A JSON slab holding `{"v":<value>}`, and the field the reader makes of
+    /// the value: a nested one flagged as escaped, as `text::parse_json` does.
+    fn member(value: &str) -> (Slab, Field) {
+        let text = format!("{{\"v\":{value}}}");
+        let slab = Slab::owned(text.into_bytes(), Dialect::Json);
+        (slab, pack(5, value.len() as u64, true))
+    }
+
+    fn nested(value: &str) -> String {
+        let (slab, f) = member(value);
+        String::from_utf8(slab.logical(f).collect()).expect("valid utf-8")
+    }
+
+    #[test]
+    fn a_nested_value_is_its_text_without_the_space_between_tokens() {
+        assert_eq!(
+            nested("{\n  \"a\" : [ 1 ,\t2 ],\r\n  \"b\": {}\n}"),
+            r#"{"a":[1,2],"b":{}}"#
+        );
+        // Space inside a string is the string's.
+        assert_eq!(nested(r#"[ "a b" , " " ]"#), r#"["a b"," "]"#);
+        // A bracket or an escaped quote inside a string is text.
+        assert_eq!(nested(r#"[ "a\"] , [b" ]"#), r#"["a\"] , [b"]"#);
+        // Two runs of number or literal bytes keep one space between them:
+        // `[1 2]` is not JSON, and it is not `[12]` either.
+        assert_eq!(nested("[1  2, true\n false]"), "[1 2,true false]");
+        assert_eq!(nested("[1, 2]"), "[1,2]");
+    }
+
+    #[test]
+    fn a_nested_string_is_spelled_one_way() {
+        // UTF-8 for a character escaped, `/` as itself, and the one escape
+        // JSON has for a quote, a backslash or a control character, whatever
+        // the writer used.
+        assert_eq!(
+            nested(r#"["caf\u00e9", "caf\u00E9", "a\/b", "\u0041", "\ud83d\ude00"]"#),
+            "[\"caf\u{e9}\",\"caf\u{e9}\",\"a/b\",\"A\",\"\u{1f600}\"]"
+        );
+        assert_eq!(
+            nested(r#"["\u0022", "\"", "\u005C", "\\", "\u000a", "\n", "\u0009"]"#),
+            r#"["\"","\"","\\","\\","\n","\n","\t"]"#
+        );
+        assert_eq!(
+            nested(r#"["\u001F", "\u0001", "\u007f"]"#),
+            "[\"\\u001f\",\"\\u0001\",\"\u{7f}\"]"
+        );
+        // Not an escape JSON defines, or not four hex digits: as written.
+        assert_eq!(nested(r#"["\x", "\uZZ"]"#), r#"["\x","\uZZ"]"#);
+    }
+
+    #[test]
+    fn a_nested_value_and_its_compact_spelling_are_the_same_bytes() {
+        let (a, x) = member("{\n  \"k\": [1, \"caf\\u00e9\"]\n}");
+        let (b, y) = member("{\"k\":[1,\"caf\u{e9}\"]}");
+        assert!(same_bytes(&a, x, &b, y));
+        assert_eq!(text_of(&a, x), text_of(&b, y));
+        // Key order and a number's spelling are as written.
+        let (c, z) = member("{\"k\":[1.0,\"caf\u{e9}\"]}");
+        assert!(!same_bytes(&b, y, &c, z));
+    }
+
+    #[test]
+    fn a_string_that_holds_json_is_a_string() {
+        // `{"s":"{\"a\": 1}"}`: the string's field starts past its quote, so it
+        // is decoded as a string, its space kept.
+        let text = br#"{"s":"{\"a\": 1}"}"#;
+        let slab = Slab::owned(text.to_vec(), Dialect::Json);
+        let f = pack(6, (text.len() - 8) as u64, true);
+        assert_eq!(text_of(&slab, f), r#"{"a": 1}"#);
     }
 }

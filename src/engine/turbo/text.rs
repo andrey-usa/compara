@@ -2101,13 +2101,16 @@ impl RowParser {
                 pos = close;
                 Some(pack(from as u64, (to - from) as u64, escaped))
             } else if data[pos] == b'{' || data[pos] == b'[' {
-                // An object or array is a cell of its JSON text, as written:
-                // two that differ anywhere differ. Left absent, as it once
-                // was, two different objects read as the same missing value
-                // and the change went unreported.
+                // An object or array is a cell of its JSON text. Left absent,
+                // as it once was, two different objects read as the same
+                // missing value and the change went unreported. Flagged as
+                // escaped, so that equality, the hash and the report read it
+                // past its spacing and its strings' escapes: the bytes
+                // compared as they stand are only the fast answer (see
+                // `slab::Slab::mode`).
                 let from = pos;
                 pos = skip_json_nested(scan, data, pos, end);
-                Some(pack(from as u64, (pos - from) as u64, false))
+                Some(pack(from as u64, (pos - from) as u64, true))
             } else {
                 // A number, true, false or null: it runs to the next comma,
                 // brace or space.
