@@ -1037,14 +1037,23 @@ struct Job<'a> {
 }
 
 /// Bytes per ranged request: [`PART`], or `COMPARA_FETCH_PART`, so that a
-/// small file can be read in many parts in a test.
+/// small file can be read in many parts in a test; never under
+/// [`MIN_PART`], for each part is a request and an entry held until the
+/// transfer ends.
 fn part_size() -> u64 {
-    std::env::var("COMPARA_FETCH_PART")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(PART)
+    part_from(std::env::var("COMPARA_FETCH_PART").ok().as_deref())
 }
+
+/// [`part_size`] from the variable's value, if it has one.
+fn part_from(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(PART, |n| n.max(MIN_PART))
+}
+
+/// The smallest part [`part_size`] takes: a 1 GiB file is then at most
+/// 16,384 requests, where `COMPARA_FETCH_PART=1` would have been a billion.
+const MIN_PART: u64 = 64 << 10;
 
 fn concurrency() -> usize {
     std::env::var("COMPARA_FETCH_CONCURRENCY")
@@ -2136,6 +2145,15 @@ fn ini_section(text: &str, name: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_part_is_never_under_64_kb() {
+        assert_eq!(part_from(None), PART);
+        assert_eq!(part_from(Some("not a size")), PART);
+        assert_eq!(part_from(Some(" 262144 ")), 262_144);
+        assert_eq!(part_from(Some("1")), MIN_PART);
+        assert_eq!(part_from(Some("0")), MIN_PART);
+    }
 
     #[test]
     fn a_shuffle_keeps_every_address_and_moves_them() {
