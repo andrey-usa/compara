@@ -331,7 +331,7 @@ impl LogicalBytes<'_> {
     ///
     /// Two writers of the same records space them differently -- `jq .`
     /// indents, `jq -c` and most NDJSON writers leave no space at all -- and
-    /// spell a string's characters differently: `é` or `é`, `\/` or `/`.
+    /// spell a string's characters differently: `\u00e9` or `é`, `\/` or `/`.
     /// RFC 8259 makes the space between tokens insignificant, and a character
     /// is the same character however it is escaped, so neither is a change.
     /// Read as written, the same records pretty and compact differed in every
