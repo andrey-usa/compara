@@ -83,18 +83,18 @@ changed and `--export-dir` for the rows.
 
 ## Benchmarks
 
-Two tables of 20 columns compared on a composite key (`-k account_id,txn_id -i updated_at`), every tool's unchanged, changed, added and removed counts checked identical, on GitHub's `ubuntu-24.04, image 20261111.370.1` (AMD EPYC 9V45 96-Core Processor, 4 cores, 15 GB), [bench-contenders run 44629611468](https://github.com/andrey-usa/compara/actions/runs/44629611468), 2026-11-19:
+Two tables of 20 columns compared on a composite key (`-k account_id,txn_id -i updated_at`), every tool's unchanged, changed, added and removed counts checked identical, on GitHub's `ubuntu-24.04, image 20261116.376.1` (AMD EPYC 7763 64-Core Processor, 4 cores, 15 GB), [bench-contenders run 44635612282](https://github.com/andrey-usa/compara/actions/runs/44635612282), 2026-11-19:
 
 | input, both files | compara 0.7.0 | DuckDB 2.0.0 | Polars 2.1.0 | qsv 29.0.0 |
 |---|---|---|---|---|
-| 1M rows, CSV, 368 MB | **0.09 s** · 0.2 s · 411 MB (56 private) | 2.10 s · 5.7 s · 1,167 MB (1,107 private) | 2.31 s · 8.9 s · 2,294 MB (2,232 private) | 0.60 s · 1.5 s · 173 MB (143 private) |
-| 1M rows, Parquet, 161 MB | **0.12 s** · 0.3 s · 319 MB (181 private) | 1.19 s · 2.1 s · 1,198 MB (1,139 private) | 2.34 s · 8.2 s · 2,457 MB (2,393 private) | not run |
-| 10M rows, CSV, 3,679 MB | **0.70 s** · 2.2 s · 4,031 MB (511 private) | 16.46 s · 59.2 s · 8,832 MB (8,771 private) | out of memory after 13 s, at 13,343 MB | 8.68 s · 19.9 s · 1,430 MB (1,401 private) |
-| 10M rows, Parquet, 1,609 MB | **0.87 s** · 2.7 s · 2,731 MB (1,337 private) | 7.27 s · 25.8 s · 6,950 MB (6,891 private) | out of memory after 11 s, at 13,345 MB | not run |
+| 1M rows, CSV, 368 MB | **0.13 s (0.12-0.13)** · cold 0.69 s (0.69-0.72) · 0.3 s · 411 MB (56 private) | 3.32 s (3.25-3.37) · cold 3.39 s (3.30-4.13) · 9.2 s · 1,185 MB (1,124 private) | 3.45 s (3.26-3.56) · cold 3.63 s (3.50-3.69) · 12.3 s · 2,154 MB (2,094 private) | 1.05 s (0.95-1.12) · cold 1.04 s (0.97-1.15) · 2.6 s · 299 MB (269 private) |
+| 1M rows, Parquet, 161 MB | **0.17 s (0.17-0.17)** · cold 0.26 s (0.25-0.27) · 0.5 s · 339 MB (181 private) | 1.95 s (1.88-2.00) · cold 2.00 s (1.93-2.08) · 3.3 s · 1,161 MB (1,101 private) | 3.54 s (3.47-3.65) · cold 3.63 s (3.48-3.67) · 11.5 s · 2,207 MB (2,143 private) | not run |
+| 10M rows, CSV, 3,679 MB | **0.99 s (0.98-1.03)** · cold 9.37 s (9.36-9.38) · 3.2 s · 4,031 MB (512 private) | 26.14 s (25.69-26.43) · cold 26.20 s (26.01-26.30) · 92.3 s · 8,813 MB (8,744 private) | out of memory after 17 s, at 13,344 MB | 12.13 s (9.98-12.72) · cold 12.24 s (10.68-12.33) · 28.4 s · 2,302 MB (2,273 private) |
+| 10M rows, Parquet, 1,609 MB | **1.22 s (1.22-1.30)** · cold 4.08 s (4.06-4.11) · 4.0 s · 2,853 MB (1,338 private) | 10.98 s (10.74-11.45) · cold 12.67 s (12.28-13.04) · 37.9 s · 6,742 MB (6,675 private) | out of memory after 15 s, at 13,345 MB | not run |
 
-Each cell: wall time, best of 3 · CPU time (user and system) · peak memory (RSS, and in brackets the private part of it), of the best run; fastest in bold. DuckDB and Polars run from Python, and their time starts at their first read, after the interpreter's start and the import; qsv is a binary and is timed as a whole process, like compara, runs on CSV only, and is given the files with the ignored column and the repeated keys already taken out (the page says how). A tool the runner's kernel stopped for lack of memory says so.
+Each cell: wall time from a warm page cache, median of 5 runs (fastest-slowest in brackets) · CPU time (user and system) · peak memory (RSS, and in brackets the private part of it), of the median run; fastest median in bold. Every run starts from a stated page cache: warm (its inputs read to the end just before) is the first figure, cold (its inputs dropped from the page cache, so read from the disk) the second. DuckDB and Polars run from Python, and their time starts at their first read, after the interpreter's start and the import; qsv is a binary and is timed as a whole process, like compara, runs on CSV only, and is given the files with the ignored column and the repeated keys already taken out (the page says how). A tool the runner's kernel stopped for lack of memory says so. Reading both inputs from a cold cache alone took (median): 1M rows, CSV, 368 MB 0.60 s; 1M rows, Parquet, 161 MB 0.09 s; 10M rows, CSV, 3,679 MB 8.62 s; 10M rows, Parquet, 1,609 MB 3.61 s.
 
-Where another tool did better in this run (by more than 2%): peak memory on 1M rows, CSV, 368 MB: qsv 173 MB, compara 411 MB; peak memory on 10M rows, CSV, 3,679 MB: qsv 1,430 MB, compara 4,031 MB.
+Where another tool did better in this run (by more than 2%): peak memory on 1M rows, CSV, 368 MB: qsv 299 MB, compara 411 MB; peak memory on 10M rows, CSV, 3,679 MB: qsv 2,302 MB, compara 4,031 MB.
 
 The method, every run and object storage: [Benchmarks](https://andrey-usa.github.io/compara/benchmarks/results.html).
 
