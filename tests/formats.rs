@@ -922,6 +922,122 @@ fn a_json_name_written_with_escapes_is_the_name_it_spells() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// A name repeated in one JSON object takes its last value, as json.loads,
+/// JavaScript and jq read it: a key column took its first, and a later `null`
+/// left an earlier value standing. In A every 7th row names its key twice,
+/// first wrongly, and every 5th row gives `v` a value and then `null`; B does
+/// the same with `v` and another value, and every 13th row of B spells its
+/// first `id` with an escape. Every 11th row of B repeats `w` with a new
+/// value. So the rows all match, and only `w` changes. The files are past the
+/// size a file is split at, and the run is held to it on every route that
+/// reads JSON.
+#[test]
+fn a_json_name_repeated_in_an_object_takes_its_last_value() {
+    let dir = std::env::temp_dir().join(format!("compara-repeated-names-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("a temp dir");
+    let rows = 80_000usize;
+    let mut a = String::with_capacity(rows * 100);
+    let mut b = String::with_capacity(rows * 100);
+    for i in 0..rows {
+        let id = if i % 7 == 0 {
+            format!("\"id\":\"t{i}\",")
+        } else {
+            String::new()
+        };
+        let v = if i % 5 == 0 {
+            format!("\"v\":\"a{i}\",\"note\":\"a row of some length\",\"v\":null")
+        } else {
+            format!("\"v\":\"c{i}\",\"note\":\"a row of some length\"")
+        };
+        a.push_str(&format!("{{{id}{v},\"w\":\"x\",\"id\":{i}}}\n"));
+        let id = if i % 13 == 0 {
+            format!("\"\\u0069d\":\"u{i}\",")
+        } else {
+            String::new()
+        };
+        let v = if i % 5 == 0 {
+            format!("\"v\":\"b{i}\",\"note\":\"a row of some length\",\"v\":null")
+        } else {
+            format!("\"v\":\"c{i}\",\"note\":\"a row of some length\"")
+        };
+        let w = if i % 11 == 0 {
+            "\"w\":\"x\",\"w\":\"y\""
+        } else {
+            "\"w\":\"x\""
+        };
+        b.push_str(&format!("{{{id}{v},{w},\"id\":{i}}}\n"));
+    }
+    let (pa, pb) = (dir.join("a.ndjson"), dir.join("b.ndjson"));
+    fs::write(&pa, a).unwrap();
+    fs::write(&pb, b).unwrap();
+    assert!(fs::metadata(&pa).unwrap().len() > 4 << 20);
+    let n = rows as i64;
+    let w = (n - 1) / 11 + 1;
+    for threads in [1usize, 2, 4] {
+        for engine in ["auto", "turbo"] {
+            for memory in [None, Some(64u64 << 20)] {
+                let mut opt = options(&["id"]);
+                opt.engine = engine.to_string();
+                opt.threads = Some(threads);
+                opt.memory = memory;
+                let result = run(&pa, &pb, &mut opt);
+                let said = format!("{engine} threads {threads} memory {memory:?}");
+                assert_eq!(result.counts.matched, n, "{said}: {}", answer(&result));
+                assert_eq!(result.counts.added, 0, "{said}: {}", answer(&result));
+                assert_eq!(result.counts.changed, w, "{said}: {}", answer(&result));
+                let per: Vec<(&str, i64)> = result
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.changed))
+                    .collect();
+                assert_eq!(per, [("v", 0), ("note", 0), ("w", w)], "{said}");
+            }
+        }
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A member name that is not UTF-8 is refused, on any thread count: the
+/// header named it with a replacement character and the parser looked it up
+/// as written, so the column had no value on either side and a change there
+/// went unreported.
+#[test]
+fn a_json_name_that_is_not_utf8_is_refused() {
+    let dir = std::env::temp_dir().join(format!("compara-latin1-names-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("a temp dir");
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for i in 0..60_000 {
+        let name: &[u8] = if i == 41_000 { b"caf\xe9" } else { b"cafe" };
+        for (out, v) in [(&mut a, "a"), (&mut b, "b")] {
+            out.extend_from_slice(format!("{{\"id\":{i},\"").as_bytes());
+            out.extend_from_slice(name);
+            out.extend_from_slice(
+                format!("\":\"{v}\",\"note\":\"a row of some length\"}}\n").as_bytes(),
+            );
+        }
+    }
+    let (pa, pb) = (dir.join("a.ndjson"), dir.join("b.ndjson"));
+    fs::write(&pa, a).unwrap();
+    fs::write(&pb, b).unwrap();
+    for threads in [1usize, 2, 4] {
+        let mut opt = options(&["id"]);
+        opt.engine = "auto".to_string();
+        opt.threads = Some(threads);
+        let Err(err) = compare(&pa, &pb, &mut opt) else {
+            panic!("a name that is not UTF-8 was read on {threads} threads");
+        };
+        let said = err.to_string();
+        assert!(err.is_input(), "{said}");
+        assert!(
+            said.contains("line 41001: the member name \"caf\\xE9\" is not UTF-8"),
+            "{said}"
+        );
+        assert!(said.contains("iconv"), "{said}");
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
 /// A JSON table's columns are the keys of all its objects, not of the first.
 ///
 /// A writer that leaves a null field out of its object (Spark's does, and

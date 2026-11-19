@@ -18,7 +18,7 @@ use super::field::{
 };
 use super::slab::{Dialect, Slab, json_string, text_of};
 use crate::error::{Error, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -428,7 +428,15 @@ fn starts_with_short(data: &[u8], text: &[u8]) -> bool {
 /// where a file is not the JSON it is read as: a row that is not an object,
 /// and, read a line at a time, an object that runs onto the next line or has
 /// more after it on its own. The row parser reads each of those as some other
-/// number of rows than the file holds.
+/// number of rows than the file holds. A member name that is not UTF-8 is
+/// refused too: the header names it with a replacement character, the parser
+/// would look it up as written, and the column was read on neither side.
+///
+/// And it says whether any object names a member twice (`LaterKeys::repeats`):
+/// where none does, the row parser may stop at the keys (see
+/// [`RowParser::names_unique`]). A name written where the first object has
+/// it, as it has it, is told by its bytes alone and costs nothing more; any
+/// other is told by what it spells, as the walk tells it anyway.
 pub(super) fn json_later_keys(
     slab: &Slab,
     lo: usize,
@@ -437,7 +445,7 @@ pub(super) fn json_later_keys(
     known: &[String],
     max_rows: usize,
     budget: &KeyBudget,
-) -> Result<(Vec<String>, usize)> {
+) -> Result<LaterKeys> {
     let data = slab.data();
     let scan = Swar;
     let end = hi.min(data.len());
@@ -458,12 +466,25 @@ pub(super) fn json_later_keys(
         })
         .collect();
     // Names are looked up, not searched for: a file built to carry a new key
-    // in every row would otherwise cost the square of its rows.
-    let seen: HashSet<&str> = known.iter().map(String::as_str).collect();
+    // in every row would otherwise cost the square of its rows. Each to its
+    // place in the first object.
+    let seen: HashMap<&str, usize> = known
+        .iter()
+        .enumerate()
+        .map(|(at, n)| (n.as_str(), at))
+        .collect();
     // Each new name once, with the place it was first met: a list beside a
     // set held every name twice.
     let mut later: HashMap<String, usize> = HashMap::new();
     let mut rows = 0usize;
+    let mut repeats = false;
+    // For the names a row's bytes alone do not tell (see the walk below):
+    // the row each name (`known` then `later`, by place) was last met in,
+    // the row each place of the first object was last passed by such a
+    // name in, and this row's such names.
+    let mut met_in: Vec<usize> = vec![0; known.len()];
+    let mut told_at: Vec<usize> = vec![0; spelled.len()];
+    let mut told: Vec<usize> = Vec::new();
     let mut pos = lo;
     'rows: while pos < end && rows < max_rows {
         while pos < end && json_space(data[pos]) {
@@ -560,32 +581,72 @@ pub(super) fn json_later_keys(
             // with no colon after it ends the object there, and one with no
             // value (a comma or the closing brace next), which the parser
             // reads as empty, is passed over. Neither names a column.
-            if !matches!(data[pos], b',' | b'}')
-                && known.get(member).map(String::as_bytes) != Some(key)
-            {
-                let name = text_of(
-                    slab,
-                    pack(key_from as u64, (key_end - 1 - key_from) as u64, escaped),
-                );
-                if !seen.contains(name.as_str()) && !later.contains_key(&name) {
-                    // The names are the one thing here that grows with a
-                    // hostile file, so they have a ceiling of their own.
-                    let room = budget.take(name.len());
-                    if !room && !budget.pieces {
-                        return Err(budget.refusal());
+            let valued = !matches!(data[pos], b',' | b'}');
+            // A name of no value may still be one the parser stores (as
+            // empty) and a later one replaces; not worth telling apart in a
+            // file json.loads refuses, so the parser walks every object.
+            repeats |= !valued;
+            // The place of this name among the file's names, once known.
+            let mut place = None;
+            if !escaped && known.get(member).map(String::as_bytes) == Some(key) {
+                place = Some(member);
+            } else {
+                if !key.is_ascii() && std::str::from_utf8(key).is_err() {
+                    return Err(name_not_utf8(data, key_from));
+                }
+                if valued {
+                    let name = text_of(
+                        slab,
+                        pack(key_from as u64, (key_end - 1 - key_from) as u64, escaped),
+                    );
+                    if let Some(&at) = seen.get(name.as_str()) {
+                        place = Some(at);
+                    } else if let Some(&at) = later.get(&name) {
+                        place = Some(known.len() + at);
+                    } else {
+                        // The names are the one thing here that grows with a
+                        // hostile file, so they have a ceiling of their own.
+                        let room = budget.take(name.len());
+                        if !room && !budget.pieces {
+                            return Err(budget.refusal());
+                        }
+                        let at = later.len();
+                        later.insert(name, at);
+                        place = Some(known.len() + at);
+                        // A piece keeps the name that did not fit, so the
+                        // names the pieces hand back, counted once each, pass
+                        // the ceiling where the file's own do.
+                        if !room {
+                            break 'rows;
+                        }
                     }
-                    let at = later.len();
-                    later.insert(name, at);
-                    // A piece keeps the name that did not fit, so the names
-                    // the pieces hand back, counted once each, pass the
-                    // ceiling where the file's own do.
-                    if !room {
-                        break 'rows;
+                }
+            }
+            if !repeats {
+                if let Some(t) = told_at.get_mut(member) {
+                    *t = rows;
+                }
+                if let Some(at) = place {
+                    if at >= met_in.len() {
+                        met_in.resize(at + 1, 0);
                     }
+                    repeats = met_in[at] == rows;
+                    met_in[at] = rows;
+                    told.push(at);
                 }
             }
             member += 1;
             pos = json_value_end_lines(scan, data, pos, end, &mut lines);
+        }
+        // A name told by its bytes sits at its own place in the first
+        // object, so those are distinct; a name told by what it spells
+        // repeats one of them if its place is one this row passed by its
+        // bytes. Rows wholly told by their bytes skip this.
+        if !told.is_empty() {
+            repeats |= told
+                .iter()
+                .any(|&at| at < member && told_at.get(at).is_some_and(|&t| t != rows));
+            told.clear();
         }
         if !array && closed {
             // A line is a row: the object closes on the line it opens, with
@@ -612,7 +673,49 @@ pub(super) fn json_later_keys(
             pos + 1
         };
     }
-    Ok((in_order(later), rows))
+    Ok(LaterKeys {
+        names: in_order(later),
+        rows,
+        repeats,
+    })
+}
+
+/// What [`json_later_keys`] found in its rows.
+pub(super) struct LaterKeys {
+    /// The names the first object did not have, in the order they were met.
+    pub(super) names: Vec<String>,
+    /// The objects walked.
+    pub(super) rows: usize,
+    /// Some object names a member twice, as written or as spelled.
+    pub(super) repeats: bool,
+}
+
+/// A member name whose bytes are not UTF-8, said with its line and what to
+/// do. JSON text is UTF-8 (RFC 8259 8.1) and json.loads refuses it; read
+/// lossily for the header and as written by the parser, the column had no
+/// value on either side and its changes went unreported.
+#[cold]
+#[inline(never)]
+fn name_not_utf8(data: &[u8], at: usize) -> Error {
+    let line = 1 + data[..at].iter().filter(|&&b| b == b'\n').count();
+    let close = data[at..]
+        .iter()
+        .position(|&b| b == b'"')
+        .map_or(data.len(), |n| at + n);
+    // The bytes that are not UTF-8 shown as `\xE9`, so the reader sees
+    // which and can tell the encoding.
+    let mut shown = String::new();
+    for chunk in data[at..close.min(at + 64)].utf8_chunks() {
+        shown.push_str(chunk.valid());
+        for b in chunk.invalid() {
+            shown.push_str(&format!("\\x{b:02X}"));
+        }
+    }
+    Error::input(format!(
+        "line {line}: the member name \"{shown}\" is not UTF-8, and JSON text is UTF-8 \
+         (RFC 8259): convert the file, for example iconv -f latin1 -t utf-8 FILE > FILE.utf8 \
+         if it was written as Latin-1"
+    ))
 }
 
 /// [`json_value_end`], noting in `lines` a line feed inside a nested value.
@@ -1231,9 +1334,20 @@ pub(super) enum RowParser {
         /// Open-addressed name to slot, so a key costs one hash.
         slots: Vec<i32>,
         slot_mask: usize,
-        /// Slots below this are key columns: the first value wins, and once
-        /// every slot is a filled key column the rest of the object is skipped.
+        /// Slots below this are key columns. Once every slot is a filled key
+        /// column the rest of the object is skipped, where that cannot change
+        /// a value: see `early`.
         key_size: usize,
+        /// The key slots filled at which the rest of an object is skipped:
+        /// `wanted.len()`, or `usize::MAX` where a name may repeat in an
+        /// object. A repeated name takes its last value, as json.loads,
+        /// JavaScript and jq read it, so stopping at the first one read a key
+        /// the rest of the object replaces.
+        early: usize,
+        /// A name may repeat in an object of this file, so a later `null`
+        /// must clear what an earlier value stored. Set unless the key walk
+        /// ([`json_later_keys`]) found every object's names distinct.
+        names_repeat: bool,
         /// What the table answers for `wanted[i]`: `i` itself unless the same
         /// name also fills an earlier slot, and -1 for a missing column or a
         /// name holding a backslash, which is never guessed. Names
@@ -1794,6 +1908,8 @@ impl RowParser {
         }
         let mut parser = RowParser::Json {
             key_size: key_size.min(wanted.len()),
+            early: usize::MAX,
+            names_repeat: true,
             wanted,
             slots,
             slot_mask,
@@ -1815,6 +1931,37 @@ impl RowParser {
             *c = canon;
         }
         parser
+    }
+
+    /// The parser for a file whose objects the key walk found to name each
+    /// member once ([`json_later_keys`]): the first value of a name is its
+    /// last, so the key-only parse may stop as soon as it has the keys, and a
+    /// `null` has nothing to clear. Without this, every object is walked to
+    /// its end. No-op on a CSV parser.
+    pub(super) fn names_unique(mut self, unique: bool) -> Self {
+        if let RowParser::Json {
+            wanted,
+            early,
+            names_repeat,
+            ..
+        } = &mut self
+        {
+            *names_repeat = !unique;
+            *early = if unique { wanted.len() } else { usize::MAX };
+        }
+        self
+    }
+
+    /// Whether a name may repeat in one of this file's objects: see
+    /// [`Self::names_unique`]. Always false for CSV.
+    pub(super) fn names_repeat(&self) -> bool {
+        matches!(
+            self,
+            RowParser::Json {
+                names_repeat: true,
+                ..
+            }
+        )
     }
 
     /// Parses one row into `out`, returning the offset of the next row.
@@ -2012,6 +2159,8 @@ impl RowParser {
         let RowParser::Json {
             wanted,
             key_size,
+            early,
+            names_repeat,
             canon,
             array,
             ..
@@ -2122,6 +2271,21 @@ impl RowParser {
                     pos += 1;
                 }
                 if &data[from..pos] == b"null" {
+                    // A null is no value. Where a name may repeat it is the
+                    // name's last value all the same, and clears an earlier
+                    // one; where none does, there is nothing to clear and it
+                    // costs no lookup.
+                    if *names_repeat {
+                        let slot = if key_escaped {
+                            self.slot_for_escaped(key)
+                        } else {
+                            self.slot_for(key)
+                        };
+                        if let Some(slot) = slot {
+                            out[slot] = ABSENT;
+                            guess = slot + 1;
+                        }
+                    }
                     None
                 } else {
                     Some(pack(from as u64, (pos - from) as u64, false))
@@ -2140,26 +2304,20 @@ impl RowParser {
                 }
             {
                 guess = slot + 1;
-                // First occurrence wins for a key column, and only for a key
-                // column -- the rule the C port states. A JSON object is not
-                // supposed to repeat a name, but the key-only parse stops as
-                // soon as it has the keys, and it has to agree with the full
-                // parse on what a row's key is: last-wins would let it stop on a
-                // different value than the full parse ends with, a lookup that
-                // misses its own row. Compared columns keep last-wins.
-                if slot < *key_size {
-                    if out[slot] == ABSENT {
-                        out[slot] = field;
-                        found += 1;
-                        // Every key found and nothing else wanted: the rest of
-                        // the object is bytes to skip, not fields to parse.
-                        if found == wanted.len() {
-                            open = true;
-                            break;
-                        }
+                // The last value of a repeated name wins, key column or not.
+                // The key-only parse stops as soon as it has the keys only
+                // where no name repeats (`early`), so it ends on the key the
+                // full parse ends with.
+                let first = out[slot] == ABSENT;
+                out[slot] = field;
+                if slot < *key_size && first {
+                    found += 1;
+                    // Every key found and nothing else wanted: the rest of
+                    // the object is bytes to skip, not fields to parse.
+                    if found == *early {
+                        open = true;
+                        break;
                     }
-                } else {
-                    out[slot] = field;
                 }
             }
         }
@@ -3378,8 +3536,10 @@ mod tests {
         // find the same rows and the same keys.
         let array = "[\n  {\n    \"k\": \"a\",\n    \"v\": \"w x\",\n    \"n\": {\"deep\": [1, 2]}\n  },\n  {\n    \"k\": \"b\"\n  }\n]\n";
         let slab = json_slab(array);
-        let full = RowParser::json(vec![Some("k".into()), Some("v".into())], 1, true);
-        let keys = RowParser::json(vec![Some("k".into())], 1, true);
+        assert!(!walk(array).repeats);
+        let full =
+            RowParser::json(vec![Some("k".into()), Some("v".into())], 1, true).names_unique(true);
+        let keys = RowParser::json(vec![Some("k".into())], 1, true).names_unique(true);
         let mut out = vec![ABSENT; 2];
         let next = full.parse(slab.data(), 0, array.len(), &mut out);
         assert_eq!(slab.raw(out[0]), b"a");
@@ -3453,15 +3613,12 @@ mod tests {
             let got: Vec<&[u8]> = out.iter().map(|&f| slab.raw(f)).collect();
             assert_eq!(got, [b"1", b"2", b"3", b"4", b"5", b"6", b"7", b"8"]);
             // The same name raw and then escaped: the escaped one is the
-            // last value, and the literal `\u00e9` column has none.
+            // last value, key column or not, and the literal `\u00e9` column
+            // has none.
             parser.parse(slab.data(), next, text.len(), &mut out);
             let got: Vec<&[u8]> = out.iter().map(|&f| slab.raw(f)).collect();
             let none: &[u8] = b"";
-            let want: [&[u8]; 8] = if key_size == 1 {
-                [b"9", none, none, none, none, none, none, b"11"]
-            } else {
-                [b"10", none, none, none, none, none, none, b"11"]
-            };
+            let want: [&[u8]; 8] = [b"10", none, none, none, none, none, none, b"11"];
             assert_eq!(got, want, "key size {key_size}");
         }
     }
@@ -3507,21 +3664,153 @@ mod tests {
 
     #[test]
     fn a_repeated_key_the_key_only_and_full_parses_agree() {
-        // The first `k` is the row's key in both parses -- the key-only one
-        // stops there -- while a repeated compared column keeps its last value.
+        // The last `k` is the row's key in both parses, as json.loads reads
+        // it, and a repeated compared column keeps its last value too. The
+        // key-only parse walks the whole object: the walk found a name that
+        // repeats.
         let text = "{\"k\":\"1\",\"v\":\"a\",\"k\":\"2\",\"v\":\"b\"}\n{\"k\":\"3\"}\n";
         let slab = json_slab(text);
-        let full = RowParser::json(vec![Some("k".into()), Some("v".into())], 1, false);
-        let keys = RowParser::json(vec![Some("k".into())], 1, false);
-        let mut out = vec![ABSENT; 2];
-        let next = full.parse(slab.data(), 0, text.len(), &mut out);
-        assert_eq!(slab.raw(out[0]), b"1");
-        assert_eq!(slab.raw(out[1]), b"b");
-        let mut key = vec![ABSENT; 1];
-        assert_eq!(keys.parse(slab.data(), 0, text.len(), &mut key), next);
-        assert_eq!(slab.raw(key[0]), b"1");
-        keys.parse(slab.data(), next, text.len(), &mut key);
-        assert_eq!(slab.raw(key[0]), b"3");
+        let walked = walk(text);
+        assert!(walked.repeats);
+        for array in [false, true] {
+            let unique = !walked.repeats;
+            let full = RowParser::json(vec![Some("k".into()), Some("v".into())], 1, array)
+                .names_unique(unique);
+            let keys = RowParser::json(vec![Some("k".into())], 1, array).names_unique(unique);
+            let mut out = vec![ABSENT; 2];
+            let next = full.parse(slab.data(), 0, text.len(), &mut out);
+            assert_eq!(slab.raw(out[0]), b"2");
+            assert_eq!(slab.raw(out[1]), b"b");
+            let mut key = vec![ABSENT; 1];
+            assert_eq!(keys.parse(slab.data(), 0, text.len(), &mut key), next);
+            assert_eq!(slab.raw(key[0]), b"2");
+            keys.parse(slab.data(), next, text.len(), &mut key);
+            assert_eq!(slab.raw(key[0]), b"3");
+        }
+    }
+
+    /// The key walk over a whole text, as one piece.
+    fn walk(text: &str) -> LaterKeys {
+        let slab = json_slab(text);
+        let first = json_header(&slab, Path::new("x")).expect("a header");
+        let array = json_framed(slab.data());
+        json_later_keys(
+            &slab,
+            0,
+            text.len(),
+            array,
+            &first,
+            usize::MAX,
+            &KeyBudget::new(None, None),
+        )
+        .expect("a walk")
+    }
+
+    #[test]
+    fn the_key_walk_says_whether_a_name_repeats_in_an_object() {
+        // No object names a member twice: rows in the first object's order,
+        // in another order, with names left out, added, or escaped.
+        for text in [
+            "{\"k\":1,\"v\":2}\n{\"k\":3,\"v\":4}\n",
+            "{\"k\":1,\"v\":2}\n{\"v\":4,\"k\":3}\n{\"v\":5}\n{\"w\":1,\"k\":2,\"v\":3}\n",
+            "{\"k\":1,\"v\":2}\n{\"k\":3,\"x\":0,\"v\":4,\"y\":1}\n{\"y\":1,\"x\":2}\n",
+            "{\"k\":1,\"caf\\u00e9\":2}\n{\"caf\u{e9}\":3,\"k\":4}\n",
+            "[{\"k\":1,\"v\":{\"k\":2,\"k\":3}},\n {\"v\":[{\"v\":1}],\"k\":2}]\n",
+        ] {
+            assert!(!walk(text).repeats, "{text}");
+        }
+        // A name twice in one object, whichever row and place, and whatever
+        // its spelling; and a member with no value away from the first
+        // object's places, which the parser reads as empty.
+        for text in [
+            "{\"k\":1,\"v\":2,\"k\":3}\n",
+            "{\"k\":1,\"v\":2}\n{\"k\":1,\"v\":2,\"k\":3}\n",
+            "{\"k\":1,\"v\":2}\n{\"k\":1,\"k\":3}\n",
+            "{\"k\":1,\"v\":2}\n{\"v\":1,\"v\":null,\"k\":3}\n",
+            "{\"k\":1,\"v\":2}\n{\"w\":1,\"k\":2,\"w\":3}\n",
+            "{\"k\":1,\"v\":2}\n{\"v\":2,\"\\u006b\":1,\"k\":3}\n",
+            "{\"caf\\u00e9\":1}\n{\"caf\u{e9}\":3,\"caf\\u00e9\":4}\n",
+            "{\"k\":1,\"v\":2}\n{\"v\":,\"k\":1}\n",
+            "[{\"k\":1,\"v\":2},\n {\"v\":1,\"k\":2,\"v\":3}]\n",
+        ] {
+            assert!(walk(text).repeats, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_later_null_clears_a_repeated_name_s_earlier_value() {
+        // json.loads keeps the last value of a repeated name, and a null is
+        // a value: none, here.
+        let text = "{\"k\":\"1\",\"v\":\"a\",\"v\":null}\n\
+                    {\"k\":\"2\",\"v\":null,\"v\":\"b\"}\n\
+                    {\"k\":\"3\",\"k\":null,\"v\":\"c\"}\n\
+                    {\"k\":\"4\",\"caf\\u00e9\":\"d\",\"caf\u{e9}\":null}\n";
+        assert!(walk(text).repeats);
+        let slab = json_slab(text);
+        let parser = RowParser::json(
+            vec![Some("k".into()), Some("v".into()), Some("caf\u{e9}".into())],
+            1,
+            false,
+        );
+        let mut out = vec![ABSENT; 3];
+        let mut at = 0;
+        let mut got = Vec::new();
+        while at < text.len() {
+            at = parser.parse(slab.data(), at, text.len(), &mut out);
+            got.push(
+                out.iter()
+                    .map(|&f| slab.raw(f).to_vec())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let none = Vec::new();
+        assert_eq!(
+            got,
+            [
+                [b"1".to_vec(), none.clone(), none.clone()],
+                [b"2".to_vec(), b"b".to_vec(), none.clone()],
+                [none.clone(), b"c".to_vec(), none.clone()],
+                [b"4".to_vec(), none.clone(), none.clone()],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_member_name_that_is_not_utf8_is_refused_with_its_line() {
+        // The header named it with a replacement character and the parser
+        // looked it up as written: no value on either side, exit 0.
+        for (text, line) in [
+            (&b"{\"id\":1,\"caf\xe9\":\"a\"}\n"[..], 1),
+            (&b"{\"id\":1}\n{\"id\":2,\"caf\xe9\":\"a\"}\n"[..], 2),
+            (&b"{\"id\":1}\n{\"caf\xe9\\u00e9\":\"a\",\"id\":2}\n"[..], 2),
+            (&b"[{\"id\":1},\n{\"id\":2,\n\"x\xff\":1}]\n"[..], 3),
+        ] {
+            let slab = Slab::owned(text.to_vec(), Dialect::Json);
+            let first = json_header(&slab, Path::new("x")).expect("a header");
+            let Err(err) = json_later_keys(
+                &slab,
+                0,
+                text.len(),
+                json_framed(text),
+                &first,
+                usize::MAX,
+                &KeyBudget::new(None, None),
+            ) else {
+                panic!("line {line} was read");
+            };
+            let said = err.to_string();
+            assert!(err.is_input(), "{said}");
+            assert!(
+                said.contains("is not UTF-8") && said.contains("iconv"),
+                "{said}"
+            );
+            assert!(said.starts_with(&format!("line {line}:")), "{said}");
+            assert!(said.contains("\\xE9") || said.contains("\\xFF"), "{said}");
+        }
+        // A replacement character written as UTF-8, or escaped, is a name.
+        let walked = walk("{\"id\":1}\n{\"id\":2,\"\u{fffd}\":1,\"\\ufffd\":2}\n");
+        assert!(walked.repeats);
+        assert_eq!(walked.names, ["\u{fffd}"]);
     }
 
     /// A row parses to the same fields at either scan width. Only runs where
@@ -3602,7 +3891,7 @@ mod tests {
         );
         let mut out = vec![ABSENT; 3];
         parser.parse(slab.data(), 0, text.len(), &mut out);
-        assert_eq!(slab.raw(out[0]), b"1");
+        assert_eq!(slab.raw(out[0]), b"2");
         assert_eq!(slab.raw(out[1]), b"a");
         assert_eq!(out[2], ABSENT);
     }

@@ -49,7 +49,7 @@ use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 pub(crate) use text::refuse_non_text;
 use text::{
-    KeyBudget, RowParser, Runs, csv_header, detect_delimiter, guard_span, in_order,
+    KeyBudget, LaterKeys, RowParser, Runs, csv_header, detect_delimiter, guard_span, in_order,
     json_array_row_starts, json_framed, json_header, json_later_keys, json_row_indent,
     json_rows_match, json_rows_match_at, shared_tail, sniff_dialect,
 };
@@ -2455,6 +2455,11 @@ struct JoinCtx<'a> {
     guard: Option<(u8, usize)>,
     runs: Option<Runs>,
     json_proof: bool,
+    /// The JSON proof offered after A's parse, through A's last value. Not
+    /// where a name may repeat in an object: a later `null` of a name read
+    /// before that value clears it in A, past the run. The proof over A's
+    /// whole row, before its parse, holds whatever repeats.
+    json_span_proof: bool,
     /// Per compared column, whether either file stores it typed: then two
     /// cells that differ as text but hold the same value are the same, because
     /// a typed value has no spelling of its own to compare (`31.40` in a CSV is
@@ -2738,7 +2743,7 @@ fn join_row(
     // names in the same order. `ctx.width` and not `ctx.nc`: the keys have to be
     // inside the run for it to stand in for the key comparison.
     let span = csv_span.or_else(|| {
-        if !ctx.json_proof {
+        if !ctx.json_span_proof {
             return None;
         }
         if scratch.refused >= PROOF_BACKOFF && k & (PROOF_BACKOFF - 1) != 0 {
@@ -2965,6 +2970,9 @@ fn join_setup<'a>(
     // See `json_values_agree`.
     let json_proof =
         nc > 0 && a.slab.dialect() == Dialect::Json && b.slab.dialect() == Dialect::Json;
+    let json_span_proof = json_proof
+        && !a.parser().is_some_and(RowParser::names_repeat)
+        && !b.parser().is_some_and(RowParser::names_repeat);
     let typed = (0..nc)
         .map(|i| Typed::of_pair(a.typed[key_size + i], b.typed[key_size + i]))
         .collect();
@@ -3000,6 +3008,7 @@ fn join_setup<'a>(
         guard,
         runs,
         json_proof,
+        json_span_proof,
         typed,
     };
     (ctx, seen)
@@ -3984,6 +3993,10 @@ enum Input {
         /// The objects of a JSON file, counted when its keys were read; 0 for
         /// CSV, whose rows nothing has counted yet.
         objects: usize,
+        /// No object of a JSON file names a member twice, so its key-only
+        /// parse may stop at the keys (`RowParser::names_unique`). Read with
+        /// its keys; false for CSV, where it means nothing.
+        names_unique: bool,
     },
     Parquet {
         reader: parquet::Reader,
@@ -4005,7 +4018,7 @@ fn json_keys_after_the_first(
     first: &[String],
     rows: usize,
     opt: &Options,
-) -> Result<(Vec<String>, usize)> {
+) -> Result<LaterKeys> {
     let data = slab.data();
     let array = json_framed(data);
     let budget = || {
@@ -4048,7 +4061,7 @@ fn json_keys_after_the_first(
         let mut total = 0usize;
         let mut failed = false;
         for piece in found {
-            let Ok((names, _)) = piece else {
+            let Ok(LaterKeys { names, .. }) = piece else {
                 failed = true;
                 continue;
             };
@@ -4072,17 +4085,24 @@ fn json_keys_after_the_first(
     // an earlier piece had: never copied.
     let mut later: HashMap<String, usize> = HashMap::new();
     let mut objects = 0usize;
+    let mut repeats = false;
     // A piece that failed fails the read: its columns would otherwise be
     // missing from the comparison without a word.
     for piece in found {
-        let (names, rows) = piece?;
-        objects += rows;
-        for name in names {
+        let walked = piece?;
+        objects += walked.rows;
+        // Pieces start at rows, so an object's names are all in one piece.
+        repeats |= walked.repeats;
+        for name in walked.names {
             let at = later.len();
             later.entry(name).or_insert(at);
         }
     }
-    Ok((in_order(later), objects))
+    Ok(LaterKeys {
+        names: in_order(later),
+        rows: objects,
+        repeats,
+    })
 }
 
 /// The cells a JSON file's comparison may touch whatever the file's size.
@@ -4173,16 +4193,19 @@ impl Input {
         slab.set_dialect(dialect);
         if dialect == Dialect::Json {
             let mut header = json_header(&slab, path)?;
-            let (later, objects) =
-                json_keys_after_the_first(&slab, &header, rows, opt).map_err(|e| {
-                    // A file that is not what it is read as is the input's
-                    // fault, and is said so, not as an engine that failed.
-                    if e.is_input() {
-                        e.context(format!("{}: ", path.display()))
-                    } else {
-                        Error::new(format!("{}: {e}", path.display()))
-                    }
-                })?;
+            let LaterKeys {
+                names: later,
+                rows: objects,
+                repeats,
+            } = json_keys_after_the_first(&slab, &header, rows, opt).map_err(|e| {
+                // A file that is not what it is read as is the input's
+                // fault, and is said so, not as an engine that failed.
+                if e.is_input() {
+                    e.context(format!("{}: ", path.display()))
+                } else {
+                    Error::new(format!("{}: {e}", path.display()))
+                }
+            })?;
             header.extend(later);
             if header.is_empty() {
                 return Err(Error::new(format!(
@@ -4196,6 +4219,7 @@ impl Input {
                 from: 0,
                 header,
                 objects,
+                names_unique: !repeats,
             });
         }
         let delimiter = match opt.delimiter_byte()? {
@@ -4212,6 +4236,7 @@ impl Input {
             from,
             header,
             objects: 0,
+            names_unique: false,
         })
     }
 
@@ -4239,6 +4264,7 @@ impl Input {
                 delimiter,
                 from,
                 header,
+                names_unique,
                 ..
             } => {
                 // The first column of each name, found by lookup: a search of
@@ -4258,6 +4284,7 @@ impl Input {
                             key_size,
                             array,
                         )
+                        .names_unique(names_unique)
                     } else {
                         RowParser::csv(
                             delimiter,
@@ -4513,6 +4540,7 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
             slab,
             delimiter,
             from,
+            names_unique,
             ..
         } => {
             let json = slab.dialect() == Dialect::Json;
@@ -4522,6 +4550,7 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
                     0,
                     json_framed(slab.data()),
                 )
+                .names_unique(names_unique)
             } else {
                 RowParser::csv(delimiter, (0..width).map(Some).collect())
             };

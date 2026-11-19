@@ -154,6 +154,42 @@ impl Fixture {
         Fixture(dir)
     }
 
+    /// Names repeated in an object: A names every 4th row's key twice, the
+    /// first wrongly, and B ends every 3rd row's `v` with a `null` after the
+    /// changed value, so the last value of each name is the same on both
+    /// sides. `c.json` is A with one name in Latin-1.
+    fn with_repeated_names() -> Fixture {
+        let dir = std::env::temp_dir().join(format!(
+            "compara-fused-rep-{}-{}",
+            std::process::id(),
+            fixture_id()
+        ));
+        fs::create_dir_all(&dir).expect("a temp directory");
+        let mut a = String::new();
+        let mut b = String::new();
+        for i in 0..6000 {
+            let k = if i % 4 == 0 { "\"id\":-1," } else { "" };
+            let v = if i % 3 == 0 {
+                "\"v\":null"
+            } else {
+                "\"v\":null,\"v\":\"a\""
+            };
+            a.push_str(&format!("{{{k}\"v\":\"x\",{v},\"id\":{i}}}\n"));
+            let v = if i % 3 == 0 {
+                "\"v\":\"b\",\"v\":null"
+            } else {
+                "\"v\":\"a\""
+            };
+            b.push_str(&format!("{{\"id\":{i},{v}}}\n"));
+        }
+        let mut c = a.clone().into_bytes();
+        c.extend_from_slice(b"{\"id\":6000,\"v\xe9\":\"a\"}\n");
+        fs::write(dir.join("a.json"), a).expect("a.json");
+        fs::write(dir.join("b.json"), b).expect("b.json");
+        fs::write(dir.join("c.json"), c).expect("c.json");
+        Fixture(dir)
+    }
+
     /// Past the chunking threshold, so four threads sweep four chunks, with a
     /// repeat after every third key: changed, and removed where the key is
     /// missing from B. Each part's first picks include repeats, so the report's
@@ -375,6 +411,43 @@ fn fused_ndjson_reads_a_name_by_what_its_escapes_spell() {
     let (fcode, fout, ferr) = run(&fx.0, &args, true);
     assert_eq!(fcode, code, "fused run failed: {ferr}");
     assert_eq!(counts(&fout), counts(&out), "fused ndjson disagrees");
+}
+
+#[test]
+fn fused_ndjson_takes_a_repeated_name_s_last_value() {
+    let fx = Fixture::with_repeated_names();
+    for threads in ["1", "2", "4"] {
+        let args = [
+            "compare",
+            "a.json",
+            "b.json",
+            "-k",
+            "id",
+            "--summary",
+            "--threads",
+            threads,
+        ];
+        let (code, out, err) = run(&fx.0, &args, false);
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            counts(&out).contains("matched 6,000 (changed 0) | added 0 | removed 0"),
+            "{out}"
+        );
+        let (fcode, fout, ferr) = run(&fx.0, &args, true);
+        assert_eq!(fcode, code, "fused run failed: {ferr}");
+        assert_eq!(counts(&fout), counts(&out), "fused ndjson disagrees");
+    }
+    // A name that is not UTF-8: exit 2, with the line and the way out.
+    for fused in [false, true] {
+        let args = ["compare", "c.json", "b.json", "-k", "id"];
+        let (code, out, err) = run(&fx.0, &args, fused);
+        assert_eq!(code, 2, "{out}{err}");
+        assert!(
+            err.contains("c.json: line 6001: the member name \"v\\xE9\" is not UTF-8")
+                && err.contains("iconv"),
+            "{err}"
+        );
+    }
 }
 
 #[test]

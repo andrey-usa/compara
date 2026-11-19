@@ -34,6 +34,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A JSON member name that is not UTF-8 (a Latin-1 `caf\xE9`, say) was
+  listed with a replacement character but looked up as written, so the
+  column had no values on either side and its changes went unreported
+  with exit 0. Such a file is now refused with the line, the name's bytes
+  and how to convert it (`iconv`); JSON text is UTF-8 (RFC 8259) and
+  Python's `json.loads` refuses it too.
+- A name repeated in one JSON object now takes its last value for every
+  column, as `json.loads`, JavaScript and jq read it: a key column took
+  its first, so `{"id":9,"id":10}` was row 9 for `-k id` and 10
+  otherwise, and a later `null` did not clear an earlier value
+  (`{"v":"a","v":null}` against `{"v":"b","v":null}` said changed). A file
+  with no repeated name is read as before, at the same cost.
 - A JSON key written with an escape was never read: Python's `json.dumps`
   writes every non-ASCII name that way by default (`"caf\u00e9"`), PHP
   writes `/` as `\/`. The column was listed but had no values on either
