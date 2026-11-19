@@ -1635,10 +1635,14 @@ async fn fetch_part_once(
 
 /// Whether an answer's validator, `answered`, says it is of another version
 /// of the object than `etag`, the end's: compared by the tag, for a weak one
-/// (`W/"…"`) names a version too. Without both there is nothing to compare.
+/// (`W/"…"`) names a version too, on either side (a store's tag is taken as
+/// it comes). Without both there is nothing to compare.
 fn other_version(etag: Option<&str>, answered: Option<&str>) -> bool {
+    fn tag(t: &str) -> &str {
+        t.trim().trim_start_matches("W/")
+    }
     match (etag, answered) {
-        (Some(want), Some(got)) => got.trim().trim_start_matches("W/") != want.trim(),
+        (Some(want), Some(got)) => tag(got) != tag(want),
         _ => false,
     }
 }
@@ -2403,6 +2407,9 @@ mod tests {
         let tag = Some("\"abc-1\"");
         assert!(!other_version(tag, Some("\"abc-1\"")));
         assert!(!other_version(tag, Some("W/\"abc-1\"")));
+        assert!(!other_version(Some("W/\"abc-1\""), Some("W/\"abc-1\"")));
+        assert!(!other_version(Some("W/\"abc-1\""), Some("\"abc-1\"")));
+        assert!(other_version(Some("W/\"abc-1\""), Some("W/\"abc-2\"")));
         assert!(other_version(tag, Some("\"abc-2\"")));
         assert!(!other_version(tag, None));
         assert!(!other_version(None, Some("\"abc-2\"")));
