@@ -346,3 +346,38 @@ fn a_link_at_the_export_directory_is_refused() {
     assert!(err.contains("symbolic link"), "{err}");
     assert_eq!(fs::read_dir(fx.path("elsewhere")).unwrap().count(), 0);
 }
+
+/// A directory or a glob given as an input is its files read as one table, so
+/// an output inside the directory, or one the glob matches, names an input as
+/// surely as a path does: it is refused before anything is read. A name the
+/// directory read passes over (starting with `.` or `_`) is not an input.
+#[test]
+fn an_output_inside_an_input_directory_or_glob_is_refused() {
+    let fx = Fixture::new();
+    fs::create_dir_all(fx.path("da/sub")).unwrap();
+    fs::copy(fx.path("a.csv"), fx.path("da/one.csv")).unwrap();
+    let before = fs::read(fx.path("da/one.csv")).unwrap();
+    let key = ["-k", "account_id,txn_id"];
+    for (input, flags) in [
+        ("da", vec!["-o", "da/report.html"]),
+        ("da", vec!["--json", "da/sub/s.json"]),
+        ("da", vec!["--export-dir", "da"]),
+        ("da/*.csv", vec!["-o", "da/one.csv"]),
+        ("da/**/*.json", vec!["--json", "./da/sub/s.json"]),
+    ] {
+        let mut args = vec!["compare", input, "b.csv"];
+        args.extend(key);
+        args.extend(&flags);
+        let (code, _, err) = run(&fx.0, &args);
+        assert_eq!(code, 2, "{input} {flags:?}: {err}");
+        assert!(err.contains("over input"), "{input} {flags:?}: {err}");
+    }
+    assert_eq!(fs::read(fx.path("da/one.csv")).unwrap(), before);
+    assert_eq!(files(&fx.0), ["da"], "something was written");
+    // Passed over by the directory read, so not an input.
+    let mut args = vec!["compare", "da", "b.csv"];
+    args.extend(key);
+    args.extend(["-o", "da/_report.html"]);
+    let (code, _, err) = run(&fx.0, &args);
+    assert_eq!(code, 1, "{err}");
+}

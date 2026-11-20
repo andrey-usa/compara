@@ -152,6 +152,12 @@ pub fn is_remote(spec: &str) -> bool {
         )
 }
 
+/// Whether the local input `spec` (a path, a directory or a glob) is, or would
+/// read, `file`: the files a run must not write over.
+pub fn reads_file(spec: &str, file: &Path) -> bool {
+    !is_remote(spec) && spec != "-" && many::would_read(spec, file)
+}
+
 impl Source {
     /// Opens `spec` -- a path, `-` or a URL -- as a local file.
     pub fn open(spec: &str, want: &Want) -> Result<Source> {

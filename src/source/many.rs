@@ -119,6 +119,49 @@ pub(crate) fn hidden(relative: &str) -> bool {
         .any(|s| s.starts_with('.') || s.starts_with('_'))
 }
 
+/// Whether reading `spec` as a directory or a glob would read `file`, a path
+/// that may not exist yet: the same root, the same match and the same names
+/// passed over as the read itself. How a run tells that an output it is about
+/// to write is one of its inputs.
+pub(crate) fn would_read(spec: &str, file: &Path) -> bool {
+    let path = Path::new(spec);
+    let pattern = if path.is_dir() {
+        None
+    } else if is_pattern(spec) && !path.exists() {
+        Some(spec)
+    } else {
+        return false;
+    };
+    let root = match pattern {
+        Some(p) if !literal_prefix(p).is_empty() => literal_prefix(p),
+        Some(_) => ".",
+        None => spec,
+    };
+    let parent = match file.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let (Ok(root), Ok(parent), Some(name)) = (
+        std::fs::canonicalize(root),
+        std::fs::canonicalize(parent),
+        file.file_name(),
+    ) else {
+        return false;
+    };
+    let Ok(under) = parent.join(name).strip_prefix(&root).map(Path::to_path_buf) else {
+        return false;
+    };
+    let relative: Vec<_> = under
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let relative = relative.join("/");
+    match pattern {
+        Some(p) => glob_matches(p, &format!("{}{relative}", literal_prefix(p))),
+        None => !hidden(&relative),
+    }
+}
+
 /// A table format whose directory is not the table: what to say instead of
 /// reading every file in it. `names` are the paths under the root.
 /// A table format whose directory is not the table, found under the root:

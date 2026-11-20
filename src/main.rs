@@ -720,7 +720,9 @@ fn check_outputs(args: &Args, inputs: [(&str, &str); 2]) -> Result<()> {
     }
     for (flag, out) in &outputs {
         for (side, spec) in inputs {
-            if local(spec) && same_file(out, Path::new(spec)) {
+            if local(spec)
+                && (same_file(out, Path::new(spec)) || compara::source::reads_file(spec, out))
+            {
                 return Err(Error::new(format!(
                     "{flag} would write {} over input {side} ({spec}); name another file",
                     out.display()
