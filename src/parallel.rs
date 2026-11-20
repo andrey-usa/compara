@@ -111,42 +111,63 @@ pub fn wait_for_set_up() {
 
 #[cold]
 fn wait_for_set_up_slowly() {
+    wait_for_set_up_within(SET_UP_WAIT);
+}
+
+/// [`wait_for_set_up`]'s wait, bounded at `most`.
+fn wait_for_set_up_within(most: std::time::Duration) {
     // `try_with`: during this thread's own teardown the flag is gone, and an
     // allocation then has nothing to wait for that it could not race anyway.
     if STARTING.try_with(std::cell::Cell::get).unwrap_or(true) {
         return;
     }
     let since = std::time::Instant::now();
-    while SETTING_UP.load(std::sync::atomic::Ordering::Acquire) != 0
-        && since.elapsed() < SET_UP_WAIT
-    {
+    while SETTING_UP.load(std::sync::atomic::Ordering::Acquire) != 0 && since.elapsed() < most {
         std::thread::yield_now();
     }
 }
 
 /// This thread, starting another under a heap limit: counted in
-/// [`SETTING_UP`] from before the room is looked at until the new thread says
-/// it is set up ([`SetUp::finished`]) or is not started after all
-/// ([`Starting::not_started`]).
+/// [`SETTING_UP`] from before the room is looked at until the count is handed
+/// to the new thread ([`Starting::hand_over`]), or until this is dropped -- a
+/// refusal, a spawn error, a panic -- so that no way out leaves the count
+/// behind, and every later allocation waiting out [`SET_UP_WAIT`].
 struct Starting {
     was: bool,
+    counted: bool,
 }
 
 impl Starting {
     fn begin() -> Self {
         let was = STARTING.replace(true);
         SETTING_UP.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Starting { was }
+        Starting { was, counted: true }
     }
 
-    fn not_started(&self) {
-        SETTING_UP.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    /// The count, moved into the new thread's closure: released when the
+    /// closure begins, or when it is dropped without having run.
+    fn hand_over(&mut self, set_up: std::sync::Arc<SetUp>) -> Counted {
+        self.counted = false;
+        Counted(set_up)
     }
 }
 
 impl Drop for Starting {
     fn drop(&mut self) {
+        if self.counted {
+            SETTING_UP.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
         STARTING.set(self.was);
+    }
+}
+
+/// A thread's place in [`SETTING_UP`], held by its closure until the closure
+/// begins: dropping it is the new thread's word that it is set up.
+struct Counted(std::sync::Arc<SetUp>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.finished();
     }
 }
 
@@ -221,25 +242,23 @@ where
     if crate::memory::heap_limit().is_none() {
         return Builder::new().spawn_scoped(scope, f);
     }
-    let starting = Starting::begin();
+    let mut starting = Starting::begin();
     match fits() {
         None => {
-            starting.not_started();
+            drop(starting);
             Builder::new().spawn_scoped(scope, f)
         }
         Some(false) => {
-            starting.not_started();
+            drop(starting);
             Err(refused())
         }
         Some(true) => {
             let set_up = SetUp::new();
-            let theirs = std::sync::Arc::clone(&set_up);
-            let handle = Builder::new()
-                .spawn_scoped(scope, move || {
-                    theirs.finished();
-                    f()
-                })
-                .inspect_err(|_| starting.not_started())?;
+            let counted = starting.hand_over(std::sync::Arc::clone(&set_up));
+            let handle = Builder::new().spawn_scoped(scope, move || {
+                drop(counted);
+                f()
+            })?;
             set_up.wait();
             Ok(handle)
         }
@@ -256,25 +275,23 @@ where
     if crate::memory::heap_limit().is_none() {
         return named.spawn(f);
     }
-    let starting = Starting::begin();
+    let mut starting = Starting::begin();
     match fits() {
         None => {
-            starting.not_started();
+            drop(starting);
             named.spawn(f)
         }
         Some(false) => {
-            starting.not_started();
+            drop(starting);
             Err(refused())
         }
         Some(true) => {
             let set_up = SetUp::new();
-            let theirs = std::sync::Arc::clone(&set_up);
-            let handle = named
-                .spawn(move || {
-                    theirs.finished();
-                    f()
-                })
-                .inspect_err(|_| starting.not_started())?;
+            let counted = starting.hand_over(std::sync::Arc::clone(&set_up));
+            let handle = named.spawn(move || {
+                drop(counted);
+                f()
+            })?;
             set_up.wait();
             Ok(handle)
         }
@@ -386,35 +403,90 @@ mod tests {
         assert_eq!(t.join().unwrap(), 7);
     }
 
+    /// The tests that move [`SETTING_UP`], one at a time.
+    static SETTING_UP_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// While a thread is being set up, another thread's allocation waits until
-    /// it is, and the thread starting it does not wait for its own.
+    /// it is, and the thread starting it does not wait for its own. The wait
+    /// is given a bound no busy machine reaches, so that returning before it
+    /// is the set-up's end and not the bound's.
     #[test]
     fn an_allocation_waits_for_a_thread_being_set_up() {
         use std::time::{Duration, Instant};
+        let _one = SETTING_UP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        const NEVER: Duration = Duration::from_secs(60);
         let (counted, count) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let starter = std::thread::spawn(move || {
             let starting = Starting::begin();
             let at = Instant::now();
-            wait_for_set_up();
+            wait_for_set_up_within(NEVER);
             let own = at.elapsed();
             counted.send(()).unwrap();
             released.recv().unwrap();
-            starting.not_started();
+            drop(starting);
             own
         });
         count.recv().unwrap();
         let at = Instant::now();
         let waiter = std::thread::spawn(move || {
-            wait_for_set_up();
+            wait_for_set_up_within(NEVER);
             at.elapsed()
         });
         std::thread::sleep(Duration::from_millis(50));
         release.send(()).unwrap();
         let waited = waiter.join().unwrap();
-        assert!(starter.join().unwrap() < Duration::from_millis(40));
+        assert!(starter.join().unwrap() < NEVER);
         assert!(waited >= Duration::from_millis(50), "{waited:?}");
-        assert!(waited < SET_UP_WAIT, "{waited:?}");
+        assert!(waited < NEVER, "{waited:?}");
+        assert_eq!(SETTING_UP.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    /// A set-up that never ends holds an allocation for the bound and no more.
+    #[test]
+    fn an_allocation_waits_no_longer_than_its_bound() {
+        use std::time::{Duration, Instant};
+        let _one = SETTING_UP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let starting = std::thread::spawn(Starting::begin).join();
+        let at = Instant::now();
+        wait_for_set_up_within(Duration::from_millis(30));
+        let waited = at.elapsed();
+        // The guard was made on a thread that has ended; dropping it here
+        // releases the count, and sets this thread's flag back to what that
+        // thread's was, which is this one's too.
+        drop(starting);
+        assert!(waited >= Duration::from_millis(30), "{waited:?}");
+        assert!(waited < Duration::from_secs(60), "{waited:?}");
+        assert_eq!(SETTING_UP.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    /// No way out of starting a thread leaves it counted as being set up:
+    /// not a panic before the spawn, and not a closure dropped without
+    /// having run (what a refused spawn does with it).
+    #[test]
+    fn a_start_given_up_leaves_nothing_counted() {
+        use std::sync::atomic::Ordering::Acquire;
+        let _one = SETTING_UP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let panicked = std::panic::catch_unwind(|| {
+            let _starting = Starting::begin();
+            assert_eq!(SETTING_UP.load(Acquire), 1);
+            panic!("given up between counting and spawning");
+        });
+        assert!(panicked.is_err());
+        assert_eq!(SETTING_UP.load(Acquire), 0);
+        assert!(!STARTING.get());
+
+        let mut starting = Starting::begin();
+        let set_up = SetUp::new();
+        let counted = starting.hand_over(std::sync::Arc::clone(&set_up));
+        let closure = move || {
+            drop(counted);
+        };
+        drop(starting);
+        assert_eq!(SETTING_UP.load(Acquire), 1, "handed over, still counted");
+        drop(closure);
+        assert_eq!(SETTING_UP.load(Acquire), 0);
+        set_up.wait();
     }
 
     /// A thread the OS starts but that has no room left to set itself up runs
