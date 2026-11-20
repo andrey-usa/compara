@@ -21,10 +21,11 @@ do not check it.
 
 --fault MODE misbehaves on the ranged GETs picked by --fault-at K (counted
 from 0 across the server) and --fault-every N (then every N-th; 0 for that
-one only): `silent` sends nothing at all; `stall` the headers and then
-nothing; `drop` half the body, then closes the connection; `reset` closes
-it before answering; `overlong` sends 1,000 bytes past the range asked, its
-Content-Length saying so; `dribble` sends the body 1 KB a second. With
+one only), at most --fault-max M of them (0: no limit): `silent` sends
+nothing at all; `stall` the headers and then nothing; `drop` half the body,
+then closes the connection; `reset` closes it before answering; `overlong`
+sends 1,000 bytes past the range asked, its Content-Length saying so;
+`dribble` sends the body 1 KB a second. With
 --fault-puts the fault hits PUTs instead, counted the same way: `silent`
 reads nothing and never answers; `stall` reads the body and never answers;
 `dribble` reads it 1 KB at a time, --rate bytes a second (1024), then
@@ -64,6 +65,7 @@ def main() -> None:
     ap.add_argument("--fault", choices=["silent", "stall", "drop", "reset", "overlong", "dribble"])
     ap.add_argument("--fault-at", type=int, default=0)
     ap.add_argument("--fault-every", type=int, default=0)
+    ap.add_argument("--fault-max", type=int, default=0)
     ap.add_argument("--fault-puts", action="store_true", help="the fault hits PUTs, not ranged GETs")
     ap.add_argument("--rate", type=int, default=1024, help="a dribbled PUT's bytes a second")
     args = ap.parse_args()
@@ -71,11 +73,16 @@ def main() -> None:
     gets = [0]
     ranged = [0]
     puts = [0]
+    faults = [0]
 
     def picked(i):
-        """Whether request i is hit."""
-        return i == args.fault_at or (
+        """Whether request i (counted under the lock) is hit."""
+        hit = i == args.fault_at or (
             args.fault_every and i > args.fault_at and (i - args.fault_at) % args.fault_every == 0)
+        if hit and args.fault_max:
+            hit = faults[0] < args.fault_max
+        faults[0] += hit
+        return hit
     newer = {}
 
     def newer_version(full):
@@ -375,6 +382,11 @@ def main() -> None:
             self.serve(head=True)
 
     class Server(ThreadingHTTPServer):
+        # A client asking again for every request a stall cut off connects
+        # dozens of times at once; the default backlog of 5 dropped some,
+        # and their retries came a second or more later.
+        request_queue_size = 128
+
         def handle_error(self, request, client_address):
             # A client that stops reading part-way (it had what it needed)
             # is not an error worth a traceback.

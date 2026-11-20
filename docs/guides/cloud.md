@@ -59,7 +59,8 @@ aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
   `If-Match`): an object overwritten mid-read is an error, not a file
   stitched from two versions. Throttled and dropped ranges are retried, and
   so is a request whose server sends nothing for 30 s
-  (`COMPARA_READ_TIMEOUT`); a slow one that keeps sending is waited for.
+  (`COMPARA_READ_TIMEOUT`); a slow one that keeps sending is waited for. A
+  server that sends nothing on any request for twice that is an error.
 - **Outputs go up** in one request, or as a multipart upload for a large
   export. `--json -` prints the summary on stdout and the counts on stderr.
   A plain `http(s)://` PUT is sent from the file as the server takes it; a

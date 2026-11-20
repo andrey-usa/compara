@@ -99,6 +99,12 @@ All notable changes to this project are documented here. The format follows
   they do after any failure, and their reads no longer stop at five minutes
   a request, which cut off an 8 MB part on a link under 28 KB/s. A server
   sending 1 KB a second is waited for.
+- A URL whose server stalled every request was given up on only after
+  each request's four tries of 30 s, 124 s in all, or an object store's own
+  retries, 181 s. A transfer now ends once its server has sent nothing on
+  any request for twice the read timeout, 60 s, and says so; one request
+  stalled while others are answered, or every request in flight stalled
+  once, still reads through (fault runs over loopback, HTTP and S3).
 - A plain `http(s)://` PUT -- an output to a presigned URL -- had no time
   limit: a server that took the connection and then stopped, reading
   nothing, or reading it all and never answering, held compara for good;

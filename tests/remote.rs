@@ -720,10 +720,12 @@ fn compare_urls(a: &str, b: &str, env: &[(&str, &str)]) -> (i32, String, String,
 /// A server that stops answering is given up on after the read timeout (1 s
 /// here) and asked again: a part whose answer never comes, or stops after
 /// its headers, still reads to the local answer, over HTTP and S3, where it
-/// had hung for good. One that stalls every time is an error within seconds
-/// that names the URL, says it stalled and what to do. One that keeps
-/// sending, if only 1 KB a second, is waited for: the timeout is the wait for
-/// each piece, not for the whole.
+/// had hung for good, and so does a transfer whose every request in flight
+/// stalls once. One that stalls every time is an error once it has sent
+/// nothing for twice the timeout, however many requests and tries that is
+/// (it had been each request's four tries), that names the URL, says it
+/// stalled and what to do. One that keeps sending, if only 1 KB a second, is
+/// waited for: the timeout is the wait for each piece, not for the whole.
 #[test]
 fn a_stalled_server_is_asked_again_and_a_slow_one_waited_for() {
     let f = fixture("20k", &[]);
@@ -764,24 +766,77 @@ fn a_stalled_server_is_asked_again_and_a_slow_one_waited_for() {
         );
     }
 
-    let Some(server) = Server::start(&f.0, &["--fault", "stall", "--fault-every", "1"]) else {
-        return;
-    };
-    let u = &server.url;
-    let started = std::time::Instant::now();
-    let (code, err, ..) = compare_urls(
-        &format!("{u}/bkt/t_a.csv"),
-        &format!("{u}/bkt/t_b.csv"),
-        &quick,
-    );
-    assert_eq!(code, 2, "{err}");
-    assert!(
-        err.contains("/bkt/t_") && err.contains("stopped sending: nothing came for 1 s (4 tries)"),
-        "{err}"
-    );
-    assert!(err.contains("COMPARA_READ_TIMEOUT"), "{err}");
-    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
-    drop(server);
+    // A over the URL, B local: after A's end, its first sixteen parts, all
+    // in flight together, each stalled once. Silent for the timeout and the
+    // pause before the next try, inside the budget (3 s here, for room).
+    for s3 in [false, true] {
+        let Some(server) = Server::start(
+            &f.0,
+            &[
+                "--fault",
+                "stall",
+                "--fault-at",
+                "1",
+                "--fault-every",
+                "1",
+                "--fault-max",
+                "16",
+            ],
+        ) else {
+            return;
+        };
+        let u = &server.url;
+        let mut env = if s3 { s3_env(u) } else { Vec::new() };
+        env.push(("COMPARA_READ_TIMEOUT", "3".into()));
+        env.push(("COMPARA_FETCH_PART", "65536".into()));
+        let a = if s3 {
+            "s3://bkt/t_a.csv".to_string()
+        } else {
+            format!("{u}/bkt/t_a.csv")
+        };
+        let got = compare_urls(&a, &local("t_b.csv"), &borrowed(&env));
+        assert_eq!(
+            (want.0, &want.2, &want.3),
+            (got.0, &got.2, &got.3),
+            "every request stalled once, s3 {s3}: {}",
+            got.1
+        );
+    }
+
+    for (at, s3) in [("0", false), ("10", false), ("0", true), ("10", true)] {
+        let Some(server) = Server::start(
+            &f.0,
+            &["--fault", "stall", "--fault-at", at, "--fault-every", "1"],
+        ) else {
+            return;
+        };
+        let u = &server.url;
+        let mut env = if s3 { s3_env(u) } else { Vec::new() };
+        env.extend(quick.iter().map(|(k, v)| (*k, v.to_string())));
+        let (a, b) = if s3 {
+            (
+                "s3://bkt/t_a.csv".to_string(),
+                "s3://bkt/t_b.csv".to_string(),
+            )
+        } else {
+            (format!("{u}/bkt/t_a.csv"), format!("{u}/bkt/t_b.csv"))
+        };
+        let started = std::time::Instant::now();
+        let (code, err, ..) = compare_urls(&a, &b, &borrowed(&env));
+        assert_eq!(code, 2, "from {at}, s3 {s3}: {err}");
+        assert!(
+            err.contains("t_") && err.contains("sent nothing for 2 s on any request"),
+            "from {at}, s3 {s3}: {err}"
+        );
+        assert!(err.contains("COMPARA_READ_TIMEOUT"), "{err}");
+        // Twice the timeout, and the time to see it; it had been four tries
+        // (HTTP), or the store's own retries for three minutes (S3).
+        assert!(
+            started.elapsed().as_secs() < 10,
+            "from {at}, s3 {s3}: {:?}",
+            started.elapsed()
+        );
+    }
 
     let small = fixture("30", &[]);
     let bucket = small.0.join("bkt");

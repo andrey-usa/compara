@@ -1142,25 +1142,38 @@ fn brief(e: &str) -> String {
 /// plain HTTP server that answers 5xx or 429, or drops the connection, is
 /// asked again, three times, a little later each time, as a range is, and so
 /// is any server whose answer does not hold the bytes it says it does;
-/// object_store asks again itself after its own failures.
+/// object_store asks again itself after its own failures. A server that
+/// sends nothing for the silence budget ([`Heard::silence`]), however many
+/// tries that is, has stalled.
 async fn tail(reader: &Reader, spec: &str) -> std::result::Result<Got, FetchError> {
-    let mut attempt = 0u32;
-    loop {
-        let result = tail_once(reader, spec).await;
-        let retryable = match &result {
-            Err(FetchError::Transient(_) | FetchError::Stalled { .. }) => true,
-            Err(Refused(status)) => *status >= 500 || *status == 429,
-            _ => false,
-        };
-        if !retryable || attempt >= 3 {
-            return result.map_err(|e| gave_up(e, attempt));
+    let heard = Heard::new();
+    let tries = async {
+        let mut attempt = 0u32;
+        loop {
+            let result = tail_once(reader, spec, &heard).await;
+            let retryable = match &result {
+                Err(FetchError::Transient(_) | FetchError::Stalled { .. }) => true,
+                Err(Refused(status)) => *status >= 500 || *status == 429,
+                _ => false,
+            };
+            if !retryable || attempt >= 3 {
+                return result.map_err(|e| gave_up(e, attempt));
+            }
+            attempt += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
         }
-        attempt += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
+    };
+    match futures::future::select(std::pin::pin!(tries), std::pin::pin!(heard.silence())).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right((why, _)) => Err(FetchError::Other(why)),
     }
 }
 
-async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, FetchError> {
+async fn tail_once(
+    reader: &Reader,
+    spec: &str,
+    heard: &Heard,
+) -> std::result::Result<Got, FetchError> {
     match reader {
         Reader::Store(store, path) => {
             let got = store
@@ -1204,9 +1217,19 @@ async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, Fetc
             let size = got.meta.size;
             let etag = got.meta.e_tag.clone();
             let span = got.range.clone();
-            let bytes = got.bytes().await?;
+            let mut bytes = Vec::with_capacity((span.end - span.start) as usize);
+            let mut stream = got.into_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                heard.now();
+                bytes.extend_from_slice(&chunk);
+                // No more is held than was asked for.
+                if bytes.len() as u64 > span.end - span.start {
+                    break;
+                }
+            }
             the_end(&span, size, bytes.len())?;
-            Ok(Got::Tail(size, bytes.to_vec(), etag))
+            Ok(Got::Tail(size, bytes, etag))
         }
         Reader::Http(client, url) => {
             let response = client
@@ -1256,11 +1279,20 @@ async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, Fetc
                     }
                 };
                 // An answer cut off is asked for again, as a part's is.
-                let bytes = response.bytes().await.map_err(|e| {
+                let mut bytes = Vec::with_capacity((span.end - span.start).min(TAIL) as usize);
+                let mut response = response;
+                while let Some(chunk) = response.chunk().await.map_err(|e| {
                     stall_of(&e, true).unwrap_or_else(|| FetchError::Transient(e.to_string()))
-                })?;
+                })? {
+                    heard.now();
+                    bytes.extend_from_slice(&chunk);
+                    // No more is held than was asked for.
+                    if bytes.len() as u64 > span.end - span.start {
+                        break;
+                    }
+                }
                 the_end(&span, total, bytes.len())?;
-                return Ok(Got::Tail(total, bytes.to_vec(), etag));
+                return Ok(Got::Tail(total, bytes, etag));
             }
             // The server sent the whole object: it does not do ranges, so this
             // response is the download. It goes to disk as it comes, never
@@ -1285,6 +1317,7 @@ async fn tail_once(reader: &Reader, spec: &str) -> std::result::Result<Got, Fetc
                         }
                     })
                 })? {
+                    heard.now();
                     std::io::Write::write_all(&mut file, &chunk)
                         .map_err(|e| FetchError::Other(format!("{spec}: {e}")))?;
                     written += chunk.len() as u64;
@@ -1423,6 +1456,57 @@ fn stalled(answered: bool, tries: &str) -> String {
     format!("{what} ({tries}); try again later, or wait longer with COMPARA_READ_TIMEOUT=<seconds>")
 }
 
+/// When a transfer last had a byte of an answer from its server.
+struct Heard {
+    start: Instant,
+    /// Milliseconds after `start`.
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl Heard {
+    fn new() -> Self {
+        Heard {
+            start: Instant::now(),
+            last: Default::default(),
+        }
+    }
+
+    fn now(&self) {
+        self.last.fetch_max(
+            self.start.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Resolves, with what to say, once nothing has come for the silence
+    /// budget, twice [`read_timeout`]: a stalled request and its next try.
+    /// One request stalled while others are answered, or every request
+    /// stalled once together, is asked again and gets through; a server
+    /// that has stopped answering ends the transfer then, rather than after
+    /// each request's every try in turn.
+    async fn silence(&self) -> String {
+        let budget = read_timeout() * 2;
+        let tick = (read_timeout() / 8).clamp(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
+        );
+        loop {
+            tokio::time::sleep(tick).await;
+            let last = std::time::Duration::from_millis(
+                self.last.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            if self.start.elapsed().saturating_sub(last) > budget {
+                return format!(
+                    "the server sent nothing for {} s on any request (each asked again after {} s); \
+                     try again later, or wait longer with COMPARA_READ_TIMEOUT=<seconds>",
+                    budget.as_secs_f64(),
+                    read_timeout().as_secs_f64()
+                );
+            }
+        }
+    }
+}
+
 fn concurrency() -> usize {
     std::env::var("COMPARA_FETCH_CONCURRENCY")
         .ok()
@@ -1455,6 +1539,7 @@ struct Lanes {
     failed: std::sync::atomic::AtomicBool,
     error: std::sync::Mutex<Option<Error>>,
     stop: std::sync::Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+    heard: Heard,
 }
 
 type Signal<T> = futures::future::Shared<futures::channel::oneshot::Receiver<T>>;
@@ -1497,6 +1582,7 @@ impl Lanes {
                     p.shift,
                     p.etag.as_deref(),
                     p.size,
+                    &self.heard,
                 )
                 .await
                 .map_err(|e| e.into_error(&p.spec))?;
@@ -1624,6 +1710,7 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
         failed: Default::default(),
         error: Default::default(),
         stop: std::sync::Mutex::new(Some(stop_tx)),
+        heard: Heard::new(),
     });
     let mut others = Vec::new();
     if lanes > 1 {
@@ -1668,6 +1755,9 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
                             shared.fail(Error::new(format!("{label}: {e}")));
                             break;
                         }
+                        // A write that took long held the lanes up, not
+                        // the server.
+                        shared.heard.now();
                     }
                     Wrote::Part(from, len) => crate::memory::write_behind(file, from, len, None),
                 }
@@ -1713,7 +1803,18 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
             );
         }
     };
-    futures::future::select(std::pin::pin!(work), std::pin::pin!(ticker)).await;
+    // A server that sends nothing on any request for the silence budget
+    // ends the transfer, rather than each request's every try in turn.
+    let quiet = async {
+        let why = shared.heard.silence().await;
+        shared.fail(Error::new(format!("{label}: {why}")));
+        std::future::pending::<()>().await
+    };
+    futures::future::select(
+        std::pin::pin!(work),
+        std::pin::pin!(futures::future::join(ticker, quiet)),
+    )
+    .await;
     let _ = end_tx.send(());
     for (thread, _) in others {
         let _ = thread.join();
@@ -1768,10 +1869,11 @@ async fn fetch_part(
     shift: u64,
     etag: Option<&str>,
     size: u64,
+    heard: &Heard,
 ) -> std::result::Result<(), FetchError> {
     let mut attempt = 0u32;
     loop {
-        let result = fetch_part_once(reader, out, part.clone(), shift, etag, size).await;
+        let result = fetch_part_once(reader, out, part.clone(), shift, etag, size, heard).await;
         // A store's own failures come back as Other, asked again already.
         let retryable = matches!(
             &result,
@@ -1792,6 +1894,7 @@ async fn fetch_part_once(
     shift: u64,
     etag: Option<&str>,
     size: u64,
+    heard: &Heard,
 ) -> std::result::Result<(), FetchError> {
     let mut at = part.start;
     let mut to = out.part();
@@ -1814,6 +1917,7 @@ async fn fetch_part_once(
             let mut stream = got.into_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
+                heard.now();
                 let len = chunk.len() as u64;
                 if at + len > part.end {
                     return Err(FetchError::Transient("a range ran past its end".into()));
@@ -1881,6 +1985,7 @@ async fn fetch_part_once(
                 let chunk = chunk.map_err(|e| {
                     stall_of(&e, true).unwrap_or_else(|| FetchError::Transient(e.to_string()))
                 })?;
+                heard.now();
                 let len = chunk.len() as u64;
                 if at + len > part.end {
                     return Err(FetchError::Transient("a range ran past its end".into()));
