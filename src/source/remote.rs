@@ -690,7 +690,8 @@ impl Drop for TempPath {
 
 /// Writes the local file `from` to `dest`: in one request when it is small,
 /// as a multipart upload of 16 MB parts, eight in flight, when it is not. A
-/// plain `https://` URL -- a presigned PUT -- takes the whole file in one PUT.
+/// plain `https://` URL -- a presigned PUT -- takes the whole file in one PUT,
+/// read from the file as it is sent and watched ([`Sent`]).
 pub(super) fn upload(from: &std::path::Path, dest: &str) -> Result<u64> {
     let _quiet = QuietPipe::new();
     runtime("upload")?.block_on(upload_async(from, dest))
@@ -713,13 +714,19 @@ async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
     let plain = matches!(url.scheme(), "http" | "https") && !signable(&url);
     let fail = |e: String| Error::new(format!("cannot write {dest}: {e}"));
     if plain {
-        let body = std::fs::read(from)?;
-        let response = http_client(false)?
+        let file = std::fs::File::open(from)?;
+        let sent = Arc::new(Sent::new(size, send_buffer_max()));
+        let request = http_client(false)?
             .put(dest)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| fail(said(&e)))?;
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .body(reqwest::Body::wrap_stream(pieces(file, size, sent.clone())))
+            .send();
+        let gave_up = sent.watch(dest, read_timeout(), progress_every());
+        let response =
+            match futures::future::select(std::pin::pin!(request), std::pin::pin!(gave_up)).await {
+                futures::future::Either::Left((answer, _)) => answer.map_err(|e| fail(said(&e)))?,
+                futures::future::Either::Right((why, _)) => return Err(fail(why)),
+            };
         if !response.status().is_success() {
             return Err(fail(format!("HTTP {}", response.status())));
         }
@@ -756,6 +763,195 @@ async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
     }
     writer.finish().await.map_err(|e| fail(e.to_string()))?;
     Ok(size)
+}
+
+/// The slowest a server may take a plain PUT and still be waited for, in
+/// bytes a second: 16 KiB. compara sees an upload leave only as the
+/// connection takes its body, and the sockets between it and the server hold
+/// megabytes of it: a server that has stopped and one reading slowly look the
+/// same until those bytes would have drained, so the waits of
+/// [`Sent::allowed`] last as long as they would take at this pace, and the
+/// error names it. At 1 KiB a second, a server that took 398 KB whole and
+/// never answered was waited for 419 s; at 16 KiB, 54 s.
+const UPLOAD_FLOOR: f64 = 16.0 * 1024.0;
+
+/// The most a socket's send buffer grows to: the ceiling of Linux's
+/// `tcp_wmem`, 4 MiB unless the system is tuned otherwise, and about that
+/// elsewhere.
+fn send_buffer_max() -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(max) = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_wmem")
+        .ok()
+        .and_then(|t| t.split_whitespace().nth(2)?.parse::<u64>().ok())
+    {
+        return max.clamp(64 << 10, 1 << 30);
+    }
+    4 << 20
+}
+
+/// Bytes a plain PUT's body is read from its file in: the connection takes
+/// the next one once it has room for it. 1 GiB over loopback went up in
+/// 0.48 s in 256 KiB pieces, 0.51 s in 64 KiB ones (medians of 8, local,
+/// indicative).
+const UPLOAD_PIECE: usize = 256 << 10;
+
+/// How far a plain PUT has got: the bytes of its body the connection has
+/// taken, and when it took the last of them.
+struct Sent {
+    size: u64,
+    /// The most the connection takes of a body no one reads: a send buffer,
+    /// the HTTP client's own of a few hundred KB, and the server's window.
+    /// Over loopback, 4.0 to 4.5 MB with a 4 MiB send buffer (local,
+    /// indicative).
+    held: u64,
+    /// While the body is going, the most a slow server reads before the
+    /// connection takes more: Linux wakes a writer once a third of its full
+    /// send buffer is free, and this is half of it. Over loopback the
+    /// connection took nothing for 1,300 s from a server reading 1 KB a
+    /// second, then 1.5 MB at once (local, indicative).
+    room: u64,
+    start: Instant,
+    taken: std::sync::atomic::AtomicU64,
+    /// Milliseconds after `start`.
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl Sent {
+    /// For a body of `size` bytes, over sockets whose send buffer grows to
+    /// `buffer` bytes ([`send_buffer_max`]).
+    fn new(size: u64, buffer: u64) -> Self {
+        Sent {
+            size,
+            held: buffer + (4 << 20),
+            room: buffer / 2,
+            start: Instant::now(),
+            taken: Default::default(),
+            last: Default::default(),
+        }
+    }
+
+    fn took(&self, n: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.taken.fetch_add(n, Relaxed);
+        self.last
+            .store(self.start.elapsed().as_millis() as u64, Relaxed);
+    }
+
+    /// What the server may not have read yet once `taken` bytes have gone:
+    /// while the body is going, what it reads before the connection takes
+    /// more (`room`); after the last byte, all of it, up to `held`.
+    fn unread(&self, taken: u64) -> u64 {
+        if taken < self.size {
+            taken.min(self.room)
+        } else {
+            taken.min(self.held)
+        }
+    }
+
+    /// The server's pace, in bytes a second, once `taken` bytes have gone,
+    /// the last at `last`: known once more has gone than the sockets hold,
+    /// for the rest it has read; never taken for less than [`UPLOAD_FLOOR`].
+    fn pace(&self, taken: u64, last: std::time::Duration) -> f64 {
+        let read = taken.saturating_sub(self.held) as f64 / last.as_secs_f64().max(1e-3);
+        read.max(UPLOAD_FLOOR)
+    }
+
+    /// How long the server may take nothing once `taken` bytes have gone, the
+    /// last at `last`: `wait`, and the time [`Sent::unread`] needs at its
+    /// [`Sent::pace`].
+    fn allowed(&self, taken: u64, last: std::time::Duration, wait: std::time::Duration) -> f64 {
+        wait.as_secs_f64() + self.unread(taken) as f64 / self.pace(taken, last)
+    }
+
+    /// Resolves, with what to say, once the server has taken nothing for
+    /// longer than [`Sent::allowed`]: while the body is going, or after its
+    /// last byte, waiting for the answer. Every `every` seconds (0: never) of
+    /// a long upload, says how far it has got.
+    async fn watch(&self, dest: &str, wait: std::time::Duration, every: f64) -> String {
+        use std::io::Write;
+        use std::sync::atomic::Ordering::Relaxed;
+        let tick = (wait / 8).clamp(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
+        );
+        let mut said = 0.0;
+        loop {
+            tokio::time::sleep(tick).await;
+            let taken = self.taken.load(Relaxed);
+            let last = std::time::Duration::from_millis(self.last.load(Relaxed));
+            let now = self.start.elapsed().as_secs_f64();
+            let idle = now - last.as_secs_f64();
+            let allowed = self.allowed(taken, last, wait);
+            let sent = format!("{} of {}", human(taken), human(self.size));
+            if idle > allowed {
+                let why = format!(
+                    "compara gives up on a server taking less than {} KB/s (it waited {} s, \
+                     and the time {} takes at {}/s)",
+                    UPLOAD_FLOOR / 1024.0,
+                    wait.as_secs_f64(),
+                    human(self.unread(taken)),
+                    human(self.pace(taken, last) as u64)
+                );
+                let then = "try again later, or wait longer with COMPARA_READ_TIMEOUT=<seconds>";
+                return if taken < self.size {
+                    format!(
+                        "the server took nothing for {idle:.0} s with {sent} sent; {why}; {then}"
+                    )
+                } else {
+                    format!(
+                        "no answer {idle:.0} s after the last of {} was sent; {why}; {then}",
+                        human(self.size)
+                    )
+                };
+            }
+            if every > 0.0 && now >= said + every {
+                said = now;
+                let state = if taken < self.size {
+                    format!("{sent} sent")
+                } else {
+                    format!("{} sent, waiting for the answer", human(self.size))
+                };
+                let quiet = if idle >= wait.as_secs_f64() {
+                    format!(", nothing taken for {idle:.0}s of {allowed:.0}s")
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(std::io::stderr(), "{dest}: {state} in {now:.0}s{quiet}");
+            }
+        }
+    }
+}
+
+/// The body of a plain PUT: `file`, `size` bytes of it, read a piece at a
+/// time as the connection takes them, so memory holds a few pieces whatever
+/// the size. Each piece handed over is noted in `sent`.
+fn pieces(
+    mut file: File,
+    size: u64,
+    sent: Arc<Sent>,
+) -> impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static {
+    use std::io::Read;
+    futures::stream::try_unfold(0u64, move |at| {
+        let read = if at >= size {
+            Ok(None)
+        } else {
+            // Read into spare capacity: not zeroed first, as a vec![0; n] is.
+            let want = UPLOAD_PIECE.min((size - at) as usize);
+            let mut piece = Vec::with_capacity(want);
+            match (&mut file).take(want as u64).read_to_end(&mut piece) {
+                Ok(n) if n == want => {
+                    sent.took(n as u64);
+                    Ok(Some((bytes::Bytes::from(piece), at + n as u64)))
+                }
+                Ok(n) => Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("the file ended {} bytes short", size - at - n as u64),
+                )),
+                Err(e) => Err(e),
+            }
+        };
+        std::future::ready(read)
+    })
 }
 
 /// SIGPIPE held back on this thread while it moves bytes over the network.
@@ -1493,10 +1689,7 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
     // A long download says how far it has got, every so often, so a log --
     // a CI job's, a pod's -- shows it moving.
     let started = Instant::now();
-    let every = std::env::var("COMPARA_PROGRESS")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(PROGRESS_EVERY_SECS);
+    let every = progress_every();
     let done = &shared.done;
     let ticker = async {
         if every <= 0.0 {
@@ -1549,9 +1742,16 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
 /// and left the time as it was (local, indicative).
 const WRITES_QUEUED: usize = 0;
 
-/// How often, in seconds, a download in progress says how far it has got
+/// How often, in seconds, a transfer in progress says how far it has got
 /// (`COMPARA_PROGRESS`; 0 for never).
 const PROGRESS_EVERY_SECS: f64 = 10.0;
+
+fn progress_every() -> f64 {
+    std::env::var("COMPARA_PROGRESS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(PROGRESS_EVERY_SECS)
+}
 
 /// One part, pinned to the version of the object the first request saw (its
 /// `etag`, its `size`): a part of a later version fails rather than lands
@@ -1947,13 +2147,23 @@ fn plain(text: &str) -> String {
 /// A client to read with, which waits [`read_timeout`] for the server's
 /// answer and then for each piece of it, or to upload with, which does not:
 /// that wait runs from the request's first byte to its answer, and a large
-/// body takes longer than that to send.
+/// body takes longer than that to send. An upload is watched instead
+/// ([`Sent`]), and sets no TCP_USER_TIMEOUT: the client's own 30 s ends a
+/// connection whose server has kept its receive window shut that long in
+/// all, reading or not -- one reading 1 KB a second was cut off at 30 s,
+/// and with 90 and 150 s at 91 and 151 s, its window opening on the way
+/// (Linux 6.18, loopback; local, indicative).
 fn http_client(reading: bool) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(concat!("compara/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(30));
     if reading {
         builder = builder.read_timeout(read_timeout());
+    } else {
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        {
+            builder = builder.tcp_user_timeout(None);
+        }
     }
     if link_local_allowed() {
         builder = builder.dns_resolver(Arc::new(System));
@@ -2499,6 +2709,60 @@ mod tests {
         for huge in ["1e300", "inf"] {
             assert_eq!(read_timeout_from(Some(huge)), Duration::from_secs(86_400));
         }
+    }
+
+    #[test]
+    fn an_upload_is_waited_for_as_long_as_16_kb_a_second_would_need() {
+        use std::time::Duration;
+        let wait = Duration::from_secs(30);
+        let at = Duration::from_millis(10);
+        // A 4 MiB send buffer: up to 8 MiB held, 2 MiB to free.
+        let buffer = 4 << 20;
+        // All of a small body gone at once: the server may be reading all
+        // of it at 16 KB/s before it answers.
+        let small = Sent::new(400 << 10, buffer);
+        assert_eq!(small.allowed(400 << 10, at, wait), 30.0 + 25.0);
+        // Under way, it may read what the sockets must free, at that pace,
+        // before the connection takes more -- however much it took at once.
+        let big = Sent::new(40 << 20, buffer);
+        assert_eq!(big.allowed(1 << 20, at, wait), 30.0 + 64.0);
+        assert_eq!(big.allowed(9 << 19, at, wait), 30.0 + 128.0);
+        // At the end, what the sockets hold, up to 8 MiB, at the pace it has
+        // shown -- or 16 KB/s, if slower.
+        let slow = Duration::from_secs(100_000);
+        assert_eq!(big.allowed(40 << 20, slow, wait), 30.0 + 512.0);
+        let fast = big.allowed(40 << 20, Duration::from_millis(30), wait);
+        assert!(fast > 30.0 && fast < 30.01, "{fast}");
+    }
+
+    #[test]
+    fn an_upload_body_is_the_file_in_pieces_each_noted() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("compara-pieces-{}", std::process::id()));
+        let bytes: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let read = |size: u64| {
+            let sent = Arc::new(Sent::new(size, 4 << 20));
+            let body = pieces(File::open(&path).unwrap(), size, sent.clone());
+            let got: std::io::Result<Vec<bytes::Bytes>> =
+                runtime("test").unwrap().block_on(body.try_collect());
+            (got, sent.taken.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        let (got, taken) = read(bytes.len() as u64);
+        let got = got.unwrap();
+        let lens: Vec<usize> = got.iter().map(|b| b.len()).collect();
+        assert_eq!(lens, [262_144, 262_144, 75_712]);
+        assert_eq!(got.concat(), bytes);
+        assert_eq!(taken, bytes.len() as u64);
+        // A file shorter than its size said is an error, not a short body.
+        let (got, taken) = read(bytes.len() as u64 + 10);
+        let e = got.unwrap_err();
+        assert!(e.to_string().contains("ended 10 bytes short"), "{e}");
+        assert_eq!(taken, 524_288);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

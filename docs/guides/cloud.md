@@ -62,3 +62,8 @@ aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
   (`COMPARA_READ_TIMEOUT`); a slow one that keeps sending is waited for.
 - **Outputs go up** in one request, or as a multipart upload for a large
   export. `--json -` prints the summary on stdout and the counts on stderr.
+  A plain `http(s)://` PUT is sent from the file as the server takes it; a
+  server that stops taking it, or never answers, is an error after 30 s
+  (`COMPARA_READ_TIMEOUT`) and the time what it may still be reading would
+  take at 16 KB/s: a server taking it at 16 KB/s or more is waited for,
+  and the error names that floor.

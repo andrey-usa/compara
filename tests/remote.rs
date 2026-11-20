@@ -816,8 +816,8 @@ fn a_stalled_server_is_asked_again_and_a_slow_one_waited_for() {
 
 /// Files for the PUT tests, in a directory the object server serves: `a.csv`
 /// with no rows, so that `compare a.csv <b> -k id --export-dir URL` sends
-/// B's rows first, as `added.csv`; `small.csv` (6.6 KB of rows) and
-/// `big.csv` (8.4 MB).
+/// B's rows first, as `added.csv`; `small.csv` (6.6 KB of rows),
+/// `medium.csv` (205 KB) and `big.csv` (8.4 MB).
 fn put_fixture() -> Dir {
     let dir =
         Dir(std::env::temp_dir().join(format!("compara-put-{}-{}", std::process::id(), id())));
@@ -831,18 +831,20 @@ fn put_fixture() -> Dir {
         text
     };
     std::fs::write(dir.0.join("small.csv"), rows(160)).unwrap();
+    std::fs::write(dir.0.join("medium.csv"), rows(5_000)).unwrap();
     std::fs::write(dir.0.join("big.csv"), rows(200_000)).unwrap();
     dir
 }
 
 /// `compare a.csv <b> -k id --export-dir URL`, the object server failing
-/// every PUT with `mode`, within a minute: the exit, the error, the file the
-/// server wrote, how long it took, and the URL.
+/// every PUT with `mode` (and `extra` arguments), within a minute: the exit,
+/// the error, the file the server wrote, how long it took, and the URL.
 fn put_export(
     root: &Dir,
     b: &str,
     mode: &str,
     timeout: &str,
+    extra: &[&str],
 ) -> (
     std::process::ExitStatus,
     String,
@@ -852,7 +854,11 @@ fn put_export(
 ) {
     let server = Server::start(
         &root.0,
-        &["--fault", mode, "--fault-puts", "--fault-every", "1"],
+        &[
+            &["--fault", mode, "--fault-puts", "--fault-every", "1"],
+            extra,
+        ]
+        .concat(),
     )
     .unwrap();
     let name = format!("{mode}{}", id());
@@ -891,7 +897,7 @@ fn a_put_whose_connection_the_server_closes_is_an_error() {
     // The write that meets the reset fails with ECONNRESET or, after it,
     // with EPIPE, which raised the SIGPIPE: most runs, not all, so four.
     for mode in ["reset", "reset", "reset", "reset", "drop"] {
-        let (status, err, _, _, dest) = put_export(&root, "big.csv", mode, "1");
+        let (status, err, _, _, dest) = put_export(&root, "big.csv", mode, "1", &[]);
         // Not a signal.
         assert_eq!(status.code(), Some(2), "{mode}: {status:?} {err}");
         assert!(
@@ -899,6 +905,63 @@ fn a_put_whose_connection_the_server_closes_is_an_error() {
             "{mode}: {err}"
         );
     }
+}
+
+/// A plain PUT to a server that stops -- never reading it, or reading it all
+/// and never answering -- ends in an error that names the URL, says what
+/// happened, the pace it gives up below and what to do, within the read
+/// timeout and the time the body would take at 16 KB/s, where it had waited
+/// for good. One reading 32 KB a second is waited for, and has the whole
+/// file; one reading 1 KB a second is given up on, and told why.
+#[test]
+fn a_put_to_a_stopped_server_ends_and_a_slow_one_is_waited_for() {
+    if python().is_none() {
+        eprintln!("skipping: no python to run the object server");
+        return;
+    }
+    let root = put_fixture();
+    let local = root.0.join("local");
+    let status = Command::new(env!("CARGO_BIN_EXE_compara"))
+        .arg("compare")
+        .arg(root.0.join("a.csv"))
+        .arg(root.0.join("medium.csv"))
+        .args(["-k", "id", "--export-dir"])
+        .arg(&local)
+        .output()
+        .unwrap()
+        .status;
+    assert_eq!(status.code(), Some(1));
+    let want = std::fs::read(local.join("added.csv")).unwrap();
+    assert!(want.len() > 200_000, "{}", want.len());
+    let floor = "compara gives up on a server taking less than 16 KB/s";
+
+    for mode in ["silent", "stall"] {
+        let (status, err, _, took, dest) = put_export(&root, "small.csv", mode, "1", &[]);
+        assert_eq!(status.code(), Some(2), "{mode}: {status:?} {err}");
+        assert!(
+            err.contains(&format!("cannot write {dest}added.csv")),
+            "{mode}: {err}"
+        );
+        assert!(
+            err.contains("no answer")
+                && err.contains(floor)
+                && err.contains("COMPARA_READ_TIMEOUT"),
+            "{mode}: {err}"
+        );
+        // 1 s, and 6.6 KB at 16 KB/s.
+        assert!(took.as_secs() < 20, "{mode}: {took:?}");
+    }
+    // 205 KB at 32 KB a second: about 7 s, seven times the timeout.
+    let (status, err, written, took, _) =
+        put_export(&root, "medium.csv", "dribble", "1", &["--rate", "32768"]);
+    assert_eq!(status.code(), Some(1), "32 KB/s: {status:?} {err}");
+    assert_eq!(written.as_deref(), Some(&want[..]), "32 KB/s: {err}");
+    assert!(took.as_secs() >= 5, "{took:?}");
+    // 6.6 KB at 1 KB a second, under the floor.
+    let (status, err, _, took, _) = put_export(&root, "small.csv", "dribble", "1", &[]);
+    assert_eq!(status.code(), Some(2), "1 KB/s: {status:?} {err}");
+    assert!(err.contains(floor), "1 KB/s: {err}");
+    assert!(took.as_secs() < 6, "1 KB/s: {took:?}");
 }
 
 /// The first request, for the end of the object, is asked again when its

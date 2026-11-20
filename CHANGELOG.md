@@ -99,6 +99,22 @@ All notable changes to this project are documented here. The format follows
   they do after any failure, and their reads no longer stop at five minutes
   a request, which cut off an 8 MB part on a link under 28 KB/s. A server
   sending 1 KB a second is waited for.
+- A plain `http(s)://` PUT -- an output to a presigned URL -- had no time
+  limit: a server that took the connection and then stopped, reading
+  nothing, or reading it all and never answering, held compara for good;
+  and one reading slowly was cut off after 30 s, by the HTTP client's
+  TCP_USER_TIMEOUT, whose count runs on while a receiver's window opens and
+  shuts again. The body is now read from the file as it goes (it was read
+  into memory whole: 1 GiB more held during the upload), and the upload
+  ends once the server has taken nothing for 30 s (`COMPARA_READ_TIMEOUT`)
+  and the time what it may still be reading would take at 16 KB/s, the
+  slowest pace waited for: compara sees only what the sockets take, and
+  they hold megabytes, so a stopped server and a slow one look the same
+  until then. The error says what happened, that compara gives up on a
+  server taking less than 16 KB/s, and what to do. Over loopback (local,
+  indicative): a 19 KB body to a server that never answers, no end to
+  33 s; 398 KB never read, 30 s to 56 s; 398 KB read at 32 KB/s, done in
+  12 s; at 1 KB/s, cut off at 30 s before and at 55 s now, the floor named.
 - An output to a URL whose server reset the connection under a body of
   megabytes killed compara with SIGPIPE, exit 141 and no message (SIGPIPE's
   default, restored so that `compara head | head -1` ends quietly, caught

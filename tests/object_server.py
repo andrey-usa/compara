@@ -27,8 +27,9 @@ it before answering; `overlong` sends 1,000 bytes past the range asked, its
 Content-Length saying so; `dribble` sends the body 1 KB a second. With
 --fault-puts the fault hits PUTs instead, counted the same way: `silent`
 reads nothing and never answers; `stall` reads the body and never answers;
-`dribble` reads it 1 KB a second, then answers; `drop` reads half of it and
-closes the connection; `reset` closes it before reading.
+`dribble` reads it 1 KB at a time, --rate bytes a second (1024), then
+answers; `drop` reads half of it and closes the connection; `reset` closes
+it before reading.
 
 Prints `LISTENING <url>` once it is ready.
 """
@@ -64,6 +65,7 @@ def main() -> None:
     ap.add_argument("--fault-at", type=int, default=0)
     ap.add_argument("--fault-every", type=int, default=0)
     ap.add_argument("--fault-puts", action="store_true", help="the fault hits PUTs, not ranged GETs")
+    ap.add_argument("--rate", type=int, default=1024, help="a dribbled PUT's bytes a second")
     args = ap.parse_args()
     lock = threading.Lock()
     gets = [0]
@@ -308,7 +310,7 @@ def main() -> None:
                     if not piece:
                         break
                     data += piece
-                    time.sleep(1)
+                    time.sleep(1024 / args.rate)
             else:
                 data = self.body()
             if fault == "stall":
