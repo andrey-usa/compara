@@ -17,8 +17,8 @@ All notable changes to this project are documented here. The format follows
 - In a container (or under `ulimit -d`), a pair whose key indexes
   cannot fit the heap goes to the sortmerge engine once its rows
   are counted, instead of after building indexes it then throws away:
-  10M rows a side under a 512 MB limit, 27.6 s to 18.7 s (local, cold
-  cache, median of three interleaved rounds). The note says how much the
+  10M rows a side under a 512 MB limit, 52.8 s to 35.9 s ([run 44738688220](https://github.com/andrey-usa/compara/actions/runs/44738688220),
+  cold cache, median of five interleaved rounds against 0.7.0). The note says how much the
   indexes need. Where they fit, nothing changes, also when one file's rows
   are much longer than the other's.
 - A JSON file is refused for what comparing it would cost, not for its
@@ -29,8 +29,10 @@ All notable changes to this project are documented here. The format follows
   refusal says how many cells, and names `--compare`.
 - `-c` (or `-i`, `-k`) naming many columns is checked against the files'
   headers by lookup, not a search per name: comparing a sparse JSON table
-  with `-c` naming all 20,000 of its columns took 2.1-2.3 s and now takes
-  0.5-0.6 s (local, indicative).
+  with `-c` naming all 20,000 of its columns took 0.87 s and now takes
+  0.26 s ([run 44738688220](https://github.com/andrey-usa/compara/actions/runs/44738688220), 200,000 objects of 2 keys each, warm cache,
+  median of five, against the build before the lookup: 0.7.0 refuses that
+  table).
 
 ### Fixed
 
@@ -124,9 +126,10 @@ All notable changes to this project are documented here. The format follows
   to one budget for the file, shared by every thread reading it: 64 MB,
   or a quarter of `--memory` (or of the heap limit) when that is less.
   Each thread had 64 MB of its own and held each name twice, so a file of
-  long keys took 200 MB of peak RSS at `--threads 1` and 739 MB at 4
-  before it was refused, whatever `--memory` said; now 137 and 146 MB,
-  and under `--memory 64M` it is refused at 40-51 MB (local, indicative).
+  long keys took 200 MB of peak RSS at `--threads 1` and 780 MB at 4
+  before it was refused, whatever `--memory` said; now 137 and 149 MB,
+  and under `--memory 64M` it is refused at 41-52 MB ([run 44738688220](https://github.com/andrey-usa/compara/actions/runs/44738688220), 300
+  names of 1 MB, warm cache, median of five against 0.7.0).
   Whether a file's names fit is the same at every thread count: names
   that every thread's piece meets are counted once, not once a piece.
 - A JSON key with no value (`"zz":}`, `"q":,`) or no colon names no
