@@ -39,6 +39,12 @@
 //! thread to be set up before going on: looking alone left a burst of lanes,
 //! each counted against room the one before had not taken yet, and the fused
 //! join on a 200,000-row pair still aborted at 17 of 752 limits scanned.
+//! Nor is the thread that starts one the only one taking room: while a lane
+//! is being set up, its siblings already at work, or the fused join's index
+//! build on the main thread, could take it: the fused join still aborted in
+//! 8 of 690 runs at the limits where it had aborted before. So while any
+//! thread is being set up, every other thread's allocation waits for it (see
+//! [`wait_for_set_up`]).
 
 use std::thread::{Builder, Scope, ScopedJoinHandle};
 
@@ -70,6 +76,80 @@ fn fits() -> Option<bool> {
     Some(used.saturating_add(stack_size()).saturating_add(SET_UP) <= limit)
 }
 
+/// Threads started under a heap limit and not yet set up; while there are
+/// any, other threads' allocations wait (see [`wait_for_set_up`]).
+static SETTING_UP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// Whether this thread is starting one: its own allocations, for the new
+    /// thread's handle and closure, do not wait for the set-up they precede.
+    static STARTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How long an allocation waits for a set-up at most. A set-up is a few
+/// system calls, tens of microseconds; this is for a thread the scheduler has
+/// not run yet on a busy machine. Past it the allocation goes ahead, as it
+/// would have without the wait.
+const SET_UP_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Called by the global allocator ([`crate::hugepages`]) before every
+/// allocation: returns at once unless a thread is being set up under a heap
+/// limit, and then waits until it is. The room [`fits`] counted for the new
+/// thread is taken by the thread itself and not by another's allocation in
+/// the meantime -- a refused allocation is a clear error, a refused set-up is
+/// the abort.
+///
+/// Only allocations through the global allocator wait; the C library's own
+/// and raw mappings do not, and the thread starting a new one does not wait
+/// for its own.
+#[inline]
+pub fn wait_for_set_up() {
+    if SETTING_UP.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        wait_for_set_up_slowly();
+    }
+}
+
+#[cold]
+fn wait_for_set_up_slowly() {
+    // `try_with`: during this thread's own teardown the flag is gone, and an
+    // allocation then has nothing to wait for that it could not race anyway.
+    if STARTING.try_with(std::cell::Cell::get).unwrap_or(true) {
+        return;
+    }
+    let since = std::time::Instant::now();
+    while SETTING_UP.load(std::sync::atomic::Ordering::Acquire) != 0
+        && since.elapsed() < SET_UP_WAIT
+    {
+        std::thread::yield_now();
+    }
+}
+
+/// This thread, starting another under a heap limit: counted in
+/// [`SETTING_UP`] from before the room is looked at until the new thread says
+/// it is set up ([`SetUp::finished`]) or is not started after all
+/// ([`Starting::not_started`]).
+struct Starting {
+    was: bool,
+}
+
+impl Starting {
+    fn begin() -> Self {
+        let was = STARTING.replace(true);
+        SETTING_UP.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Starting { was }
+    }
+
+    fn not_started(&self) {
+        SETTING_UP.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        STARTING.set(self.was);
+    }
+}
+
 /// What a refused thread is: a bare kind, since an error with a message
 /// would allocate, at the limit.
 fn refused() -> std::io::Error {
@@ -94,6 +174,7 @@ impl SetUp {
     }
 
     fn finished(&self) {
+        SETTING_UP.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         self.done.store(true, std::sync::atomic::Ordering::Release);
         self.starter.unpark();
     }
@@ -137,16 +218,28 @@ where
     F: FnOnce() -> T + Send + 's,
     T: Send + 's,
 {
+    if crate::memory::heap_limit().is_none() {
+        return Builder::new().spawn_scoped(scope, f);
+    }
+    let starting = Starting::begin();
     match fits() {
-        None => Builder::new().spawn_scoped(scope, f),
-        Some(false) => Err(refused()),
+        None => {
+            starting.not_started();
+            Builder::new().spawn_scoped(scope, f)
+        }
+        Some(false) => {
+            starting.not_started();
+            Err(refused())
+        }
         Some(true) => {
             let set_up = SetUp::new();
             let theirs = std::sync::Arc::clone(&set_up);
-            let handle = Builder::new().spawn_scoped(scope, move || {
-                theirs.finished();
-                f()
-            })?;
+            let handle = Builder::new()
+                .spawn_scoped(scope, move || {
+                    theirs.finished();
+                    f()
+                })
+                .inspect_err(|_| starting.not_started())?;
             set_up.wait();
             Ok(handle)
         }
@@ -160,16 +253,28 @@ where
     T: Send + 'static,
 {
     let named = Builder::new().name(name.into());
+    if crate::memory::heap_limit().is_none() {
+        return named.spawn(f);
+    }
+    let starting = Starting::begin();
     match fits() {
-        None => named.spawn(f),
-        Some(false) => Err(refused()),
+        None => {
+            starting.not_started();
+            named.spawn(f)
+        }
+        Some(false) => {
+            starting.not_started();
+            Err(refused())
+        }
         Some(true) => {
             let set_up = SetUp::new();
             let theirs = std::sync::Arc::clone(&set_up);
-            let handle = named.spawn(move || {
-                theirs.finished();
-                f()
-            })?;
+            let handle = named
+                .spawn(move || {
+                    theirs.finished();
+                    f()
+                })
+                .inspect_err(|_| starting.not_started())?;
             set_up.wait();
             Ok(handle)
         }
@@ -279,6 +384,37 @@ mod tests {
     fn an_already_finished_task_joins() {
         let t: Task<'_, u32> = Task::Done(7);
         assert_eq!(t.join().unwrap(), 7);
+    }
+
+    /// While a thread is being set up, another thread's allocation waits until
+    /// it is, and the thread starting it does not wait for its own.
+    #[test]
+    fn an_allocation_waits_for_a_thread_being_set_up() {
+        use std::time::{Duration, Instant};
+        let (counted, count) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let starter = std::thread::spawn(move || {
+            let starting = Starting::begin();
+            let at = Instant::now();
+            wait_for_set_up();
+            let own = at.elapsed();
+            counted.send(()).unwrap();
+            released.recv().unwrap();
+            starting.not_started();
+            own
+        });
+        count.recv().unwrap();
+        let at = Instant::now();
+        let waiter = std::thread::spawn(move || {
+            wait_for_set_up();
+            at.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        release.send(()).unwrap();
+        let waited = waiter.join().unwrap();
+        assert!(starter.join().unwrap() < Duration::from_millis(40));
+        assert!(waited >= Duration::from_millis(50), "{waited:?}");
+        assert!(waited < SET_UP_WAIT, "{waited:?}");
     }
 
     /// A thread the OS starts but that has no room left to set itself up runs

@@ -55,8 +55,11 @@ fn advise(_: *mut u8, _: usize) {}
 /// Calls `attempt` again after giving back a chunk of the reserve, while it
 /// fails, the request is one the reserve is for and any of it is left (see
 /// [`crate::alloc::release_reserve`]). A null is passed through otherwise.
+/// While a new thread is being set up under a heap limit, waits for that
+/// first ([`crate::parallel::wait_for_set_up`]).
 #[inline]
 fn retried(size: usize, mut attempt: impl FnMut() -> *mut u8) -> *mut u8 {
+    crate::parallel::wait_for_set_up();
     let mut p = attempt();
     while p.is_null() && crate::alloc::reserve_covers(size) && crate::alloc::release_reserve() {
         p = attempt();
