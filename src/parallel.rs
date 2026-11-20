@@ -24,8 +24,86 @@
 //! [`crate::engine`]'s sweep: *a thread that cannot be spawned is not a failure,
 //! it is the same work, done here*. That was a comment describing something the
 //! code did not do. This module is the part that does it.
+//!
+//! A spawn the OS grants can still take the process down. Before a new thread
+//! runs anything, the runtime maps it an alternate signal stack (for the
+//! message a stack overflow prints), and when that mapping is refused it
+//! aborts: exit 134, "failed to allocate an alternative stack", with no error
+//! the caller could see. The stack itself needs no new memory when the C
+//! library hands back a cached one from a finished thread, so the spawn
+//! succeeds after a comparison has taken the last of its heap -- measured,
+//! a 2M-row JSON pair at a `ulimit -d` anywhere in a 44 KB band aborted on
+//! every run. So [`spawn_scoped`] looks first: under a heap limit, a thread is
+//! started only when a stack and its setting-up still fit under it, and
+//! otherwise it is refused the way the OS refuses one. It then waits for the
+//! thread to be set up before going on: looking alone left a burst of lanes,
+//! each counted against room the one before had not taken yet, and the fused
+//! join on a 200,000-row pair still aborted at 17 of 752 limits scanned.
 
 use std::thread::{Builder, Scope, ScopedJoinHandle};
+
+/// What a new thread maps for itself besides its stack before its work
+/// starts: the alternate signal stack (16 KB here, more where the CPU's
+/// signal frame is larger), the C library's first heap for the thread
+/// (132 KB), and the page or two of slack the stack mapping carries.
+const SET_UP: u64 = 256 << 10;
+
+/// The stack a thread gets from [`Builder::new`]: `RUST_MIN_STACK`, read as
+/// the runtime reads it, or the runtime's 2 MB.
+fn stack_size() -> u64 {
+    static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var_os("RUST_MIN_STACK")
+            .and_then(|s| s.to_str()?.parse().ok())
+            .unwrap_or(2 << 20)
+    })
+}
+
+/// Whether a new thread fits under the heap limit: room for a stack and its
+/// [`SET_UP`]; `None` without a limit (or where what is in use cannot be
+/// read). Whether the C library has a stack cached is not knowable from here,
+/// so one is always counted; near the limit that refuses a thread a little
+/// early, which costs a core and not an answer.
+fn fits() -> Option<bool> {
+    let limit = crate::memory::heap_limit()?;
+    let used = crate::memory::data_in_use()?;
+    Some(used.saturating_add(stack_size()).saturating_add(SET_UP) <= limit)
+}
+
+/// What a refused thread is: a bare kind, since an error with a message
+/// would allocate, at the limit.
+fn refused() -> std::io::Error {
+    std::io::ErrorKind::OutOfMemory.into()
+}
+
+/// A new thread's word that the runtime has set it up -- its signal stack,
+/// its first heap -- and its work has begun. Until then the thread that
+/// started it waits, so that neither its own next allocation nor the next
+/// thread's check takes the room that set-up was counted on.
+struct SetUp {
+    done: std::sync::atomic::AtomicBool,
+    starter: std::thread::Thread,
+}
+
+impl SetUp {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(SetUp {
+            done: std::sync::atomic::AtomicBool::new(false),
+            starter: std::thread::current(),
+        })
+    }
+
+    fn finished(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.starter.unpark();
+    }
+
+    fn wait(&self) {
+        while !self.done.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::park();
+        }
+    }
+}
 
 /// Work that is either running on its own thread or already finished.
 pub enum Task<'s, T> {
@@ -46,6 +124,58 @@ impl<'s, T> Task<'s, T> {
     }
 }
 
+/// [`Builder::spawn_scoped`], refused up front when there is no room for the
+/// thread under the heap limit, as the OS would have refused it. Under a
+/// limit, returns once the thread is set up (see [`SetUp`]). Every thread here
+/// is started through it or [`spawn_named`]; a refusal is handled where it
+/// already was, by doing the work on the calling thread.
+pub fn spawn_scoped<'s, 'e, T, F>(
+    scope: &'s Scope<'s, 'e>,
+    f: F,
+) -> std::io::Result<ScopedJoinHandle<'s, T>>
+where
+    F: FnOnce() -> T + Send + 's,
+    T: Send + 's,
+{
+    match fits() {
+        None => Builder::new().spawn_scoped(scope, f),
+        Some(false) => Err(refused()),
+        Some(true) => {
+            let set_up = SetUp::new();
+            let theirs = std::sync::Arc::clone(&set_up);
+            let handle = Builder::new().spawn_scoped(scope, move || {
+                theirs.finished();
+                f()
+            })?;
+            set_up.wait();
+            Ok(handle)
+        }
+    }
+}
+
+/// [`std::thread::Builder::spawn`] of a named thread, the same way.
+pub fn spawn_named<T, F>(name: &str, f: F) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let named = Builder::new().name(name.into());
+    match fits() {
+        None => named.spawn(f),
+        Some(false) => Err(refused()),
+        Some(true) => {
+            let set_up = SetUp::new();
+            let theirs = std::sync::Arc::clone(&set_up);
+            let handle = named.spawn(move || {
+                theirs.finished();
+                f()
+            })?;
+            set_up.wait();
+            Ok(handle)
+        }
+    }
+}
+
 /// `f` on a scoped thread, or on this one if the OS refuses.
 ///
 /// `f` is taken by reference and must be `Fn`, because the fallback has to be
@@ -60,7 +190,7 @@ where
     F: Fn() -> T + Sync + 's,
     T: Send + 's,
 {
-    match Builder::new().spawn_scoped(scope, f) {
+    match spawn_scoped(scope, f) {
         Ok(h) => Task::Running(h),
         Err(_) => Task::Done(f()),
     }
@@ -72,7 +202,7 @@ where
     F: Fn(usize) -> T + Sync + 's,
     T: Send + 's,
 {
-    match Builder::new().spawn_scoped(scope, move || f(part)) {
+    match spawn_scoped(scope, move || f(part)) {
         Ok(h) => Task::Running(h),
         Err(_) => Task::Done(f(part)),
     }

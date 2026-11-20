@@ -796,7 +796,7 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
         std::thread::scope(|scope| {
             for (p, chunk) in hs.chunks_mut(per).enumerate() {
                 let go = move || hash_rows(as_id, s, p * per, chunk, opt);
-                if std::thread::Builder::new().spawn_scoped(scope, go).is_err() {
+                if crate::parallel::spawn_scoped(scope, go).is_err() {
                     break;
                 }
                 spawned = p + 1;

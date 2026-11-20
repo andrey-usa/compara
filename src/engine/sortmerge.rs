@@ -242,15 +242,14 @@ fn stream_into(
     let (to_spill, batches) = mpsc::sync_channel::<Packed>(0);
     std::thread::scope(|scope| {
         let spill = &spill;
-        let spiller =
-            std::thread::Builder::new().spawn_scoped(scope, move || -> Result<Vec<PathBuf>> {
-                let mut spilled = Vec::new();
-                let mut rowbuf: Vec<u8> = Vec::new();
-                for batch in batches {
-                    spilled.push(spill(&batch, spilled.len(), &mut rowbuf)?);
-                }
-                Ok(spilled)
-            });
+        let spiller = crate::parallel::spawn_scoped(scope, move || -> Result<Vec<PathBuf>> {
+            let mut spilled = Vec::new();
+            let mut rowbuf: Vec<u8> = Vec::new();
+            for batch in batches {
+                spilled.push(spill(&batch, spilled.len(), &mut rowbuf)?);
+            }
+            Ok(spilled)
+        });
         // A thread the OS refuses (a process limit, or a data limit its stack
         // counts against) leaves the batches to be written here, between reads.
         let mut here: Option<(Vec<PathBuf>, Vec<u8>)> =
@@ -440,7 +439,7 @@ impl Ahead {
         // its closure, and the cursor must outlive that.
         let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(inner)));
         let theirs = std::sync::Arc::clone(&slot);
-        let spawned = std::thread::Builder::new().spawn_scoped(scope, move || {
+        let spawned = crate::parallel::spawn_scoped(scope, move || {
             let taken = theirs.lock().unwrap_or_else(|e| e.into_inner()).take();
             let Some(mut inner) = taken else {
                 return;

@@ -685,11 +685,7 @@ fn in_ranges<T: Send>(n: usize, ways: usize, f: impl Fn(Range<usize>) -> T + Syn
     std::thread::scope(|scope| {
         let f = &f;
         let handles: Vec<_> = (1..ways)
-            .map(|p| {
-                std::thread::Builder::new()
-                    .spawn_scoped(scope, move || f(range(p)))
-                    .ok()
-            })
+            .map(|p| crate::parallel::spawn_scoped(scope, move || f(range(p))).ok())
             .collect();
         let mut out = vec![f(range(0))];
         for (p, handle) in (1..ways).zip(handles) {

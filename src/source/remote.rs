@@ -88,12 +88,10 @@ async fn look_up(host: String) -> std::io::Result<Vec<std::net::SocketAddr>> {
     }
     let (sent, found) = futures::channel::oneshot::channel();
     let asked = host.clone();
-    let spawned = std::thread::Builder::new()
-        .name("compara-lookup".into())
-        .spawn(move || {
-            // The receiver is gone if the request was given up meanwhile.
-            let _ = sent.send(find(&asked));
-        });
+    let spawned = crate::parallel::spawn_named("compara-lookup", move || {
+        // The receiver is gone if the request was given up meanwhile.
+        let _ = sent.send(find(&asked));
+    });
     match spawned {
         Ok(_) => match found.await {
             Ok(result) => result,
@@ -821,21 +819,19 @@ async fn send_parts(
             let (to_lane, parts) = futures::channel::mpsc::unbounded::<BoxFuture<'static, ()>>();
             let (ready_tx, ready) = futures::channel::oneshot::channel::<()>();
             let end = end.clone();
-            let spawned = std::thread::Builder::new()
-                .name("compara-upload".into())
-                .spawn(move || {
-                    let _quiet = QuietPipe::new();
-                    // A lane whose runtime cannot start says nothing and
-                    // takes no parts.
-                    if let Ok(rt) = runtime("upload") {
-                        let _ = ready_tx.send(());
-                        rt.block_on(async move {
-                            let work = parts.for_each_concurrent(None, |part| part);
-                            futures::future::select(std::pin::pin!(work), end.clone()).await;
-                            let _ = end.await;
-                        });
-                    }
-                });
+            let spawned = crate::parallel::spawn_named("compara-upload", move || {
+                let _quiet = QuietPipe::new();
+                // A lane whose runtime cannot start says nothing and takes no
+                // parts.
+                if let Ok(rt) = runtime("upload") {
+                    let _ = ready_tx.send(());
+                    rt.block_on(async move {
+                        let work = parts.for_each_concurrent(None, |part| part);
+                        futures::future::select(std::pin::pin!(work), end.clone()).await;
+                        let _ = end.await;
+                    });
+                }
+            });
             match spawned {
                 Ok(thread) => {
                     if ready.await.is_ok() {
@@ -1890,26 +1886,24 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
             let (sent, result) = futures::channel::oneshot::channel::<()>();
             let (lane, stop, go, end) = (shared.clone(), stop.clone(), go.clone(), end.clone());
             let out = Out::Writer(to_writer.clone());
-            let spawned = std::thread::Builder::new()
-                .name("compara-fetch".into())
-                .spawn(move || {
-                    let _quiet = QuietPipe::new();
-                    // A lane whose runtime cannot start takes no parts; the
-                    // others, or this thread, take them.
-                    if let Ok(rt) = runtime("download") {
-                        rt.block_on(async {
-                            if let Ok(width) = go.await {
-                                lane.run(&out, width, stop).await;
-                            }
-                            drop(out);
-                            let _ = sent.send(());
-                            let _ = end.await;
-                        });
-                    } else {
+            let spawned = crate::parallel::spawn_named("compara-fetch", move || {
+                let _quiet = QuietPipe::new();
+                // A lane whose runtime cannot start takes no parts; the
+                // others, or this thread, take them.
+                if let Ok(rt) = runtime("download") {
+                    rt.block_on(async {
+                        if let Ok(width) = go.await {
+                            lane.run(&out, width, stop).await;
+                        }
                         drop(out);
                         let _ = sent.send(());
-                    }
-                });
+                        let _ = end.await;
+                    });
+                } else {
+                    drop(out);
+                    let _ = sent.send(());
+                }
+            });
             match spawned {
                 Ok(thread) => others.push((thread, result)),
                 Err(_) => break,

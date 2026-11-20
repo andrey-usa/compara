@@ -157,6 +157,13 @@ pub fn heap_limit() -> Option<u64> {
     rlimit::data()
 }
 
+/// What [`heap_limit`] is measured against: this process's private writable
+/// mappings -- heap, buffers, thread stacks -- in bytes, as the kernel counts
+/// them (`VmData`). `None` where that cannot be read.
+pub fn data_in_use() -> Option<u64> {
+    rlimit::data_in_use()
+}
+
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod rlimit {
     use std::ffi::c_int;
@@ -205,6 +212,41 @@ mod rlimit {
         // privilege.
         (unsafe { setrlimit(RLIMIT_DATA, &new) } == 0).then_some(want)
     }
+
+    /// `VmData` from `/proc/self/status`, read into a buffer on the stack: it
+    /// is asked when the heap may be full, so asking must not need any of it.
+    /// The line is in the first kilobyte; four leave room for a longer file.
+    pub fn data_in_use() -> Option<u64> {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        let mut file = std::fs::File::open("/proc/self/status").ok()?;
+        let mut len = 0;
+        while len < buf.len() {
+            match file.read(&mut buf[len..]) {
+                Ok(0) => break,
+                Ok(n) => len += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return None,
+            }
+        }
+        vm_data(&buf[..len])
+    }
+
+    /// The `VmData` line of a `/proc/<pid>/status`, in bytes.
+    pub fn vm_data(text: &[u8]) -> Option<u64> {
+        const KEY: &[u8] = b"\nVmData:";
+        let at = text.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
+        let mut digits = text[at..]
+            .iter()
+            .skip_while(|b| b.is_ascii_whitespace())
+            .take_while(|b| b.is_ascii_digit())
+            .peekable();
+        digits.peek()?;
+        let kb = digits.try_fold(0u64, |n, &d| {
+            n.checked_mul(10)?.checked_add(u64::from(d - b'0'))
+        })?;
+        kb.checked_mul(1024)
+    }
 }
 
 #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
@@ -214,6 +256,10 @@ mod rlimit {
     }
 
     pub fn data() -> Option<u64> {
+        None
+    }
+
+    pub fn data_in_use() -> Option<u64> {
         None
     }
 }
@@ -569,5 +615,20 @@ mod tests {
         let m = probe().expect("no memory reading on this platform");
         assert!(m.limit > 0 && m.available > 0);
         assert!(m.available <= m.limit);
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn vm_data_is_read_from_its_line() {
+        let status = b"Name:\tcompara\nVmPeak:\t  999 kB\nVmData:\t  118536 kB\nVmStk:\t 132 kB\n";
+        assert_eq!(rlimit::vm_data(status), Some(118_536 * 1024));
+        assert_eq!(rlimit::vm_data(b"Name:\tx\nVmStk:\t 132 kB\n"), None);
+        assert_eq!(rlimit::vm_data(b"Name:\tx\nVmData:\t kB\n"), None);
+        assert_eq!(
+            rlimit::vm_data(b"Name:\tx\nVmData:\t99999999999999999999 kB\n"),
+            None
+        );
+        // This process has a heap, and reading it needs none.
+        assert!(data_in_use().is_some_and(|b| b > 0));
     }
 }

@@ -535,9 +535,7 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     let (a, b) = std::thread::scope(|scope| {
         // A thread wants a stack, and under a small memory limit there may be
         // none to give: then B is read after A, on this one.
-        let b = std::thread::Builder::new()
-            .spawn_scoped(scope, || Source::open(b_spec, &want))
-            .ok();
+        let b = compara::parallel::spawn_scoped(scope, || Source::open(b_spec, &want)).ok();
         let a = Source::open(a_spec, &want);
         let b = match b {
             Some(h) => h
