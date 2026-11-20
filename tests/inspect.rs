@@ -696,15 +696,16 @@ fn columns_of_a_json_file_are_every_object_s_keys() {
 
 /// A key is a column with its colon and a value, in the first object as in
 /// the later ones, as it is a member to the row parser: one with no value
-/// (`"zz":}`, `"q":,`) is passed over and one with no colon ends the object.
-/// Before, each named a column that was empty in every row.
+/// (`"zz":}`, `"q":,`) is passed over. Before, each named a column that was
+/// empty in every row. One with no colon breaks its object, which the row
+/// parser read only as far as the break: the file is refused.
 #[test]
 fn a_json_key_with_no_value_names_no_column() {
     let f = Fixture::new(1);
     let path = f.path("valueless.ndjson");
     std::fs::write(
         &path,
-        "{\"id\":\"1\",\"q\":,\"p\":\"v\",\"r\"}\n{\"id\":\"2\",\"b\":\"x\"\"zz\":}\n{\"id\":\"3\",\"y\": }\n",
+        "{\"id\":\"1\",\"q\":,\"p\":\"v\"}\n{\"id\":\"2\",\"b\":\"x\"\"zz\":}\n{\"id\":\"3\",\"y\": }\n",
     )
     .unwrap();
     let (code, stdout, stderr) = run(&["columns"], &path);
@@ -712,6 +713,15 @@ fn a_json_key_with_no_value_names_no_column() {
     assert_eq!(stdout, "id\np\nb\n");
     let (_, rows, _) = run(&["head", "--csv"], &path);
     assert_eq!(rows, "id,p,b\n1,v,\n2,,x\n3,,\n");
+    let broken = f.path("colonless.ndjson");
+    std::fs::write(
+        &broken,
+        "{\"id\":\"1\",\"p\":\"v\"}\n{\"id\":\"2\",\"r\"}\n",
+    )
+    .unwrap();
+    let (code, _, stderr) = run(&["columns"], &broken);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("line 2 (\"}\") is not JSON"), "{stderr}");
 }
 
 /// A later object's name written with an escape is the name its escapes

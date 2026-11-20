@@ -426,7 +426,7 @@ fn starts_with_short(data: &[u8], text: &[u8]) -> bool {
 ///
 /// It is also the one walk over every row before the comparison, so it says
 /// where a file is not the JSON it is read as: a row that is not an object,
-/// an object of a framed file it cannot follow to its closing brace, and,
+/// an object it cannot follow to its closing brace, and,
 /// read a line at a time, an object that runs onto the next line (a line
 /// feed in one of its strings included) or has more after it on its own.
 /// The row parser reads each of those as some other number of rows than the
@@ -605,6 +605,7 @@ fn later_keys<const LINES: bool>(
             let key_from = pos + 1;
             let (key_end, escaped) = later_string::<_, LINES>(scan, data, pos, end, &mut lines);
             if key_end > end || key_end <= key_from {
+                pos = end; // the name runs to the end
                 break;
             }
             let key = &data[key_from..key_end - 1];
@@ -725,22 +726,16 @@ fn later_keys<const LINES: bool>(
                 pos = line_end.saturating_add(1);
                 continue;
             }
-            // An object broken before its brace, on its own line: the walk
-            // stopped where the row parser stops reading it, and both go on
-            // at the next line.
-            let next = end_of_json_row(scan, data, pos.min(end), end, false, false);
-            pos = if next > pos || data.get(next) == Some(&b'{') {
-                next
-            } else {
-                pos + 1
-            };
-            continue;
+            // An object broken before its brace: the row parser read it as
+            // far as the break and dropped the rest of its line, members and
+            // key included, so a broken row was a changed row or a keyless one.
+            return Err(not_followed(data, row, pos, false));
         }
         // Framed: the walk stops where the object stops being one it can
         // follow, which is where the splits for threads stop following it
         // too, so the place it names is the same at every thread count.
         if !closed {
-            return Err(not_followed(data, row, pos));
+            return Err(not_followed(data, row, pos, true));
         }
         // Between rows: space, one comma at most, then the next row, the
         // array's own `]`, or the end of this piece (the next starts at a
@@ -1034,11 +1029,11 @@ fn off_its_line(data: &[u8], row: usize) -> Error {
     not_a_row(data, row, "runs onto the next line", false)
 }
 
-/// An object of a framed file the walk could not follow to its closing
-/// brace: stopped at `at`, or at the end of the file.
+/// An object the walk could not follow to its closing brace: stopped at
+/// `at`, or at the end of the file.
 #[cold]
 #[inline(never)]
-fn not_followed(data: &[u8], row: usize, at: usize) -> Error {
+fn not_followed(data: &[u8], row: usize, at: usize, framed: bool) -> Error {
     let (line, shown) = line_and_text(data, row);
     if at >= data.len() {
         return Error::input(format!(
@@ -1047,11 +1042,15 @@ fn not_followed(data: &[u8], row: usize, at: usize) -> Error {
         ));
     }
     let (at_line, at_shown) = line_and_text(data, at);
+    let rows = if framed {
+        "every row of a JSON array or stream of objects is an object"
+    } else {
+        "each line is one object"
+    };
     Error::input(format!(
         "line {at_line} ({at_shown:?}) is not JSON in the object that opens on line {line} \
-         ({shown:?}): every row of a JSON array or stream of objects is an object, of \
-         \"name\": value members separated by commas and closed by }}; jq empty FILE names \
-         the first error"
+         ({shown:?}): {rows}, of \"name\": value members separated by commas and closed by \
+         }}; jq empty FILE names the first error"
     ))
 }
 
@@ -4256,11 +4255,26 @@ mod tests {
             got.contains("line 2 (") && got.contains("runs onto the next line"),
             "{got}"
         );
-        // An object broken before its brace on its own line is read as far
-        // as the row parser reads it, as before: line by line, the rows are
-        // the same at every thread count.
-        assert_eq!(walk("{\"id\":1}\n{\"id\":2 x}\n{\"id\":3}\n").rows, 3);
-        assert_eq!(walk("{\"id\":1}\n{\"id\":2,\"v\":\"ab").rows, 2);
+        // An object broken before its brace is refused too: the row parser
+        // read it as far as the break, so its later members, or its key,
+        // were missing.
+        for (text, said) in [
+            (
+                "{\"id\":1}\n{\"id\":2 x}\n{\"id\":3}\n",
+                "line 2 (\"x}\") is not JSON in the object that opens on line 2",
+            ),
+            (
+                "{\"id\":1}\n{\"id\" 2,\"v\":1}\n",
+                "line 2 (\"2,\\\"v\\\":1}\") is not JSON",
+            ),
+            (
+                "{\"id\":1}\n{\"id\":2,\"v\":\"ab",
+                "line 2 (\"{\\\"id\\\":2,\\\"v\\\":\\\"ab\") opens an object that the file ends inside",
+            ),
+        ] {
+            let got = walk_refused(text);
+            assert!(got.starts_with(said), "{text:?}: {got}");
+        }
         // An escaped line feed, and a backslash before the closing quote,
         // are a string's own.
         assert_eq!(

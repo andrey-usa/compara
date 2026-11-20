@@ -1301,7 +1301,7 @@ fn duplicate_sections_carry_the_whole_key_in_order() {
 
 /// A file cut off mid-row (a download or a write that stopped) can end right
 /// after a key's opening quote. That half-row has no key to read; reading one
-/// anyway sliced backwards and panicked.
+/// anyway sliced backwards and panicked. The file is refused as cut short.
 #[test]
 fn an_ndjson_row_cut_off_inside_a_key_is_not_read_past() {
     for tail in ["{\"", "{\"id\":\"b\",\"", "{\"id\":\"b\",  \""] {
@@ -1311,8 +1311,12 @@ fn an_ndjson_row_cut_off_inside_a_key_is_not_read_past() {
         );
         let mut opt = Options::with_key(["id"]);
         opt.engine = Engine::Turbo.label().to_string();
-        let r = compare(&f.a, &f.b, &mut opt).expect("compare");
-        assert_eq!(r.counts.matched, 1, "tail {tail:?}");
-        assert_eq!(r.counts.changed, 0, "tail {tail:?}");
+        let err = compare(&f.a, &f.b, &mut opt).expect_err("refused");
+        assert!(err.is_input(), "tail {tail:?}: {err}");
+        assert!(
+            err.to_string().contains("line 2 (")
+                && err.to_string().contains("the file ends inside"),
+            "tail {tail:?}: {err}"
+        );
     }
 }

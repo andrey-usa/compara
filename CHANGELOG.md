@@ -52,6 +52,12 @@ All notable changes to this project are documented here. The format follows
   reader, and the rest of the line was a row with no key: two files
   differing past the break compared as equal, exit 0. The file is now
   refused with the line; `json.loads` and jq refuse it too.
+- An object of newline-delimited JSON broken before its closing brace (a
+  name with no colon, a missing quote, a line cut short at the end of the
+  file) was read as far as the break, and the rest of its line was
+  dropped: its later members compared as absent, or its key did and the
+  row was added and removed. Such a file is now refused with the line, as
+  `json.loads` refuses it.
 - A JSON member name that is not UTF-8 (a Latin-1 `caf\xE9`, say) was
   listed with a replacement character but looked up as written, so the
   column had no values on either side and its changes went unreported
