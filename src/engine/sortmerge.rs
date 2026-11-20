@@ -35,7 +35,7 @@ use crate::error::{Error, Result};
 use crate::options::Options;
 use crate::phases::Phases;
 use crate::rowstore::{Joined, Packed};
-use crate::sections::assemble;
+use crate::sections::{assemble, create_export_dir, export_file, export_headers};
 
 /// How much memory a batch may occupy before it is spilled: its packed text,
 /// four bytes a cell and the sort's four bytes a row.
@@ -854,11 +854,24 @@ fn merge_join(
     // strings, which is most of what this engine holds in memory -- and it is
     // the engine a comparison falls back to for want of memory.
     let cap = if opt.row_lists { opt.max_rows } else { 0 };
-    let mut changed = Capped::new(cap, exporting);
+    // An export's changed rows are written as the merge finds them, so the
+    // report's list stays at its cap either way.
+    let mut changed = Capped::new(if exporting { opt.max_rows } else { cap }, false);
     let mut added = Capped::new(cap, exporting);
     let mut removed = Capped::new(cap, exporting);
     let mut changed_a: Vec<Vec<Val>> = Vec::new();
     let mut changed_b: Vec<Vec<Val>> = Vec::new();
+    // The merge visits matched keys in key order, which is the order of the
+    // file, so each changed row goes straight to it and is dropped.
+    let mut changed_out = match (&opt.export_dir, exporting) {
+        (Some(dir), true) => {
+            let dir = std::path::Path::new(dir);
+            create_export_dir(dir)?;
+            let (_, both) = export_headers(opt, compared);
+            Some(export_file(&dir.join("changed.csv"), &both)?)
+        }
+        _ => None,
+    };
 
     let (mut matched, mut a_keys, mut b_keys) = (0i64, 0i64, 0i64);
     // Each side's current row, copied out of its cursor: the cursor moves on
@@ -917,6 +930,18 @@ fn merge_join(
                 }
                 if !cells.is_empty() {
                     let arow = ar.row(0);
+                    if let Some(out) = changed_out.as_mut() {
+                        let brow = br.row(0);
+                        let mut record: Vec<&str> = Vec::with_capacity(key_size + 2 * nc);
+                        for v in &arow[..key_size] {
+                            record.push(v.as_deref().unwrap_or(""));
+                        }
+                        for i in 0..nc {
+                            record.push(arow[key_size + i].as_deref().unwrap_or(""));
+                            record.push(brow[key_size + i].as_deref().unwrap_or(""));
+                        }
+                        out.write_record(&record)?;
+                    }
                     changed.push_with(|| {
                         let mut row: Vec<Cell> = arow[..key_size]
                             .iter()
@@ -925,7 +950,7 @@ fn merge_join(
                         row.push(Cell::Diffs(cells));
                         row
                     });
-                    if exporting || (opt.row_lists && changed_a.len() <= opt.max_rows) {
+                    if !exporting && opt.row_lists && changed_a.len() <= opt.max_rows {
                         changed_a.push(arow);
                         changed_b.push(br.row(0));
                     }
@@ -936,6 +961,9 @@ fn merge_join(
         }
     }
 
+    if let Some(out) = changed_out.as_mut() {
+        out.flush()?;
+    }
     let columns: Vec<ColumnStat> = (0..nc)
         .map(|i| ColumnStat {
             name: compared[i].clone(),
@@ -969,6 +997,7 @@ fn merge_join(
         removed: removed.held,
         changed_a,
         changed_b,
+        changed_written: exporting,
     })
 }
 
