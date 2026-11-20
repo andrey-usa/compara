@@ -206,7 +206,9 @@ def claim_sortmerge(args, builds):
         subprocess.run([args.gen, "--rows", args.rows, "--out-dir", args.work, "--prefix", args.rows, "-f", "csv"],
                        check=True)
     cap = Cap(args.memory)
-    out_json = os.path.join(args.work, "counts.json")
+    # Each claim its own counts file: a capped run goes through sudo, so the
+    # file it leaves is root's, and a later uncapped run could not write it.
+    out_json = os.path.join(args.work, "counts-sortmerge.json")
     try:
         case = {"name": "sortmerge", "capped": True,
                 "cmd": lambda bin_: [bin_, "compare", a, b, "-k", ",".join(KEY), "-i", IGNORE, "--json", out_json],
@@ -255,7 +257,7 @@ def claim_wide(args, builds):
     cols = []
     for i in range(0, len(names), 2000):
         cols += ["-c", ",".join(names[i:i + 2000])]
-    out_json = os.path.join(args.work, "counts.json")
+    out_json = os.path.join(args.work, "counts-wide.json")
 
     def read(n, r):
         if r["exit"] in (0, 1):
