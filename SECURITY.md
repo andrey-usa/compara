@@ -29,6 +29,10 @@ or report a wrong count is a bug we want to hear about.
   copy, the runs `sortmerge` spills, an export on its way to object storage.
   Files are made with mode 0600 and directories 0700, never at a name that
   already exists, and removed when the run ends.
+- The files a run is told to write (`-o`, `--json`, `--export-dir`) are
+  written only at the names given: a symbolic link at one is refused, not
+  followed, and each file is written beside its name and moved onto it once
+  complete.
 - The HTML report shows cell values as text. It loads nothing from the
   network and runs no code from the data.
 - Exported CSVs (`--export-dir`, the report's download) keep values exactly

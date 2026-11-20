@@ -189,12 +189,25 @@ All notable changes to this project are documented here. The format follows
   column, in the first object as in the later ones: the row parser reads
   no member there, and `compara columns` listed a column empty in every
   row.
+- The report, the JSON summary and the export CSVs are written beside
+  their names and moved into place once complete: a run that fails, is
+  stopped or fills the disk leaves the file that was there before, not
+  half of a new one, and a file that is replaced keeps its permissions.
 - A file named with `__PAYLOAD__` (or `__MODE__`, `__TITLE__`) in it gave a
   blank report that said the browser could not decode it: the template's
   slots were looked for in text already put in, and the payload went into
   the page title.
 - The report's "Download shown rows as CSV" quotes a value that holds a
   carriage return; such a value split its row in a spreadsheet.
+
+### Security
+
+- `-o`, `--json` and `--export-dir` refuse a symbolic link at the name of
+  a file they would write (exit 2, saying so) and leave what it points to
+  alone. They wrote through it: in a shared directory (`/tmp`, a CI
+  workspace) a link left at `report.html` turned the run into an overwrite
+  of the file it named. `/dev/stdout` is such a link; a FIFO or a device
+  named directly (`/dev/null`) is still written.
 
 ## [0.7.0] - 2026-11-17
 

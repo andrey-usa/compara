@@ -680,7 +680,7 @@ fn write_output(dest: &str, bytes: &[u8]) -> Result<()> {
         compara::source::upload(&local, dest)?;
         return Ok(());
     }
-    fs::write(dest, bytes).map_err(|e| Error::new(format!("cannot write {dest}: {e}")))
+    compara::output::write(Path::new(dest), bytes)
 }
 
 /// `compara env`: what this process sees of the machine, for whoever is

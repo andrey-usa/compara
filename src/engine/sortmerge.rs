@@ -35,7 +35,7 @@ use crate::error::{Error, Result};
 use crate::options::Options;
 use crate::phases::Phases;
 use crate::rowstore::{Joined, Packed};
-use crate::sections::{assemble, create_export_dir, export_file, export_headers};
+use crate::sections::{assemble, create_export_dir, export_file, export_headers, finish_export};
 
 /// How much memory a batch may occupy before it is spilled: its packed text,
 /// four bytes a cell and the sort's four bytes a row.
@@ -960,8 +960,8 @@ fn merge_join(
         }
     }
 
-    if let Some(out) = changed_out.as_mut() {
-        out.flush()?;
+    if let (Some(out), Some(dir)) = (changed_out.take(), &opt.export_dir) {
+        finish_export(out, &std::path::Path::new(dir).join("changed.csv"))?;
     }
     let columns: Vec<ColumnStat> = (0..nc)
         .map(|i| ColumnStat {

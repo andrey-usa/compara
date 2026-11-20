@@ -1143,7 +1143,7 @@ impl Listed {
             }
             first = last;
         }
-        Ok(())
+        file.commit()
     }
 }
 

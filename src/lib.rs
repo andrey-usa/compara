@@ -31,6 +31,7 @@ pub mod hugepages;
 pub mod keyhash;
 pub mod memory;
 pub mod options;
+pub mod output;
 pub mod parallel;
 pub mod parquet;
 pub mod phases;

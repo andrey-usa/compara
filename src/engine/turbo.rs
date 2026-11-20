@@ -63,7 +63,7 @@ use crate::options::{Engine, Options};
 use crate::parallel;
 use crate::phases::Phases;
 use crate::rowstore::Joined;
-use crate::sections::{assemble, create_export_dir, export_file, export_headers};
+use crate::sections::{assemble, create_export_dir, export_file, export_headers, finish_export};
 
 /// Below this there is nothing to divide: finding the chunk boundaries would
 /// cost more than the parsing it splits.
@@ -3430,7 +3430,7 @@ where
         cells.extend(rows.into_iter().filter_map(|(_, _, shown)| shown));
         at += block.len();
     }
-    out.flush()?;
+    finish_export(out, &dir.join("changed.csv"))?;
     Ok(cells)
 }
 

@@ -204,3 +204,51 @@ fn summary_refuses_the_flags_that_ask_for_output() {
         assert!(files(&fx.0).is_empty(), "{flag:?} wrote {:?}", files(&fx.0));
     }
 }
+
+/// Every output a run writes refuses a link at its name rather than writing
+/// through it: in a shared directory a link left at `report.html` would
+/// otherwise make the run overwrite the file it points to. The target is left
+/// as it was and the run exits 2 saying why.
+#[cfg(unix)]
+#[test]
+fn a_link_at_an_output_name_is_refused_and_its_target_left_alone() {
+    let fx = Fixture::new();
+    let target = fx.path("precious.txt");
+    fs::write(&target, "keep me").expect("the target");
+    fs::create_dir(fx.path("ex")).expect("the export directory");
+    let base = ["compare", "a.csv", "b.csv", "-k", "account_id,txn_id"];
+    for (link, flags) in [
+        ("r.html", vec!["-o", "r.html"]),
+        ("r.json", vec!["--json", "r.json"]),
+        ("ex/added.csv", vec!["--export-dir", "ex"]),
+    ] {
+        std::os::unix::fs::symlink(&target, fx.path(link)).expect("the link");
+        let mut args = base.to_vec();
+        args.extend(&flags);
+        let (code, _, err) = run(&fx.0, &args);
+        assert_eq!(code, 2, "{flags:?} wrote through a link: {err}");
+        assert!(err.contains("symbolic link"), "{flags:?}: {err}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me", "{flags:?}");
+        fs::remove_file(fx.path(link)).expect("the link");
+    }
+}
+
+/// An output reaches its name in one step: a second run replaces the first's
+/// files and leaves nothing else beside them.
+#[test]
+fn outputs_replace_what_was_there_and_leave_nothing_beside_it() {
+    let fx = Fixture::new();
+    let mut args = vec!["compare", "a.csv", "b.csv", "-k", "account_id,txn_id"];
+    args.extend(["-o", "r.html", "--json", "r.json", "--export-dir", "ex"]);
+    for _ in 0..2 {
+        let (code, _, err) = run(&fx.0, &args);
+        assert_eq!(code, 1, "{err}");
+    }
+    assert_eq!(files(&fx.0), ["ex", "r.html", "r.json"]);
+    let mut exported: Vec<String> = fs::read_dir(fx.path("ex"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    exported.sort();
+    assert_eq!(exported, ["added.csv", "changed.csv", "removed.csv"]);
+}

@@ -1,11 +1,12 @@
 //! Capping the report sections and writing the uncapped CSV exports.
 
-use std::fs::{self, File};
+use std::fs;
 use std::path::Path;
 
 use crate::contract::{Cell, EngineMeta, EngineResult, Section, Val};
 use crate::error::{Error, Result};
 use crate::options::Options;
+use crate::output::Output;
 use crate::rowstore::Joined;
 
 /// Turns a completed join into the capped report sections, and writes the
@@ -70,11 +71,20 @@ pub fn create_export_dir(dir: &Path) -> Result<()> {
 /// Opens one export file and writes its header. Every engine writes through
 /// this, so the files are quoted and terminated the same way whichever path
 /// produced them.
-pub fn export_file(path: &Path, header: &[String]) -> Result<csv::Writer<File>> {
-    let mut w = csv::Writer::from_path(path)
-        .map_err(|e| Error::new(format!("cannot write {}: {e}", path.display())))?;
+///
+/// The file goes through [`Output`]: it reaches its name only when the
+/// writer is committed, and a link at the name is refused.
+pub fn export_file(path: &Path, header: &[String]) -> Result<csv::Writer<Output>> {
+    let mut w = csv::Writer::from_writer(Output::create(path)?);
     w.write_record(header)?;
     Ok(w)
+}
+
+/// Flushes an export file and puts it at its name.
+pub fn finish_export(w: csv::Writer<Output>, path: &Path) -> Result<()> {
+    w.into_inner()
+        .map_err(|e| Error::new(format!("cannot write {}: {e}", path.display())))?
+        .commit()
 }
 
 fn export(dir: &Path, joined: &Joined, opt: &Options, compared: &[String]) -> Result<()> {
@@ -122,6 +132,5 @@ fn write_rows(path: &Path, header: &[String], rows: &[Vec<Val>]) -> Result<()> {
         }
         w.write_record(&record)?;
     }
-    w.flush()?;
-    Ok(())
+    finish_export(w, path)
 }
