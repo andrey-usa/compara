@@ -15,9 +15,11 @@ Parquet a warehouse emits, a migration's source against its target.
 
 - Reads **CSV, TSV, JSON (newline-delimited or one array of objects) and
   Parquet**, and the two sides need not be in the same format.
-- Ten million rows × 20 columns in about a second on four cores with the
-  files cached, CSV or Parquet; from a cold disk, little more than the time
-  to read them (CSV 9.4 s vs 8.6 s to read, Parquet 4.1 vs 3.6 s)
+- Ten million rows × 20 columns in about a second on GitHub's 4-core
+  runner with the files cached, CSV or Parquet, where the fastest of
+  DuckDB, Polars and qsv takes 11–12 s and Polars runs out of memory; from
+  a cold disk, little more than the time to read them (CSV 9.4 s vs 8.6 s
+  to read, Parquet 4.1 vs 3.6 s)
   ([benchmarks](https://andrey-usa.github.io/compara/benchmarks/results.html)).
 - Reads and writes **object storage and the web** directly (`s3://`,
   `gs://`, `az://`, `https://`), with each cloud's own credentials, and
