@@ -24,7 +24,11 @@ from 0 across the server) and --fault-every N (then every N-th; 0 for that
 one only): `silent` sends nothing at all; `stall` the headers and then
 nothing; `drop` half the body, then closes the connection; `reset` closes
 it before answering; `overlong` sends 1,000 bytes past the range asked, its
-Content-Length saying so; `dribble` sends the body 1 KB a second.
+Content-Length saying so; `dribble` sends the body 1 KB a second. With
+--fault-puts the fault hits PUTs instead, counted the same way: `silent`
+reads nothing and never answers; `stall` reads the body and never answers;
+`dribble` reads it 1 KB a second, then answers; `drop` reads half of it and
+closes the connection; `reset` closes it before reading.
 
 Prints `LISTENING <url>` once it is ready.
 """
@@ -59,10 +63,17 @@ def main() -> None:
     ap.add_argument("--fault", choices=["silent", "stall", "drop", "reset", "overlong", "dribble"])
     ap.add_argument("--fault-at", type=int, default=0)
     ap.add_argument("--fault-every", type=int, default=0)
+    ap.add_argument("--fault-puts", action="store_true", help="the fault hits PUTs, not ranged GETs")
     args = ap.parse_args()
     lock = threading.Lock()
     gets = [0]
     ranged = [0]
+    puts = [0]
+
+    def picked(i):
+        """Whether request i is hit."""
+        return i == args.fault_at or (
+            args.fault_every and i > args.fault_at and (i - args.fault_at) % args.fault_every == 0)
     newer = {}
 
     def newer_version(full):
@@ -166,13 +177,10 @@ def main() -> None:
                 gets[0] += 1
                 n = gets[0]
                 fault = None
-                if asked and not head:
+                if asked and not head and not args.fault_puts:
                     i = ranged[0]
                     ranged[0] += 1
-                    picked = i == args.fault_at or (
-                        args.fault_every and i > args.fault_at
-                        and (i - args.fault_at) % args.fault_every == 0)
-                    fault = args.fault if picked else None
+                    fault = args.fault if picked(i) else None
             version = 2 if args.overwrite_after and n > args.overwrite_after else 1
             data = newer_version(full) if version == 2 else None
             size = len(data) if data is not None else st.st_size
@@ -278,7 +286,34 @@ def main() -> None:
         def do_PUT(self):
             parts = urlsplit(self.path)
             q = dict(p.split("=", 1) if "=" in p else (p, "") for p in parts.query.split("&") if p)
-            data = self.body()
+            fault = None
+            if args.fault_puts:
+                with lock:
+                    i = puts[0]
+                    puts[0] += 1
+                    fault = args.fault if picked(i) else None
+            n = int(self.headers.get("Content-Length") or 0)
+            if fault == "reset":
+                return self.close_now()
+            if fault == "silent":
+                time.sleep(3600)
+                return self.close_now()
+            if fault == "drop":
+                self.rfile.read(n // 2)
+                return self.close_now()
+            if fault == "dribble":
+                data = b""
+                while len(data) < n:
+                    piece = self.rfile.read(min(1024, n - len(data)))
+                    if not piece:
+                        break
+                    data += piece
+                    time.sleep(1)
+            else:
+                data = self.body()
+            if fault == "stall":
+                time.sleep(3600)
+                return self.close_now()
             if args.private and not self.headers.get("Authorization") and not parts.query:
                 return self.refuse(403)
             rel = unquote(parts.path).lstrip("/")

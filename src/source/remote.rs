@@ -52,6 +52,7 @@ const GAP: u64 = 256 << 10;
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(super) fn fetch(spec: &str, want: &Want) -> Result<Source> {
+    let _quiet = QuietPipe::new();
     runtime("download")?.block_on(fetch_async(spec, want))
 }
 
@@ -691,6 +692,7 @@ impl Drop for TempPath {
 /// as a multipart upload of 16 MB parts, eight in flight, when it is not. A
 /// plain `https://` URL -- a presigned PUT -- takes the whole file in one PUT.
 pub(super) fn upload(from: &std::path::Path, dest: &str) -> Result<u64> {
+    let _quiet = QuietPipe::new();
     runtime("upload")?.block_on(upload_async(from, dest))
 }
 
@@ -754,6 +756,67 @@ async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
     }
     writer.finish().await.map_err(|e| fail(e.to_string()))?;
     Ok(size)
+}
+
+/// SIGPIPE held back on this thread while it moves bytes over the network.
+///
+/// compara restores SIGPIPE's default so that a closed standard output ends
+/// it quietly, as it ends `cat`. A socket the server has closed raises it as
+/// well when it is written with `writev`, as the HTTP client writes a large
+/// body: the process was killed there, with no word and exit 141, where the
+/// write's own error says what happened. Blocked on this thread, the signal
+/// waits and the write fails with EPIPE; one that came is taken back before
+/// the mask is restored, so it never ends the process later. (On macOS the
+/// sockets are opened with SO_NOSIGPIPE; Windows has no SIGPIPE.)
+struct QuietPipe {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    old: Option<libc::sigset_t>,
+}
+
+impl QuietPipe {
+    fn new() -> Self {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // SAFETY: the sets are initialised by sigemptyset and
+            // pthread_sigmask before they are read, and only this thread's
+            // mask changes.
+            unsafe {
+                let mut pipe: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut pipe);
+                libc::sigaddset(&mut pipe, libc::SIGPIPE);
+                let mut old: libc::sigset_t = std::mem::zeroed();
+                let blocked = libc::pthread_sigmask(libc::SIG_BLOCK, &pipe, &mut old) == 0;
+                // Already blocked, the thread's owner takes care of it.
+                let mine = blocked && libc::sigismember(&old, libc::SIGPIPE) == 0;
+                QuietPipe {
+                    old: mine.then_some(old),
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        QuietPipe {}
+    }
+}
+
+impl Drop for QuietPipe {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(old) = self.old.take() {
+            // SAFETY: as in `new`; sigtimedwait with a zero timeout only
+            // takes a SIGPIPE already pending, and never waits.
+            unsafe {
+                let mut pipe: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut pipe);
+                libc::sigaddset(&mut pipe, libc::SIGPIPE);
+                let now = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                while libc::sigtimedwait(&pipe, std::ptr::null_mut(), &now) == libc::SIGPIPE {}
+                libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+            }
+        }
+    }
 }
 
 /// Why a request failed, kept apart so a refused unsigned GET can be retried.
@@ -1324,6 +1387,7 @@ impl PartOut<'_> {
 /// connections may be serving another lane's requests.
 async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> {
     use futures::FutureExt;
+    use std::io::Write;
     use std::sync::atomic::Ordering::Relaxed;
     let part = part_size();
     let pieces: Vec<Piece> = jobs
@@ -1374,6 +1438,7 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
             let spawned = std::thread::Builder::new()
                 .name("compara-fetch".into())
                 .spawn(move || {
+                    let _quiet = QuietPipe::new();
                     // A lane whose runtime cannot start takes no parts; the
                     // others, or this thread, take them.
                     if let Ok(rt) = runtime("download") {
@@ -1443,7 +1508,10 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
             every.tick().await;
             let got = done.load(Relaxed);
             let secs = started.elapsed().as_secs_f64();
-            eprintln!(
+            // Not eprintln: SIGPIPE is held back here ([`QuietPipe`]), and a
+            // closed standard error would make it panic.
+            let _ = writeln!(
+                std::io::stderr(),
                 "{label}: {} of {} ({}%) in {secs:.0}s, {}/s",
                 human(got),
                 human(total),

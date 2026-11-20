@@ -99,6 +99,10 @@ All notable changes to this project are documented here. The format follows
   they do after any failure, and their reads no longer stop at five minutes
   a request, which cut off an 8 MB part on a link under 28 KB/s. A server
   sending 1 KB a second is waited for.
+- An output to a URL whose server reset the connection under a body of
+  megabytes killed compara with SIGPIPE, exit 141 and no message (SIGPIPE's
+  default, restored so that `compara head | head -1` ends quietly, caught
+  the socket too). The upload's own error says what happened now, exit 2.
 - A connection dropped or reset on a URL's first request, for the end of
   the object (its size, and a Parquet footer), failed the compare: exit 2,
   "error decoding response body". It is asked again, as every later range

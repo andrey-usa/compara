@@ -814,6 +814,93 @@ fn a_stalled_server_is_asked_again_and_a_slow_one_waited_for() {
     }
 }
 
+/// Files for the PUT tests, in a directory the object server serves: `a.csv`
+/// with no rows, so that `compare a.csv <b> -k id --export-dir URL` sends
+/// B's rows first, as `added.csv`; `small.csv` (6.6 KB of rows) and
+/// `big.csv` (8.4 MB).
+fn put_fixture() -> Dir {
+    let dir =
+        Dir(std::env::temp_dir().join(format!("compara-put-{}-{}", std::process::id(), id())));
+    std::fs::create_dir_all(dir.0.join("bkt")).unwrap();
+    std::fs::write(dir.0.join("a.csv"), "id,v\n").unwrap();
+    let rows = |n: usize| {
+        let mut text = String::from("id,v\n");
+        for i in 0..n {
+            text.push_str(&format!("{i:08},{:032}\n", i * 7));
+        }
+        text
+    };
+    std::fs::write(dir.0.join("small.csv"), rows(160)).unwrap();
+    std::fs::write(dir.0.join("big.csv"), rows(200_000)).unwrap();
+    dir
+}
+
+/// `compare a.csv <b> -k id --export-dir URL`, the object server failing
+/// every PUT with `mode`, within a minute: the exit, the error, the file the
+/// server wrote, how long it took, and the URL.
+fn put_export(
+    root: &Dir,
+    b: &str,
+    mode: &str,
+    timeout: &str,
+) -> (
+    std::process::ExitStatus,
+    String,
+    Option<Vec<u8>>,
+    std::time::Duration,
+    String,
+) {
+    let server = Server::start(
+        &root.0,
+        &["--fault", mode, "--fault-puts", "--fault-every", "1"],
+    )
+    .unwrap();
+    let name = format!("{mode}{}", id());
+    let dest = format!("{}/bkt/{name}/", server.url);
+    let started = std::time::Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_compara"))
+        .arg("compare")
+        .arg(root.0.join("a.csv"))
+        .arg(root.0.join(b))
+        .args(["-k", "id", "--export-dir", &dest])
+        .env("COMPARA_READ_TIMEOUT", timeout)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    while child.try_wait().unwrap().is_none() && started.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    let written = std::fs::read(root.0.join("bkt").join(&name).join("added.csv")).ok();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    (out.status, err, written, started.elapsed(), dest)
+}
+
+/// A plain PUT whose connection the server resets, or closes half-way, under
+/// a body of megabytes is an error that names the URL and says so: the
+/// process had been killed by SIGPIPE, exit 141 and no word.
+#[test]
+fn a_put_whose_connection_the_server_closes_is_an_error() {
+    if python().is_none() {
+        eprintln!("skipping: no python to run the object server");
+        return;
+    }
+    let root = put_fixture();
+    // The write that meets the reset fails with ECONNRESET or, after it,
+    // with EPIPE, which raised the SIGPIPE: most runs, not all, so four.
+    for mode in ["reset", "reset", "reset", "reset", "drop"] {
+        let (status, err, _, _, dest) = put_export(&root, "big.csv", mode, "1");
+        // Not a signal.
+        assert_eq!(status.code(), Some(2), "{mode}: {status:?} {err}");
+        assert!(
+            err.contains(&format!("cannot write {dest}added.csv")),
+            "{mode}: {err}"
+        );
+    }
+}
+
 /// The first request, for the end of the object, is asked again when its
 /// connection drops part-way through the answer or closes before it, as any
 /// later range is: one such drop had failed the compare (exit 2, "error

@@ -37,7 +37,7 @@ bench = []
 # s3://, gs://, az:// and https:// inputs, read through Apache Arrow's
 # object_store with each cloud's own credential chain. Off, the binary reads
 # local files only and carries no network or TLS code.
-cloud = ["dep:object_store", "dep:tokio", "dep:futures", "dep:bytes", "dep:url", "dep:reqwest"]
+cloud = ["dep:object_store", "dep:tokio", "dep:futures", "dep:bytes", "dep:url", "dep:reqwest", "dep:libc"]
 
 [dependencies]
 # Engine: native, over the csv crate.
@@ -68,6 +68,11 @@ url = { version = "2.5.8", optional = true }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "http2"], optional = true }
 # Local time with an offset for the report header; std has no calendar.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+# A thread's signal mask, for SIGPIPE while a transfer writes to a socket
+# (feature `cloud`). Already built for tokio and the rest; std has no sigset_t.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = { version = "0.2.189", optional = true }
 
 [profile.dev]
 debug = 0
