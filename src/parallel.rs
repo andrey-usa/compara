@@ -84,6 +84,14 @@ thread_local! {
     /// Whether this thread is starting one: its own allocations, for the new
     /// thread's handle and closure, do not wait for the set-up they precede.
     static STARTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Whether this thread is at work: one started here, from the moment its
+    /// work begins, or one that has started another. A thread being set up is
+    /// not, and must not wait: the runtime allocates on it before its work
+    /// begins (the record of its guard page, at some starts), and waiting for
+    /// its own set-up held each such start for the whole [`SET_UP_WAIT`]
+    /// (measured: two in seventy starts of a 16-lane comparison, 0.4 s each).
+    static RUNNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// How long an allocation waits for a set-up at most. A set-up is a few
@@ -100,8 +108,9 @@ const SET_UP_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 /// the abort.
 ///
 /// Only allocations through the global allocator wait; the C library's own
-/// and raw mappings do not, and the thread starting a new one does not wait
-/// for its own.
+/// and raw mappings do not, the thread starting a new one does not wait for
+/// its own, and a thread not at work here (see [`RUNNING`]) does not wait:
+/// one being set up, or one a library started that never starts one here.
 #[inline]
 pub fn wait_for_set_up() {
     if SETTING_UP.load(std::sync::atomic::Ordering::Relaxed) != 0 {
@@ -118,14 +127,29 @@ fn wait_for_set_up_slowly() {
 fn wait_for_set_up_within(most: std::time::Duration) {
     // `try_with`: during this thread's own teardown the flag is gone, and an
     // allocation then has nothing to wait for that it could not race anyway.
-    if STARTING.try_with(std::cell::Cell::get).unwrap_or(true) {
+    if STARTING.try_with(std::cell::Cell::get).unwrap_or(true)
+        || !RUNNING.try_with(std::cell::Cell::get).unwrap_or(false)
+    {
         return;
     }
     let since = std::time::Instant::now();
+    let mut turns = 0u32;
     while SETTING_UP.load(std::sync::atomic::Ordering::Acquire) != 0 && since.elapsed() < most {
-        std::thread::yield_now();
+        // A few turns given up, then sleeps: with more threads than cores,
+        // threads that only yield keep the new one from the core its set-up
+        // needs (measured: 16 lanes on 4 cores, three times the wall time).
+        if turns < YIELDS {
+            turns += 1;
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(NAP);
+        }
     }
 }
+
+/// How often a waiting allocation yields before it sleeps, and for how long.
+const YIELDS: u32 = 4;
+const NAP: std::time::Duration = std::time::Duration::from_micros(50);
 
 /// This thread, starting another under a heap limit: counted in
 /// [`SETTING_UP`] from before the room is looked at until the count is handed
@@ -140,6 +164,7 @@ struct Starting {
 impl Starting {
     fn begin() -> Self {
         let was = STARTING.replace(true);
+        RUNNING.set(true);
         SETTING_UP.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Starting { was, counted: true }
     }
@@ -269,6 +294,7 @@ where
             let set_up = SetUp::new();
             let counted = starting.hand_over(std::sync::Arc::clone(&set_up));
             let handle = Builder::new().spawn_scoped(scope, move || {
+                RUNNING.set(true);
                 drop(counted);
                 f()
             })?;
@@ -303,6 +329,7 @@ where
             let set_up = SetUp::new();
             let counted = starting.hand_over(std::sync::Arc::clone(&set_up));
             let handle = named.spawn(move || {
+                RUNNING.set(true);
                 drop(counted);
                 f()
             })?;
@@ -442,8 +469,16 @@ mod tests {
             own
         });
         count.recv().unwrap();
+        // A thread not at work -- one being set up -- goes ahead.
+        let idle = std::thread::spawn(|| {
+            let at = Instant::now();
+            wait_for_set_up_within(NEVER);
+            at.elapsed()
+        });
+        assert!(idle.join().unwrap() < Duration::from_secs(30));
         let at = Instant::now();
         let waiter = std::thread::spawn(move || {
+            RUNNING.set(true);
             wait_for_set_up_within(NEVER);
             at.elapsed()
         });
@@ -462,6 +497,7 @@ mod tests {
         use std::time::{Duration, Instant};
         let _one = SETTING_UP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let starting = std::thread::spawn(Starting::begin).join();
+        RUNNING.set(true);
         let at = Instant::now();
         wait_for_set_up_within(Duration::from_millis(30));
         let waited = at.elapsed();
