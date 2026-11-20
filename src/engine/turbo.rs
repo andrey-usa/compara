@@ -63,7 +63,7 @@ use crate::options::{Engine, Options};
 use crate::parallel;
 use crate::phases::Phases;
 use crate::rowstore::Joined;
-use crate::sections::assemble;
+use crate::sections::{assemble, create_export_dir, export_file, export_headers};
 
 /// Below this there is nothing to divide: finding the chunk boundaries would
 /// cost more than the parsing it splits.
@@ -3250,23 +3250,9 @@ fn join_tail(
             }
         })?
     };
-    let (mut changed_a, mut changed_b) = if exporting {
-        (
-            map_rows(keep_changed, threads, "a changed row, A side", |p| {
-                a_row(p.row)
-            })?,
-            map_rows(keep_changed, threads, "a changed row, B side", |p| {
-                b_row(p.mate)
-            })?,
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
     phases.mark("  row values (par)");
     sort_rows(&mut removed_rows, key_size);
     sort_rows(&mut added_rows, key_size);
-    sort_changed_together(&mut changed_a, &mut changed_b, key_size);
     changed_rows.sort_by(|x, y| compare_keys(&x.0, &y.0, key_size));
 
     phases.mark("  sorts (serial)");
@@ -3277,40 +3263,23 @@ fn join_tail(
         row.push(Cell::Diffs(cells));
         changed_cells.push(row);
     }
-    // With an export: zipped by index rather than by iterator so the two
-    // sides can be chunked together; they are the same length and in the
-    // same order by construction.
-    let mut rows: Vec<usize> = alloc::sized(changed_a.len(), "the changed-row index")?;
-    rows.extend(0..changed_a.len());
-    let exported: Vec<Vec<Cell>> = map_rows(&rows, threads, "a changed row's cells", |&r| {
-        let (ar, br) = (&changed_a[r], &changed_b[r]);
-        let mut cells: Vec<CellDiff> = Vec::new();
-        for i in 0..nc {
-            let (x, y) = (&ar[key_size + i], &br[key_size + i]);
-            let differ = ctx.typed[i].differs(x, y, opt);
-            if differ {
-                alloc::push(
-                    &mut cells,
-                    CellDiff {
-                        column: i,
-                        a: alloc::val(x.as_deref(), "a changed cell")?,
-                        b: alloc::val(y.as_deref(), "a changed cell")?,
-                    },
-                    "a changed cell",
-                )?;
-            }
-        }
-        let mut row: Vec<Cell> = alloc::sized(key_size + 1, "a changed row's key")?;
-        for v in &ar[..key_size] {
-            row.push(Cell::Value(alloc::val(
-                v.as_deref(),
-                "a changed row's key",
-            )?));
-        }
-        row.push(Cell::Diffs(cells));
-        Ok(row)
-    })?;
-    changed_cells.extend(exported);
+    // With an export the changed rows are written from here, a block at a
+    // time in key order, and only the report's share of them is kept.
+    if exporting {
+        changed_cells = export_changed(
+            keep_changed,
+            ExportSides {
+                a_row: &a_row,
+                b_row: &b_row,
+                a,
+                ai,
+                compared,
+            },
+            ctx,
+            opt,
+            threads,
+        )?;
+    }
 
     phases.mark("  changed cells (par)");
     let counts = Counts {
@@ -3339,9 +3308,159 @@ fn join_tail(
         removed: map_rows(&removed_rows, threads, "a removed row's cells", |r| {
             to_cells(r)
         })?,
-        changed_a,
-        changed_b,
+        changed_a: Vec::new(),
+        changed_b: Vec::new(),
+        changed_written: exporting,
     })
+}
+
+/// What the changed-row export reads its rows through.
+struct ExportSides<'x, FA, FB> {
+    a_row: &'x FA,
+    b_row: &'x FB,
+    a: &'x Side,
+    ai: &'x RowIndex,
+    compared: &'x [String],
+}
+
+/// Rows decoded and written per block of the changed-row export. A block is
+/// the only place the export holds row text, so its memory does not grow with
+/// the number of changed rows.
+const EXPORT_BLOCK: usize = 1 << 14;
+
+/// Writes `changed.csv` from the picks without holding the rows.
+///
+/// The file is in key order, so the picks are ordered first from a compact
+/// copy of their keys (the bytes of every key in one buffer, not a `String`
+/// per cell). Then each block of the order is decoded on all threads, written,
+/// and dropped. Returns the report's share of the rows: the first `max_rows + 1`
+/// in key order, as cells, which is what the report keeps of an uncapped list.
+fn export_changed<FA, FB>(
+    picks: &[Pick],
+    sides: ExportSides<FA, FB>,
+    ctx: &JoinCtx,
+    opt: &Options,
+    threads: usize,
+) -> Result<Vec<Vec<Cell>>>
+where
+    FA: Fn(i32) -> Result<Vec<Val>> + Sync,
+    FB: Fn(i32) -> Result<Vec<Val>> + Sync,
+{
+    let dir = Path::new(opt.export_dir.as_deref().unwrap_or("."));
+    create_export_dir(dir)?;
+    let (_, both) = export_headers(opt, sides.compared);
+    let mut out = export_file(&dir.join("changed.csv"), &both)?;
+    let (key_size, nc) = (ctx.key_size, ctx.nc);
+
+    // The keys, in pick order: one buffer, and a (start, length) per key
+    // column. An absent key sorts last, as `compare_keys` has it.
+    const ABSENT_KEY: u32 = u32::MAX;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut spans: Vec<(usize, u32)> = alloc::sized(picks.len() * key_size, "the changed keys")?;
+    for block in picks.chunks(EXPORT_BLOCK) {
+        let keys = map_rows(block, threads, "a changed row's key", |p| {
+            key_values(sides.a, sides.ai, p.row, opt)
+        })?;
+        for key in keys {
+            for v in key {
+                match v {
+                    None => spans.push((0, ABSENT_KEY)),
+                    Some(s) => {
+                        alloc::room(&mut bytes, s.len(), "the changed keys")?;
+                        spans.push((bytes.len(), s.len() as u32));
+                        bytes.extend_from_slice(s.as_bytes());
+                    }
+                }
+            }
+        }
+    }
+    let key_at = |pick: usize, col: usize| {
+        let (start, len) = spans[pick * key_size + col];
+        (len != ABSENT_KEY).then(|| &bytes[start..start + len as usize])
+    };
+    // Stable, so rows with equal keys stay in file order.
+    let mut order: Vec<u32> = alloc::sized(picks.len(), "the changed-row order")?;
+    order.extend(0..picks.len() as u32);
+    order.sort_by(|&p, &q| {
+        for col in 0..key_size {
+            let ord = match (key_at(p as usize, col), key_at(q as usize, col)) {
+                (None, None) => continue,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (Some(x), Some(y)) => x.cmp(y),
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+
+    let report_rows = opt.max_rows.saturating_add(1);
+    let mut cells: Vec<Vec<Cell>> = alloc::sized(report_rows.min(picks.len()), "the changed rows")?;
+    let mut at = 0usize;
+    for block in order.chunks(EXPORT_BLOCK) {
+        let items: Vec<(usize, Pick)> = block
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (at + i, picks[p as usize]))
+            .collect();
+        let rows = map_rows(&items, threads, "a changed row", |&(pos, p)| {
+            let (ar, br) = ((sides.a_row)(p.row)?, (sides.b_row)(p.mate)?);
+            let shown = if pos < report_rows {
+                Some(changed_cells_of(&ar, &br, ctx, opt)?)
+            } else {
+                None
+            };
+            Ok((ar, br, shown))
+        })?;
+        let mut record: Vec<&str> = Vec::with_capacity(key_size + 2 * nc);
+        for (ar, br, _) in &rows {
+            record.clear();
+            for v in &ar[..key_size] {
+                record.push(v.as_deref().unwrap_or(""));
+            }
+            for i in 0..nc {
+                record.push(ar[key_size + i].as_deref().unwrap_or(""));
+                record.push(br[key_size + i].as_deref().unwrap_or(""));
+            }
+            out.write_record(&record)?;
+        }
+        drop(record);
+        cells.extend(rows.into_iter().filter_map(|(_, _, shown)| shown));
+        at += block.len();
+    }
+    out.flush()?;
+    Ok(cells)
+}
+
+/// A changed row as the report shows it: its key, then the cells that differ.
+fn changed_cells_of(ar: &[Val], br: &[Val], ctx: &JoinCtx, opt: &Options) -> Result<Vec<Cell>> {
+    let (key_size, nc) = (ctx.key_size, ctx.nc);
+    let mut cells: Vec<CellDiff> = Vec::new();
+    for i in 0..nc {
+        let (x, y) = (&ar[key_size + i], &br[key_size + i]);
+        if ctx.typed[i].differs(x, y, opt) {
+            alloc::push(
+                &mut cells,
+                CellDiff {
+                    column: i,
+                    a: alloc::val(x.as_deref(), "a changed cell")?,
+                    b: alloc::val(y.as_deref(), "a changed cell")?,
+                },
+                "a changed cell",
+            )?;
+        }
+    }
+    let mut row: Vec<Cell> = alloc::sized(key_size + 1, "a changed row's key")?;
+    for v in &ar[..key_size] {
+        row.push(Cell::Value(alloc::val(
+            v.as_deref(),
+            "a changed row's key",
+        )?));
+    }
+    row.push(Cell::Diffs(cells));
+    Ok(row)
 }
 
 // ---------------------------------------------------------------------------
@@ -3905,26 +4024,6 @@ fn compare_fused(
 
 fn sort_rows(rows: &mut [Vec<Val>], key_size: usize) {
     rows.sort_by(|x, y| compare_keys(x, y, key_size));
-}
-
-/// Sorts the changed rows by key while keeping the parallel A and B lists in step.
-///
-/// The permutation moves rows rather than copying them. Cloning instead meant
-/// deep-copying every `String` in both lists -- fifty thousand rows over twenty
-/// columns, twice -- which was almost the whole of this engine's serial sort
-/// time, and none of it was the comparisons.
-fn sort_changed_together(a: &mut Vec<Vec<Val>>, b: &mut Vec<Vec<Val>>, key_size: usize) {
-    let mut order: Vec<usize> = (0..a.len()).collect();
-    order.sort_by(|&p, &q| compare_keys(&a[p], &a[q], key_size));
-    permute(a, &order);
-    permute(b, &order);
-}
-
-/// Reorders `v` so that `v[i]` becomes what `v[order[i]]` was, moving each
-/// element exactly once. `order` must be a permutation of `0..v.len()`.
-fn permute<T: Default>(v: &mut Vec<T>, order: &[usize]) {
-    let mut src = std::mem::take(v);
-    *v = order.iter().map(|&i| std::mem::take(&mut src[i])).collect();
 }
 
 /// The duplicate-key section a `--summary` run reports instead of building one.

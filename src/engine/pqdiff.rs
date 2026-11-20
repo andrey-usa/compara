@@ -2372,6 +2372,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         removed: removed_rows.into_iter().map(to_cells).collect(),
         changed_a: Vec::new(),
         changed_b: Vec::new(),
+        changed_written: false,
     };
     phases.mark("assemble");
     let meta = resolved.meta(&opt.key, a_meta.names.len(), b_meta.names.len());

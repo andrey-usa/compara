@@ -83,6 +83,9 @@ fn export(dir: &Path, joined: &Joined, opt: &Options, compared: &[String]) -> Re
     write_cells(&dir.join("added.csv"), &cols, &joined.added)?;
     write_cells(&dir.join("removed.csv"), &cols, &joined.removed)?;
 
+    if joined.changed_written {
+        return Ok(());
+    }
     let key_size = opt.key.len();
     let rows: Vec<Vec<Val>> = joined
         .changed_a

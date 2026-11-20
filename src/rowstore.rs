@@ -502,6 +502,8 @@ pub struct Joined {
     /// A-side rows aligned with `changed`, for `--export-dir`.
     pub changed_a: Vec<Vec<Val>>,
     pub changed_b: Vec<Vec<Val>>,
+    /// The engine has already written `changed.csv` itself, a block at a time.
+    pub changed_written: bool,
 }
 
 /// The full outer join of two stores on the composite key.
@@ -592,6 +594,7 @@ pub fn join(a: &RowStore, b: &RowStore, opt: &Options) -> Joined {
         removed,
         changed_a,
         changed_b,
+        changed_written: false,
     }
 }
 
