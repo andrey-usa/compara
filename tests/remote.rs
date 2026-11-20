@@ -660,6 +660,57 @@ fn outputs_reach_object_storage_and_stdout() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("matched"));
 }
 
+/// A multipart upload where the system gives some threads but not as many
+/// as the upload could send its parts from lands whole, its parts sent from
+/// the threads there are or from the calling thread: never a panic or a
+/// hang.
+#[test]
+fn a_multipart_upload_lands_whole_under_a_partial_thread_budget() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: thread stacks count against `ulimit -d` on Linux");
+        return;
+    }
+    let f = fixture("20k", &[]);
+    let Some(server) = Server::start(&f.0, &[]) else {
+        return;
+    };
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let want = compare(&local("t_a.csv"), &local("t_b.csv"), &KEY, &[], None);
+    // By name, so the connections' lookups want threads too; parts small
+    // enough that each export is a dozen or more.
+    let mut env = s3_env(&server.url.replace("127.0.0.1", "localhost"));
+    env.push(("COMPARA_UPLOAD_ONE_SHOT", "1".into()));
+    env.push(("COMPARA_UPLOAD_PART", "4096".into()));
+    for n in [2, 4, 6, 8, 10] {
+        let prefix = format!("out{}", id());
+        let mut cmd = with_threads(n);
+        cmd.args(["compare", &local("t_a.csv"), &local("t_b.csv")])
+            .args(KEY)
+            .args(["--export-dir", &format!("s3://bkt/{prefix}/")])
+            .envs(borrowed(&env))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let started = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if started.elapsed() > std::time::Duration::from_secs(60) {
+                let _ = child.kill();
+                panic!("about {n} threads: no exit within 60 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(want.0), "about {n} threads: {err}");
+        let mut rows = String::new();
+        for name in ["added.csv", "changed.csv", "removed.csv"] {
+            rows.push_str(&std::fs::read_to_string(bucket.join(&prefix).join(name)).unwrap());
+        }
+        assert_eq!(rows, want.3, "about {n} threads: exported rows");
+    }
+}
+
 /// A server that drops some ranged requests is retried through; an object
 /// overwritten part-way through the download is an error, not a file stitched
 /// together from two versions.

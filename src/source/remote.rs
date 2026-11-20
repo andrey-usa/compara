@@ -689,16 +689,16 @@ impl Drop for TempPath {
 }
 
 /// Writes the local file `from` to `dest`: in one request when it is small,
-/// as a multipart upload of 16 MB parts, eight in flight, when it is not. A
-/// plain `https://` URL -- a presigned PUT -- takes the whole file in one PUT,
-/// read from the file as it is sent and watched ([`Sent`]).
+/// as a multipart upload of 16 MB parts, eight in flight, when it is not
+/// ([`send_parts`]). A plain `https://` URL -- a presigned PUT -- takes the
+/// whole file in one PUT, read from the file as it is sent and watched
+/// ([`Sent`]).
 pub(super) fn upload(from: &std::path::Path, dest: &str) -> Result<u64> {
     let _quiet = QuietPipe::new();
     runtime("upload")?.block_on(upload_async(from, dest))
 }
 
 async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
-    use std::io::Read;
     // Overridable so the multipart path can be tested on a small file.
     let env_size = |name: &str, default: u64| {
         std::env::var(name)
@@ -743,26 +743,198 @@ async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
             .map_err(|e| fail(explain(&e.to_string())))?;
         return Ok(size);
     }
-    let upload = store
+    let file = std::fs::File::open(from)?;
+    let mut upload = store
         .put_multipart(&path)
         .await
         .map_err(|e| fail(explain(&e.to_string())))?;
-    let mut writer = object_store::WriteMultipart::new_with_chunk_size(upload, chunk);
-    let mut file = std::fs::File::open(from)?;
-    let mut buf = vec![0u8; chunk];
-    loop {
-        let n = file.read(&mut buf)?;
+    send_parts(upload.as_mut(), file, chunk)
+        .await
+        .map_err(fail)?;
+    Ok(size)
+}
+
+/// Parts of an upload in flight at once.
+const PARTS_IN_FLIGHT: usize = 8;
+
+/// What became of one part: sent, or why not.
+type PartSent = std::result::Result<(), String>;
+
+/// Says what became of a part when it is dropped, sent or not: a part a
+/// thread dropped unsent (it panicked, or its runtime is gone) fails the
+/// upload rather than leaves it waiting.
+struct PartReport {
+    to: futures::channel::mpsc::UnboundedSender<PartSent>,
+    sent: Option<PartSent>,
+}
+
+impl PartReport {
+    fn say(mut self, sent: PartSent) {
+        self.sent = Some(sent);
+    }
+}
+
+impl Drop for PartReport {
+    fn drop(&mut self) {
+        let sent = self
+            .sent
+            .take()
+            .unwrap_or_else(|| Err("an upload thread stopped before its part was sent".into()));
+        let _ = self.to.unbounded_send(sent);
+    }
+}
+
+/// Sends `file` as the parts of `upload`, `chunk` bytes each,
+/// [`PARTS_IN_FLIGHT`] at once, and completes it; aborts it on the first
+/// failure.
+///
+/// Where there are cores for them and the system gives them, the parts are
+/// sent from up to [`LANES`] threads compara starts itself, each driving its
+/// requests on a runtime of its own, while this thread reads the file: the
+/// work of a part -- its signature's SHA-256 over the body, TLS, the socket
+/// writes -- runs on several cores, as under tokio's multi-thread runtime
+/// with four workers, where on this thread alone a 1 GiB upload took 1.7 s
+/// of one core. A thread the system refuses is a lane fewer, never an error;
+/// with none, this thread sends them. The lanes go on driving their runtimes
+/// until the upload is complete, for a connection one of them opened may
+/// carry a later request.
+async fn send_parts(
+    upload: &mut dyn object_store::MultipartUpload,
+    mut file: std::fs::File,
+    chunk: usize,
+) -> std::result::Result<(), String> {
+    use futures::FutureExt;
+    use futures::future::BoxFuture;
+    use std::io::Read;
+    use std::task::Poll;
+    type Lane = (
+        std::thread::JoinHandle<()>,
+        futures::channel::mpsc::UnboundedSender<BoxFuture<'static, ()>>,
+    );
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let (end_tx, end_rx) = futures::channel::oneshot::channel::<()>();
+    let end = end_rx.shared();
+    let (report, mut reports) = futures::channel::mpsc::unbounded::<PartSent>();
+    let mut lanes: Vec<Lane> = Vec::new();
+    if LANES.min(cores) > 1 {
+        for _ in 0..LANES.min(cores) {
+            let (to_lane, parts) = futures::channel::mpsc::unbounded::<BoxFuture<'static, ()>>();
+            let (ready_tx, ready) = futures::channel::oneshot::channel::<()>();
+            let end = end.clone();
+            let spawned = std::thread::Builder::new()
+                .name("compara-upload".into())
+                .spawn(move || {
+                    let _quiet = QuietPipe::new();
+                    // A lane whose runtime cannot start says nothing and
+                    // takes no parts.
+                    if let Ok(rt) = runtime("upload") {
+                        let _ = ready_tx.send(());
+                        rt.block_on(async move {
+                            let work = parts.for_each_concurrent(None, |part| part);
+                            futures::future::select(std::pin::pin!(work), end.clone()).await;
+                            let _ = end.await;
+                        });
+                    }
+                });
+            match spawned {
+                Ok(thread) => {
+                    if ready.await.is_ok() {
+                        lanes.push((thread, to_lane));
+                    } else {
+                        let _ = thread.join();
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    let mut here = futures::stream::FuturesUnordered::<BoxFuture<'static, ()>>::new();
+    // The next report, while driving the parts sent from this thread.
+    async fn next_report(
+        here: &mut futures::stream::FuturesUnordered<BoxFuture<'static, ()>>,
+        reports: &mut futures::channel::mpsc::UnboundedReceiver<PartSent>,
+    ) -> Option<PartSent> {
+        futures::future::poll_fn(|cx| {
+            while let Poll::Ready(Some(())) = here.poll_next_unpin(cx) {}
+            reports.poll_next_unpin(cx)
+        })
+        .await
+    }
+    let mut failed: Option<String> = None;
+    let mut in_flight = 0usize;
+    let mut turn = 0usize;
+    'parts: loop {
+        while in_flight >= PARTS_IN_FLIGHT {
+            in_flight -= 1;
+            if let Some(Err(e)) = next_report(&mut here, &mut reports).await {
+                failed = Some(e);
+                break 'parts;
+            }
+        }
+        let mut buf = vec![0u8; chunk];
+        let mut n = 0;
+        while n < chunk {
+            match file.read(&mut buf[n..]) {
+                Ok(0) => break,
+                Ok(got) => n += got,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    failed = Some(e.to_string());
+                    break 'parts;
+                }
+            }
+        }
         if n == 0 {
             break;
         }
-        writer
-            .wait_for_capacity(8)
-            .await
-            .map_err(|e| fail(e.to_string()))?;
-        writer.write(&buf[..n]);
+        buf.truncate(n);
+        let sending = upload.put_part(buf.into());
+        let done = PartReport {
+            to: report.clone(),
+            sent: None,
+        };
+        let part: BoxFuture<'static, ()> = async move {
+            done.say(sending.await.map_err(|e| explain(&e.to_string())));
+        }
+        .boxed();
+        in_flight += 1;
+        turn += 1;
+        let part = match lanes.get(turn % lanes.len().max(1)) {
+            Some((_, to_lane)) => match to_lane.unbounded_send(part) {
+                Ok(()) => continue,
+                Err(e) => e.into_inner(),
+            },
+            None => part,
+        };
+        here.push(part);
     }
-    writer.finish().await.map_err(|e| fail(e.to_string()))?;
-    Ok(size)
+    while failed.is_none() && in_flight > 0 {
+        in_flight -= 1;
+        match next_report(&mut here, &mut reports).await {
+            Some(Ok(())) => {}
+            Some(Err(e)) => failed = Some(e),
+            None => failed = Some("the upload's parts stopped reporting".into()),
+        }
+    }
+    let result = match failed {
+        None => upload
+            .complete()
+            .await
+            .map(|_| ())
+            .map_err(|e| explain(&e.to_string())),
+        Some(e) => Err(e),
+    };
+    drop(here);
+    let _ = end_tx.send(());
+    for (thread, to_lane) in lanes {
+        drop(to_lane);
+        let _ = thread.join();
+    }
+    if result.is_err() {
+        // Parts already sent are otherwise kept, and billed, by S3 and GCS.
+        let _ = upload.abort().await;
+    }
+    result
 }
 
 /// The slowest a server may take a plain PUT and still be waited for, in
