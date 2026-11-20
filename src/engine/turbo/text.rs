@@ -3026,6 +3026,9 @@ fn json_rows_match_counted<S: Scan>(
     // The lowest byte the backward read may look at: the brace, and later the
     // byte after the last value skipped.
     let mut floor = s - 1;
+    // A backslash was passed before a difference, so a name read backwards
+    // may be written with escapes.
+    let mut escapes = false;
     for _ in 0..64 {
         let left = a_hi - ai;
         let m = left.min(b_hi - bi);
@@ -3070,14 +3073,19 @@ fn json_rows_match_counted<S: Scan>(
             return Some(false); // B ends first
         }
         if odd {
-            return None;
+            // A backslash that hides no quote leaves the count as it was.
+            if !escapes_keep_the_count(scan, a, ai, same) {
+                return None;
+            }
+            escapes = true;
         }
         let diff = ai + same;
-        let (vs, ve) = match json_member_back(scan, p, a, a_hi, floor, diff, quotes & 1 == 1) {
-            Some(Some(found)) => found,
-            Some(None) => return Some(false),
-            None => return None,
-        };
+        let (vs, ve) =
+            match json_member_back(scan, p, a, a_hi, floor, diff, quotes & 1 == 1, escapes) {
+                Some(Some(found)) => found,
+                Some(None) => return Some(false),
+                None => return None,
+            };
         let b_vs = bi + (vs - ai);
         let b_ve = json_value_end(scan, b, b_vs, b.len());
         if b_ve >= b_hi || b_ve <= b_vs {
@@ -3090,15 +3098,61 @@ fn json_rows_match_counted<S: Scan>(
     Some(false)
 }
 
+/// Are the backslashes, braces and brackets the count passed in A's row, in
+/// the `same` bytes from `from`, all escapes that hide no quote? A brace or
+/// bracket opens a nested value; a backslash hides a quote only where it
+/// escapes one (`\"`) or another backslash (`\\`, which may escape what
+/// follows it). Any other escape (Python's `\u00e9`, PHP's `\/`) leaves every
+/// quote opening or closing a string, as it was, and the backward read of a
+/// name finds its quotes.
+///
+/// A second pass, after the count's loop: a writer that escapes nothing never
+/// comes here, and its rows keep the loop they had. The count's loop read
+/// every register here, so each is inside the slab.
+#[inline(always)]
+fn escapes_keep_the_count<S: Scan>(scan: S, a: &[u8], from: usize, same: usize) -> bool {
+    let mut i = 0;
+    while i < same {
+        let at = from + i;
+        let before = if same - i >= S::STEP {
+            u64::MAX >> (64 - S::STEP)
+        } else {
+            (1u64 << (same - i)) - 1
+        };
+        let o = (scan.hits(a, at, b'\\', b'{') | scan.hits(a, at, b'[', b'[')) & before;
+        if o != 0 {
+            let backslashes = scan.hits(a, at, b'\\', b'\\');
+            if o & !backslashes != 0 {
+                return false; // a brace or a bracket
+            }
+            // Bit j: byte j + 1 is a quote or a backslash. The register's last
+            // byte is followed by the next register's first, or by the end of
+            // the slab.
+            if o >> (S::STEP - 1) & 1 != 0
+                && matches!(a.get(at + S::STEP), None | Some(b'"' | b'\\'))
+            {
+                return false;
+            }
+            if o & (scan.hits(a, at, b'"', b'"') | backslashes) >> 1 != 0 {
+                return false;
+            }
+        }
+        i += S::STEP;
+    }
+    true
+}
+
 /// The value of the member `diff` is in, read backwards from `diff`: from it
 /// to the colon, then the name before that, which must be one nobody tracks.
 /// `inside` says `diff` is inside a string. `floor` is the lowest byte the read
-/// may look at.
+/// may look at. `escapes` says a backslash was passed, so the name may be
+/// written with escapes and is looked up as what they spell.
 ///
 /// `None` is a shape this does not follow; `Some(None)` a member the walk would
 /// not skip either: a tracked name, or a difference in a name or between
 /// members.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn json_member_back<S: Scan>(
     scan: S,
     p: &RowParser,
@@ -3107,6 +3161,7 @@ fn json_member_back<S: Scan>(
     floor: usize,
     diff: usize,
     inside: bool,
+    escapes: bool,
 ) -> Option<Option<(usize, usize)>> {
     let mut k = diff;
     let back = |k: &mut usize| -> Option<u8> {
@@ -3157,7 +3212,13 @@ fn json_member_back<S: Scan>(
     if c != b',' && c != b'{' {
         return None;
     }
-    if p.slot_for(&d[name_start..name_end]).is_some() {
+    let name = &d[name_start..name_end];
+    let tracked = if escapes && name.contains(&b'\\') {
+        p.slot_for_escaped(name)
+    } else {
+        p.slot_for(name)
+    };
+    if tracked.is_some() {
         return Some(None);
     }
     let mut vs = colon + 1;
@@ -3486,6 +3547,112 @@ mod tests {
         assert!(
             proved > 2000 && proved_escaped > 1000,
             "too few rows proved to test anything: {proved}, {proved_escaped} with an escape"
+        );
+    }
+
+    /// The counted proof answers rows whose names and values carry escapes
+    /// that hide no quote (Python's `\u00e9`, a surrogate pair, PHP's `\/`)
+    /// instead of handing them to the walk, and its answer is the walk's.
+    /// Rows also carry `\"` and `\\`, which it hands over, at every offset in
+    /// a register: a filler member moves them along a byte at a time, so a
+    /// backslash falls on a register's last byte with its quote in the next.
+    #[test]
+    fn the_counted_proof_passes_escapes_that_hide_no_quote() {
+        let Some(w) = Wide::detect() else {
+            return;
+        };
+        let p = RowParser::json(
+            ["id", "amount", "not\u{e9}"]
+                .iter()
+                .map(|n| Some(n.to_string()))
+                .collect(),
+            1,
+            false,
+        );
+        let names = [
+            "id",
+            "\\u0069d",
+            "amount",
+            "not\\u00e9",
+            "not\\u00E9",
+            "not\u{e9}",
+            "caf\\u00e9",
+            "\\ud83d\\ude00",
+            "a\\/b",
+            "upd",
+            "q\\\"",
+            "b\\\\",
+            "a\\\\u0062",
+        ];
+        let values = [
+            "\"a\"",
+            "12",
+            "\"caf\\u00e9\"",
+            "\"\\ud834\\udd1e\"",
+            "\"x\\/y\"",
+            "\"q\\\"r\"",
+            "\"\\\\\"",
+            "\"\\\\\\\"\"",
+            "\"\\u0022\"",
+            "null",
+        ];
+        let mut seed = 0x6a09_e667_f3bc_c908u64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let (mut answered, mut answered_escaped) = (0, 0);
+        for _ in 0..40_000 {
+            let fill = "f".repeat(next(40));
+            let n = 2 + next(5);
+            let mut members: Vec<(usize, usize)> = (0..n)
+                .map(|_| (next(names.len()), next(values.len())))
+                .collect();
+            members.insert(next(n + 1), (usize::MAX, 0));
+            let text = |members: &[(usize, usize)]| {
+                let body: Vec<String> = members
+                    .iter()
+                    .map(|&(m, v)| match m {
+                        usize::MAX => format!("\"{fill}\":0"),
+                        _ => format!("\"{}\":{}", names[m], values[v]),
+                    })
+                    .collect();
+                format!("{{{}}}\n", body.join(","))
+            };
+            let mut b_members = members.clone();
+            let i = next(b_members.len());
+            match next(4) {
+                0 if b_members[i].0 != usize::MAX => b_members[i].1 = next(values.len()),
+                1 if b_members[i].0 != usize::MAX => b_members[i].0 = next(names.len()),
+                2 => {
+                    b_members.remove(i);
+                }
+                _ => {}
+            }
+            let (a_row, b_row) = (text(&members), text(&b_members));
+            let mut a = a_row.clone().into_bytes();
+            a.extend_from_slice(&[b' '; 80]);
+            let mut b = b"{\"pad\":0}\n".to_vec();
+            let b_lo = b.len();
+            b.extend_from_slice(b_row.as_bytes());
+            let b_hi = b.len();
+            b.extend_from_slice(&[b' '; 80]);
+            let walk = json_rows_match_with(Swar, &p, &a, 0, a_row.len(), &b, b_lo, b_hi);
+            let counted = json_rows_match_counted(w, &p, &a, 0, a_row.len(), &b, b_lo, b_hi);
+            if let Some(counted) = counted {
+                assert_eq!(counted, walk, "A {a_row:?} B {b_row:?}");
+                answered += 1;
+                let differ = a_row.bytes().zip(b_row.bytes()).position(|(x, y)| x != y);
+                if a_row[..differ.unwrap_or(a_row.len())].contains('\\') {
+                    answered_escaped += 1;
+                }
+            }
+        }
+        assert!(
+            answered > 10_000 && answered_escaped > 3000,
+            "too few rows answered by the count: {answered}, {answered_escaped} past an escape"
         );
     }
 
