@@ -71,31 +71,55 @@ impl Output {
                     .write(true)
                     .open(dest)
                     .map_err(|e| cannot(dest, &e))?;
+                #[cfg(unix)]
+                is_the_checked_file(&file, &meta).map_err(|e| cannot(dest, &e))?;
                 return Ok(Output {
                     dest: dest.to_path_buf(),
                     temp: None,
                     file: Some(file),
                 });
             }
-            Ok(meta) => Some(meta.permissions()),
+            Ok(meta) => {
+                // A rename ignores the mode of the file it replaces; writing
+                // to the name does not. Asking the system whether this user
+                // may write it keeps a write-protected file protected.
+                OpenOptions::new().write(true).open(dest).map_err(|e| {
+                    Error::new(format!(
+                        "cannot write {}: {e}; the file is write-protected, and compara \
+                         replaces what is at the name: make it writable or name another file",
+                        dest.display()
+                    ))
+                })?;
+                Some(meta.permissions())
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(cannot(dest, &e)),
         };
-        let name = dest.file_name().ok_or_else(|| {
-            Error::new(format!("cannot write {}: it names no file", dest.display()))
-        })?;
+        if dest.file_name().is_none() {
+            return Err(Error::new(format!(
+                "cannot write {}: it names no file",
+                dest.display()
+            )));
+        }
         let dir = match dest.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
         for n in 0..16 {
-            let mut part = std::ffi::OsString::from(".");
-            part.push(name);
-            part.push(format!(".{}-{n}.part", std::process::id()));
-            let temp = dir.join(part);
+            // A name of its own, not one built from the output's: a file name
+            // can be 255 bytes long and the temporary has to fit beside it.
+            let temp = dir.join(format!(".compara-{}-{n}.part", std::process::id()));
+            let mut open = OpenOptions::new();
             // Only where nothing is, so a link or a file at the temporary name
             // is never opened either.
-            match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            open.write(true).create_new(true);
+            // Private while it is written when what it replaces is private;
+            // the mode of the replaced file is put on it just before the move.
+            #[cfg(unix)]
+            if replaced.is_some() {
+                std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+            }
+            match open.open(&temp) {
                 Ok(file) => {
                     return Ok(Output {
                         dest: dest.to_path_buf(),
@@ -104,6 +128,13 @@ impl Output {
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(Error::new(format!(
+                        "cannot write {}: the directory {} does not exist; create it first",
+                        dest.display(),
+                        dir.display()
+                    )));
+                }
                 Err(e) => {
                     return Err(Error::new(format!(
                         "cannot write {}: cannot make a file beside it to write into ({e}); \
@@ -166,6 +197,21 @@ impl Drop for Output {
             drop(self.file.take());
             let _ = fs::remove_file(temp);
         }
+    }
+}
+
+/// A file opened by name is the one a check of the name looked at: the same
+/// device and inode. Between the check and the open the name could be swapped
+/// for a link to something else; the open does not truncate, so a mismatch
+/// costs nothing but the refusal.
+#[cfg(unix)]
+fn is_the_checked_file(file: &File, checked: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let opened = file.metadata()?;
+    if opened.dev() == checked.dev() && opened.ino() == checked.ino() {
+        Ok(())
+    } else {
+        Err(io::Error::other("it changed while it was being opened"))
     }
 }
 
@@ -272,5 +318,79 @@ mod tests {
     #[test]
     fn a_device_is_written_in_place() {
         write(Path::new("/dev/null"), b"discarded").unwrap();
+    }
+
+    #[test]
+    fn a_name_of_any_valid_length_gets_a_temporary_beside_it() {
+        // 255 bytes is the longest name most file systems take; the temporary
+        // name must not depend on the length of the one it stands for.
+        let dir = scratch("long");
+        let dest = dir.join(format!("{}.html", "x".repeat(250)));
+        write(&dest, b"one").unwrap();
+        write(&dest, b"two").unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"two");
+        assert_eq!(left_in(&dir).len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_directory_is_named_as_missing() {
+        let dir = scratch("missing");
+        let err = write(&dir.join("nope").join("r.html"), b"x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(!err.contains("must be writable"), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_temporary_of_a_private_file_is_private_while_it_is_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("private");
+        let dest = dir.join("report.html");
+        fs::write(&dest, b"old").unwrap();
+        fs::set_permissions(&dest, Permissions::from_mode(0o600)).unwrap();
+        let out = Output::create(&dest).unwrap();
+        let (temp, _) = out.temp.as_ref().unwrap();
+        let mode = fs::metadata(temp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "another user could read it before it is moved");
+        drop(out);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_protected_file_is_not_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("protected");
+        let dest = dir.join("report.html");
+        fs::write(&dest, b"old").unwrap();
+        fs::set_permissions(&dest, Permissions::from_mode(0o444)).unwrap();
+        // A user the modes do not bind (root) may write it; nothing to refuse.
+        if OpenOptions::new().write(true).open(&dest).is_ok() {
+            fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let err = write(&dest, b"new").unwrap_err().to_string();
+        assert!(err.contains("write-protected"), "{err}");
+        assert_eq!(fs::read(&dest).unwrap(), b"old");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_opened_in_place_must_be_the_one_that_was_checked() {
+        let dir = scratch("swapped");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        let checked = fs::symlink_metadata(&a).unwrap();
+        let other = OpenOptions::new().write(true).open(&b).unwrap();
+        let same = OpenOptions::new().write(true).open(&a).unwrap();
+        assert!(is_the_checked_file(&other, &checked).is_err());
+        assert!(is_the_checked_file(&same, &checked).is_ok());
+        fs::remove_dir_all(dir).unwrap();
     }
 }
