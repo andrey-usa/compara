@@ -26,7 +26,9 @@ pub struct Output {
     /// The temporary file `commit` moves onto `dest`, and the mode of the file
     /// it replaces; `None` when `dest` is written in place (a FIFO, a device).
     temp: Option<(PathBuf, Option<Permissions>)>,
-    file: File,
+    /// Taken and closed by `commit` before the rename: Windows renames an
+    /// open file only when every handle on it allows it.
+    file: Option<File>,
 }
 
 fn cannot(dest: &Path, e: &io::Error) -> Error {
@@ -61,7 +63,7 @@ impl Output {
                 return Ok(Output {
                     dest: dest.to_path_buf(),
                     temp: None,
-                    file,
+                    file: Some(file),
                 });
             }
             Ok(meta) => Some(meta.permissions()),
@@ -87,7 +89,7 @@ impl Output {
                     return Ok(Output {
                         dest: dest.to_path_buf(),
                         temp: Some((temp, replaced)),
-                        file,
+                        file: Some(file),
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -109,7 +111,9 @@ impl Output {
 
     /// Puts the written file at its name, in one step.
     pub fn commit(mut self) -> Result<()> {
-        self.file.flush().map_err(|e| cannot(&self.dest, &e))?;
+        if let Some(mut file) = self.file.take() {
+            file.flush().map_err(|e| cannot(&self.dest, &e))?;
+        }
         if let Some((temp, mode)) = self.temp.take() {
             let moved = mode
                 .map_or(Ok(()), |m| fs::set_permissions(&temp, m))
@@ -123,23 +127,32 @@ impl Output {
     }
 }
 
+impl Output {
+    fn open(&mut self) -> io::Result<&mut File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("the output is already committed"))
+    }
+}
+
 impl Write for Output {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.file.write(buf)
+        self.open()?.write(buf)
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.file.write_all(buf)
+        self.open()?.write_all(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        self.open()?.flush()
     }
 }
 
 impl Drop for Output {
     fn drop(&mut self) {
         if let Some((temp, _)) = self.temp.take() {
+            drop(self.file.take());
             let _ = fs::remove_file(temp);
         }
     }
