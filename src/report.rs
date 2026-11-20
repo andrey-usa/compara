@@ -96,23 +96,33 @@ pub fn render(result: &CompareResult, compress: bool) -> Result<String> {
     };
     drop(raw);
 
-    let title = format!("{} → {}", result.meta.a.name, result.meta.b.name);
-    let shell = TEMPLATE
-        .replace("__TITLE__", &escape_html(&title))
-        .replace("__MODE__", mode);
-    // The payload is the whole of the file's size, so the last substitution is
-    // the one that has to be sized rather than discovered: `String::replace`
-    // would grow its buffer by doubling and abort on the growth that did not
-    // fit.
-    let at = shell
-        .find("__PAYLOAD__")
-        .ok_or_else(|| Error::new("the report template has no payload slot"))?;
-    let need = shell.len() - "__PAYLOAD__".len() + payload.len();
+    let title = escape_html(&format!("{} → {}", result.meta.a.name, result.meta.b.name));
+    // Each slot is looked for in the template, in the order the template has
+    // them, never in text already put in: replacing them one after another
+    // found a slot inside a file name, so `x__PAYLOAD__.csv` took the payload
+    // into the page title and left the report blank. One buffer sized up
+    // front, because the payload is the whole of the file's size and a buffer
+    // grown by doubling aborts on the growth that does not fit.
+    let slots = [
+        ("__TITLE__", title.as_str()),
+        ("__MODE__", mode),
+        ("__PAYLOAD__", payload.as_str()),
+    ];
+    let need = slots.iter().fold(TEMPLATE.len(), |n, (slot, with)| {
+        n - slot.len() + with.len()
+    });
     let mut out: Vec<u8> = crate::alloc::sized(need, "the report")?;
-    out.extend_from_slice(&shell.as_bytes()[..at]);
-    out.extend_from_slice(payload.as_bytes());
-    out.extend_from_slice(&shell.as_bytes()[at + "__PAYLOAD__".len()..]);
-    // Three `&str` concatenated, so UTF-8 by construction.
+    let mut rest = TEMPLATE;
+    for (slot, with) in slots {
+        let at = rest
+            .find(slot)
+            .ok_or_else(|| Error::new(format!("the report template has no {slot} slot")))?;
+        out.extend_from_slice(&rest.as_bytes()[..at]);
+        out.extend_from_slice(with.as_bytes());
+        rest = &rest[at + slot.len()..];
+    }
+    out.extend_from_slice(rest.as_bytes());
+    // `&str`s concatenated, so UTF-8 by construction.
     String::from_utf8(out).map_err(|_| Error::new("the report is not UTF-8"))
 }
 

@@ -109,6 +109,35 @@ fn the_title_is_html_escaped() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// A file name that spells one of the template's slots is text in the title,
+/// not a place to put the payload: `x__PAYLOAD__.csv` took the payload into
+/// the title and left the report's own slot empty, so the page said the
+/// browser could not decode it.
+#[test]
+fn a_file_name_that_spells_a_slot_stays_a_file_name() {
+    let (mut result, dir) = sample();
+    for compress in [true, false] {
+        result.meta.a.name = "x__PAYLOAD____MODE____TITLE__.csv".to_string();
+        let html = render(&result, compress).expect("render");
+        let title = &html[html.find("<title>").unwrap() + 7..html.find("</title>").unwrap()];
+        assert!(
+            title.starts_with("x__PAYLOAD____MODE____TITLE__.csv"),
+            "{title}"
+        );
+        let (mode, body) = payload(&html);
+        assert_eq!(mode, if compress { "gzip" } else { "json" });
+        assert_ne!(body, "__PAYLOAD__", "the payload went elsewhere");
+        if !compress {
+            let decoded: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+            assert_eq!(
+                decoded["meta"]["a"]["name"],
+                "x__PAYLOAD____MODE____TITLE__.csv"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// The compact `[column, a, b]` triple every implementation reads.
 #[test]
 fn a_cell_diff_serialises_as_a_triple() {

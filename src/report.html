@@ -190,7 +190,7 @@ function openDrawer(i){const t=tab(),r=S.view[i];if(!r||t.id==='columns')return;
   dr.innerHTML=`<h2><span>${esc(keyv)}</span><button id="cp" title="Copy key">Copy key</button><button id="cl" title="Close (Esc)">Close</button></h2>${body}`;dr.hidden=false;
   dr.querySelector('#cl').onclick=closeDrawer;dr.querySelector('#cp').onclick=()=>navigator.clipboard&&navigator.clipboard.writeText(keyv);}
 function closeDrawer(){dr.hidden=true;if(S.sel>=0){S.sel=-1;paint();}}
-function download(){const t=tab();if(t.id==='columns')return;const cq=v=>{v=v==null?'':String(v);return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};
+function download(){const t=tab();if(t.id==='columns')return;const cq=v=>{v=v==null?'':String(v);return /[",\r\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;};
   let lines=[];
   if(t.id==='changed'){lines.push([...K,'column','A','B'].map(cq).join(','));S.view.forEach(r=>r[NK].forEach(c=>lines.push([...r.slice(0,NK),CMP[c[0]],c[1],c[2]].map(cq).join(','))));}
   else{lines.push(t.cols.map(cq).join(','));S.view.forEach(r=>lines.push(r.map(cq).join(',')));}

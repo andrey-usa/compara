@@ -189,6 +189,12 @@ All notable changes to this project are documented here. The format follows
   column, in the first object as in the later ones: the row parser reads
   no member there, and `compara columns` listed a column empty in every
   row.
+- A file named with `__PAYLOAD__` (or `__MODE__`, `__TITLE__`) in it gave a
+  blank report that said the browser could not decode it: the template's
+  slots were looked for in text already put in, and the payload went into
+  the page title.
+- The report's "Download shown rows as CSV" quotes a value that holds a
+  carriage return; such a value split its row in a spreadsheet.
 
 ## [0.7.0] - 2026-11-17
 
