@@ -150,6 +150,135 @@ mod tests {
         let t: Task<'_, u32> = Task::Done(7);
         assert_eq!(t.join().unwrap(), 7);
     }
+
+    /// A thread the OS starts but that has no room left to set itself up runs
+    /// its work here instead of taking the process down. The runtime maps an
+    /// alternate signal stack for every thread it starts, on that thread and
+    /// before the work, and when the mapping is refused it aborts (exit 134,
+    /// "failed to allocate an alternative stack"). A stack from the C
+    /// library's cache of finished threads' stacks needs no new memory, so the
+    /// spawn itself succeeds at a heap limit that is already full -- which is
+    /// how a comparison that had just taken the last of its heap met it.
+    ///
+    /// The abort is the whole process, so the case runs in a child: this test
+    /// binary again, running only this test, with the limit set inside.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn a_thread_with_no_room_to_start_runs_its_work_here() {
+        const CHILD: &str = "COMPARA_TEST_NO_ROOM_FOR_A_THREAD";
+        if std::env::var_os(CHILD).is_some() {
+            no_room::run();
+            return;
+        }
+        let exe = std::env::current_exe().expect("the test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "parallel::tests::a_thread_with_no_room_to_start_runs_its_work_here",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            // With a backtrace asked for, the panic's report allocates at the
+            // limit and deadlocks in the allocation error hook instead of
+            // aborting; the deadline below is for that.
+            .env("RUST_BACKTRACE", "0")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the test binary runs");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break Some(status);
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read;
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "the child ended with {status:?} (None: it hung):\n{stderr}"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    mod no_room {
+        use std::ffi::c_int;
+
+        #[repr(C)]
+        struct RLimit {
+            cur: u64,
+            max: u64,
+        }
+
+        unsafe extern "C" {
+            fn getrlimit(resource: c_int, rlim: *mut RLimit) -> c_int;
+            fn setrlimit(resource: c_int, rlim: *const RLimit) -> c_int;
+        }
+
+        const RLIMIT_DATA: c_int = 2;
+
+        fn data_limit() -> RLimit {
+            let mut now = RLimit { cur: 0, max: 0 };
+            // SAFETY: `now` is a valid, writable rlimit for the call to fill.
+            assert_eq!(unsafe { getrlimit(RLIMIT_DATA, &mut now) }, 0);
+            now
+        }
+
+        fn set_soft_data_limit(cur: u64, max: u64) {
+            let new = RLimit { cur, max };
+            // SAFETY: a valid rlimit whose soft limit is at most the hard one.
+            assert_eq!(unsafe { setrlimit(RLIMIT_DATA, &new) }, 0);
+        }
+
+        /// What `RLIMIT_DATA` is measured against: `VmData`, in bytes.
+        fn data_in_use() -> u64 {
+            let status = std::fs::read_to_string("/proc/self/status").expect("/proc");
+            let line = status
+                .lines()
+                .find(|l| l.starts_with("VmData:"))
+                .expect("VmData");
+            let kb: String = line.chars().filter(char::is_ascii_digit).collect();
+            kb.parse::<u64>().expect("a number") * 1024
+        }
+
+        pub fn run() {
+            // A finished, joined thread: its stack goes to the C library's
+            // cache, and the heap it allocated from keeps free room for the
+            // next thread's own few allocations.
+            std::thread::scope(|scope| {
+                let warm = std::thread::Builder::new().spawn_scoped(scope, || {
+                    std::hint::black_box(vec![1u8; 64 << 10]);
+                });
+                warm.expect("a thread with no limit")
+                    .join()
+                    .expect("joined");
+            });
+            let was = data_limit();
+            // With room under a limit, the thread is started and waited for
+            // until it is set up; the work runs there.
+            set_soft_data_limit(data_in_use() + (64 << 20), was.max);
+            let there = || std::thread::current().id();
+            let ran_on = std::thread::scope(|scope| super::super::spawn(scope, &there).join());
+            assert_ne!(ran_on.expect("the work ran"), std::thread::current().id());
+            let used = data_in_use();
+            // Full to the page: nothing left for a new mapping.
+            set_soft_data_limit(used, was.max);
+            let work = || 6 * 7;
+            let got = std::thread::scope(|scope| super::super::spawn(scope, &work).join());
+            set_soft_data_limit(was.cur, was.max);
+            assert_eq!(got.expect("the work ran"), 42);
+        }
+    }
 }
 
 /// The failure a run reports when lanes take numbered jobs in order (from a
