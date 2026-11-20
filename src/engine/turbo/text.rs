@@ -13,8 +13,8 @@
 #[cfg(target_arch = "x86_64")]
 use super::field::Wide512;
 use super::field::{
-    ABSENT, Delims, Field, Scan, Swar, Wide, next_of1, next_of1_with, next_of2, next_of2_with,
-    next_of3_with, pack, skip_quoted, skip_quoted_with,
+    ABSENT, Delims, Field, Scan, Swar, Wide, next_of1, next_of1_with, next_of2,
+    next_of2_or_control, next_of2_with, next_of3_with, pack, skip_quoted, skip_quoted_with,
 };
 use super::slab::{Dialect, Slab, json_string, text_of};
 use crate::error::{Error, Result};
@@ -427,17 +427,17 @@ fn starts_with_short(data: &[u8], text: &[u8]) -> bool {
 /// It is also the one walk over every row before the comparison, so it says
 /// where a file is not the JSON it is read as: a row that is not an object,
 /// an object of a framed file it cannot follow to its closing brace, and,
-/// read a line at a time, an object that runs onto the next line or has
-/// more after it on its own. The row parser reads each of those as some
-/// other number of rows than the file holds, and a split of the file for
-/// threads can start a piece inside one, so the answer moved with the
-/// thread count. In a framed file, between two rows there is space and a
-/// comma at most, a `]` only as the closing bracket of the array the file
-/// opens with, and after it nothing but space: the parser took any `]` for
-/// the end of the rows and anything else for the end of a line. A member
-/// name that is not UTF-8 is refused too: the header names it with a
-/// replacement character, the parser would look it up as written, and the
-/// column was read on neither side.
+/// read a line at a time, an object that runs onto the next line (a line
+/// feed in one of its strings included) or has more after it on its own.
+/// The row parser reads each of those as some other number of rows than the
+/// file holds, and a split of the file for threads can start a piece inside
+/// one, so the answer moved with the thread count. In a framed file, between
+/// two rows there is space and a comma at most, a `]` only as the closing
+/// bracket of the array the file opens with, and after it nothing but space:
+/// the parser took any `]` for the end of the rows and anything else for the
+/// end of a line. A member name that is not UTF-8 is refused too: the header
+/// names it with a replacement character, the parser would look it up as
+/// written, and the column was read on neither side.
 ///
 /// And it says whether any object names a member twice (`LaterKeys::repeats`):
 /// where none does, the row parser may stop at the keys (see
@@ -453,9 +453,9 @@ pub(super) fn json_later_keys(
     max_rows: usize,
     budget: &KeyBudget,
 ) -> Result<LaterKeys> {
-    // One walk for each framing rather than one asking a flag: the framed
-    // one checks what lies between rows, which the line-read one need not
-    // pay for.
+    // One walk for each framing rather than one asking a flag: the
+    // line-read walk asks every string for a line feed too, and the framed
+    // one checks what lies between rows, neither of which the other pays.
     if array {
         later_keys::<false>(slab, lo, hi, known, max_rows, budget)
     } else {
@@ -547,9 +547,10 @@ fn later_keys<const LINES: bool>(
         let row = pos;
         pos += 1;
         let mut closed = false;
-        // A line feed met between the object's tokens: newline-delimited
-        // JSON has none, and outside its strings that is the only place
-        // one can be (a scalar ends at one, a nested value is searched).
+        // A line feed met inside the object, read a line at a time:
+        // newline-delimited JSON has none. Between tokens it is seen as
+        // space, in a string by the string's own scan, and a nested value
+        // is searched; a scalar ends at one.
         let mut lines = false;
         // A framed file's value the walk cannot follow as the splits for
         // threads do, by its braces (see `later_value_end`).
@@ -602,7 +603,7 @@ fn later_keys<const LINES: bool>(
                 continue;
             }
             let key_from = pos + 1;
-            let (key_end, escaped) = skip_json_string(scan, data, pos, end);
+            let (key_end, escaped) = later_string::<_, LINES>(scan, data, pos, end, &mut lines);
             if key_end > end || key_end <= key_from {
                 break;
             }
@@ -709,7 +710,7 @@ fn later_keys<const LINES: bool>(
             // A line is a row: the object closes on the line it opens, with
             // nothing after it there but space.
             if lines {
-                return Err(not_a_row(data, row, "runs onto the next line", false));
+                return Err(off_its_line(data, row));
             }
             if closed {
                 let line_end = next_of1_with(scan, data, pos, end, b'\n');
@@ -820,10 +821,10 @@ fn name_not_utf8(data: &[u8], at: usize) -> Error {
 
 /// Past one value for [`json_later_keys`], as [`json_value_end`] is.
 ///
-/// Read a line at a time (`LINES`), a line feed inside a nested value is
-/// noted in `lines`. Only a nested value is searched: a string cannot hold
-/// one, and a number or a literal ends at one, which the walk then steps
-/// over as space.
+/// Read a line at a time (`LINES`), a line feed inside the value is noted in
+/// `lines`: a string's own scan looks for one, a nested value is searched,
+/// and a number or a literal ends at one, which the walk then steps over as
+/// space.
 ///
 /// Framed, the splits for threads find rows by their braces alone
 /// ([`json_array_row_starts`]): a value the walk follows otherwise is noted in
@@ -845,7 +846,7 @@ fn later_value_end<S: Scan, const LINES: bool>(
         return end;
     }
     match d[at] {
-        b'"' => skip_json_string(scan, d, at, end).0,
+        b'"' => later_string::<S, LINES>(scan, d, at, end, lines).0,
         b'{' | b'[' if LINES => {
             let to = skip_json_nested(scan, d, at, end);
             *lines |= next_of1_with(scan, d, at, to, b'\n') < to;
@@ -868,6 +869,65 @@ fn later_value_end<S: Scan, const LINES: bool>(
             }
             at
         }
+    }
+}
+
+/// [`skip_json_string`] for [`json_later_keys`]: read a line at a time
+/// (`LINES`), a line feed in the string, raw or after a backslash, is noted
+/// in `lines`. JSON writes one as `\n`; the row parser ends a line-read row
+/// at the first line feed, so a row holding one was two, the second keyless,
+/// and two files differing past it compared as equal.
+///
+/// The line feed is a third byte for the string's scan to stop at, which is
+/// all it costs a string that holds none.
+#[inline(always)]
+fn later_string<S: Scan, const LINES: bool>(
+    scan: S,
+    data: &[u8],
+    mut at: usize,
+    end: usize,
+    lines: &mut bool,
+) -> (usize, bool) {
+    if !LINES {
+        return skip_json_string(scan, data, at, end);
+    }
+    at += 1; // the opening quote
+    let mut escaped = false;
+    loop {
+        let stop = if S::WIDE {
+            next_of3_with(scan, data, at, end, b'"', b'\\', b'\n')
+        } else {
+            next_of2_or_control(data, at, end, b'"', b'\\')
+        };
+        if stop >= end {
+            return (end, escaped);
+        }
+        if data[stop] == b'"' {
+            return (stop + 1, escaped);
+        }
+        // Out of the string's path: worked out together with the quote's,
+        // the line feed's flag cost every string a few instructions.
+        let (next, backslash, lf) = past_a_backslash_or_line_feed(data, stop);
+        escaped |= backslash;
+        *lines |= lf;
+        at = next;
+        if at > end {
+            return (end, escaped);
+        }
+    }
+}
+
+/// Past the backslash or control character at `at` inside a string: where
+/// the scan goes on, whether it was a backslash, and whether a line feed was
+/// passed (the byte itself, or the one a backslash escapes). Another control
+/// character, a tab say, is the string's own.
+#[cold]
+#[inline(never)]
+fn past_a_backslash_or_line_feed(data: &[u8], at: usize) -> (usize, bool, bool) {
+    match data[at] {
+        // The backslash and whatever it escapes.
+        b'\\' => (at + 2, true, data.get(at + 1) == Some(&b'\n')),
+        c => (at + 1, false, c == b'\n'),
     }
 }
 
@@ -941,6 +1001,37 @@ fn line_and_text(data: &[u8], at: usize) -> (usize, String) {
         .take_while(|&c| c != '\n' && c != '\r')
         .collect();
     (line, shown)
+}
+
+/// A line-read row the walk saw a line feed in, said by where the first one
+/// is: inside a string, which no rewriting of the layout mends, or between
+/// the object's tokens. Walked again from the row's start, so the answer is
+/// the row's own whichever piece of the file found it.
+#[cold]
+#[inline(never)]
+fn off_its_line(data: &[u8], row: usize) -> Error {
+    let mut in_string = false;
+    let mut at = row;
+    while at < data.len() {
+        let c = data[at];
+        // A backslash before a line feed escapes nothing JSON has.
+        if in_string && (c == b'\n' || (c == b'\\' && data.get(at + 1) == Some(&b'\n'))) {
+            let (line, shown) = line_and_text(data, row);
+            return Error::input(format!(
+                "line {line} ({shown:?}) has a line break inside a string: JSON writes it \
+                 as \\n, and this file is read one object a line (its first object keeps \
+                 to one line), so the row would end there; have the writer escape it"
+            ));
+        }
+        match c {
+            b'\n' => break,
+            b'\\' if in_string => at += 1,
+            b'"' => in_string = !in_string,
+            _ => {}
+        }
+        at += 1;
+    }
+    not_a_row(data, row, "runs onto the next line", false)
 }
 
 /// An object of a framed file the walk could not follow to its closing
@@ -4138,6 +4229,44 @@ mod tests {
         ] {
             assert_eq!(walk(text).rows, rows, "{text:?}");
         }
+    }
+
+    /// Read a line at a time, a row holding a line feed in a string -- raw,
+    /// or after a backslash, in a value or a name -- is refused with its
+    /// line: the row parser ended the row there and read the rest of the
+    /// string as a keyless row, so two files differing past it compared as
+    /// equal. One between the tokens is said as before.
+    #[test]
+    fn a_line_read_row_with_a_line_feed_in_a_string_is_refused() {
+        for text in [
+            "{\"id\":1,\"v\":\"a\"}\n{\"id\":2,\"v\":\"x\ny\"}\n",
+            "{\"id\":1,\"v\":\"a\"}\n{\"id\":2,\"v\":\"x\\\ny\"}\n",
+            "{\"id\":1,\"v\":\"a\"}\n{\"v\":\"\n\",\"id\":2}\n",
+            "{\"id\":1,\"v\":\"a\"}\n{\"id\":2,\"x\ny\":1}\n",
+            "{\"id\":1,\"v\":\"a\"}\n{\"id\":2,\"v\":[\"x\ny\"]}\n",
+        ] {
+            let got = walk_refused(text);
+            assert!(
+                got.starts_with("line 2 (") && got.contains("has a line break inside a string"),
+                "{text:?}: {got}"
+            );
+        }
+        let got = walk_refused("{\"id\":1}\n{\"id\":2,\n\"v\":\"x\ny\"}\n");
+        assert!(
+            got.contains("line 2 (") && got.contains("runs onto the next line"),
+            "{got}"
+        );
+        // An object broken before its brace on its own line is read as far
+        // as the row parser reads it, as before: line by line, the rows are
+        // the same at every thread count.
+        assert_eq!(walk("{\"id\":1}\n{\"id\":2 x}\n{\"id\":3}\n").rows, 3);
+        assert_eq!(walk("{\"id\":1}\n{\"id\":2,\"v\":\"ab").rows, 2);
+        // An escaped line feed, and a backslash before the closing quote,
+        // are a string's own.
+        assert_eq!(
+            walk("{\"id\":1,\"v\":\"a\"}\n{\"id\":2,\"v\":\"x\\ny\\\\\"}\n").rows,
+            2
+        );
     }
 
     /// A row parses to the same fields at either scan width. Only runs where

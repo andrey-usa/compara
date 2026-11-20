@@ -981,6 +981,44 @@ fn framed_json_with_text_between_rows_is_refused_at_every_thread_count() {
     }
 }
 
+/// A line feed inside a string of a later row of newline-delimited JSON is
+/// refused with its line at every thread count. The row parser ended the row
+/// at it and read the string's tail as a row of no key: A 3 rows, matched 3,
+/// changed 0, exit 0, for two files that differ in that string.
+#[test]
+fn a_line_feed_in_a_string_of_a_later_ndjson_row_is_refused() {
+    let f = json_fixture(
+        "{\"id\":1,\"v\":\"a\"}\n{\"id\":2,\"v\":\"x\ny\"}\n",
+        "{\"id\":1,\"v\":\"a\"}\n{\"id\":2,\"v\":\"x\nz\"}\n",
+    );
+    let err = compare(&f.a, &f.b, &mut Options::with_key(["id"])).expect_err("refused");
+    let text = err.to_string();
+    assert!(err.is_input(), "{text}");
+    assert!(
+        text.contains("line 2 (") && text.contains("line break inside a string"),
+        "{text}"
+    );
+    let rows = 200_000;
+    let mut big = String::new();
+    for i in 0..rows {
+        if i == rows * 2 / 3 {
+            big.push_str(&format!("{{\"id\":{i},\"v\":\"two\nlines\"}}\n"));
+        } else {
+            big.push_str(&format!("{{\"id\":{i},\"v\":\"row {i} of the file\"}}\n"));
+        }
+    }
+    assert!(
+        big.len() > 4 << 20,
+        "fixture must exceed the chunking threshold"
+    );
+    let got = refused_at_every_thread_count(&big);
+    assert!(
+        got.contains(&format!("line {} (", rows * 2 / 3 + 1))
+            && got.contains("line break inside a string"),
+        "{got}"
+    );
+}
+
 /// `changed` for one pair, at every thread count, so a proof that fires on one
 /// chunking and not another shows up.
 fn changed_json(a_body: &str, b_body: &str) -> i64 {

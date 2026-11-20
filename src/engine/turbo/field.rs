@@ -710,6 +710,38 @@ pub(super) fn next_of3_with<S: Scan>(
     end
 }
 
+/// The offset of the first byte at or after `from` that is `a`, `b` or a
+/// control character (below 0x20), or `end`, eight bytes a step.
+///
+/// What a JSON string's scan stops at where a line feed in it matters: the
+/// control characters are one subtraction where a third byte to match was a
+/// subtraction and an exclusive or, and its constant. `word - 0x20..` borrows
+/// out of exactly the bytes below 0x20 (a byte from 0x80 up is left out by
+/// `!word`, as in [`match_bits`]), and like it marks the lowest such byte
+/// exactly, which is the one taken.
+#[inline(always)]
+pub(super) fn next_of2_or_control(data: &[u8], from: usize, end: usize, a: u8, b: u8) -> usize {
+    let data = &data[..end.min(data.len())];
+    let mut at = from;
+    let (ba, bb, below) = (broadcast(a), broadcast(b), broadcast(0x20));
+    while at + 8 <= data.len() {
+        let word = word_at(data, at);
+        let control = word.wrapping_sub(below) & !word & HIGH;
+        let hits = match_bits(word, ba) | match_bits(word, bb) | control;
+        if hits != 0 {
+            return at + (hits.trailing_zeros() >> 3) as usize;
+        }
+        at += 8;
+    }
+    while at < data.len() {
+        if data[at] == a || data[at] == b || data[at] < 0x20 {
+            return at;
+        }
+        at += 1;
+    }
+    end
+}
+
 /// The offset of the first `target` at or after `from`, or `end`.
 #[inline(always)]
 pub(super) fn next_of1_with<S: Scan>(
@@ -800,6 +832,35 @@ mod tests {
         assert_eq!(next_of2(d, 13, d.len(), b',', b'\n'), 14);
         assert_eq!(next_of2(d, 15, d.len(), b',', b'\n'), d.len());
         assert_eq!(next_of1(d, 0, d.len(), b'x'), 13);
+    }
+
+    #[test]
+    fn a_control_character_stops_the_scan_as_a_byte_at_a_time_scan_does() {
+        // Every byte value at every place of two words and the tail, after
+        // bytes that borrow (0x00, 0x1f) or sit at the edges (0x20, 0x7f,
+        // 0x80, 0xff), so a borrow that marks a byte above the first is seen.
+        let fill = [b'a', 0x00, 0x1f, 0x20, 0x7f, 0x80, 0xff, b' '];
+        for len in 1..20usize {
+            for at in 0..len {
+                for v in 0..=255u8 {
+                    for &f in &fill {
+                        let mut d = vec![b'x'; len];
+                        if at > 0 {
+                            d[at - 1] = f;
+                        }
+                        d[at] = v;
+                        for from in 0..len {
+                            let want = d[from..]
+                                .iter()
+                                .position(|&c| c == b'"' || c == b'\\' || c < 0x20)
+                                .map_or(len, |p| from + p);
+                            let got = next_of2_or_control(&d, from, len, b'"', b'\\');
+                            assert_eq!(got, want, "{d:?} from {from}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

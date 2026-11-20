@@ -1094,7 +1094,7 @@ fn a_json_column_missing_from_the_first_object_is_still_compared() {
     // names no column: `zz` and `q` below are none.
     let cut = csv(
         "cut.json",
-        "{\"id\":\"1\",\"v\":\"x\"}\n{\"id\":\"2\",\"zz\"}\n{\"id\":\"3\",\"q\n",
+        "{\"id\":\"1\",\"v\":\"x\"}\n{\"id\":\"2\",\"zz\"}\n{\"id\":\"3\",\"q",
     );
     let names: Vec<String> = run(&cut, &cut, &mut options(&["id"]))
         .columns
@@ -1102,6 +1102,17 @@ fn a_json_column_missing_from_the_first_object_is_still_compared() {
         .map(|c| c.name.clone())
         .collect();
     assert_eq!(names, ["v"]);
+    // A name cut off by its line's end runs onto the next line, which a
+    // file read a line at a time cannot hold.
+    let broken = csv(
+        "broken.json",
+        "{\"id\":\"1\",\"v\":\"x\"}\n{\"id\":\"3\",\"q\n",
+    );
+    let refused = compare(&broken, &broken, &mut options(&["id"])).expect_err("refused");
+    assert!(
+        refused.to_string().contains("line 2 (") && refused.to_string().contains("line break"),
+        "{refused}"
+    );
     let empty = csv("empty.json", "{}\n{}\n");
     let refused = compare(&empty, &empty, &mut options(&["id"])).expect_err("no columns");
     assert!(

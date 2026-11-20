@@ -47,6 +47,11 @@ All notable changes to this project are documented here. The format follows
   file is now refused with the line and what to do, at every thread
   count, as is an object in it that cannot be followed to its closing
   brace (`[1, 2}`, a number running into a `{`).
+- A line break inside a string of a later row of newline-delimited JSON
+  (written raw where JSON writes `\n`) ended the row there for the row
+  reader, and the rest of the line was a row with no key: two files
+  differing past the break compared as equal, exit 0. The file is now
+  refused with the line; `json.loads` and jq refuse it too.
 - A JSON member name that is not UTF-8 (a Latin-1 `caf\xE9`, say) was
   listed with a replacement character but looked up as written, so the
   column had no values on either side and its changes went unreported
