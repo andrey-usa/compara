@@ -84,8 +84,8 @@ compare options:
                           column at a time is refused
       --export-dir DIR    Write full changed, added and removed CSVs here (a
                           directory, or a URL prefix such as s3://bucket/run/)
-  -o, --out PATH          Write the HTML report here, a path or a URL (no
-                          report without it)
+  -o, --out PATH          Write the HTML report here, a path or a URL, or
+                          `-` for standard output (no report without it)
       --json PATH         Write a JSON summary (counts and column statistics)
                           here, a path or a URL; `-` prints it, and the counts
                           line goes to stderr
@@ -528,6 +528,16 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     // Only the report embeds rows. An export is every row, which each engine
     // keeps for it whether or not this is set.
     opt.row_lists = report.is_some();
+    // `-` is standard output for the report as for the summary; one stream
+    // cannot carry both.
+    let json_to_stdout = args.get("json", None) == Some("-");
+    let report_to_stdout = report.as_deref() == Some(Path::new("-"));
+    if json_to_stdout && report_to_stdout {
+        return Err(Error::new(
+            "-o - and --json - both ask for standard output; send one of them to a file",
+        ));
+    }
+    check_outputs(&args, [("A", a_spec), ("B", b_spec)])?;
 
     // Both sides are fetched at once: a download is network-bound, and the
     // two do not share anything until the engine runs.
@@ -567,13 +577,22 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     let mut written: Option<(String, u64)> = None;
     if let Some(out_path) = report {
         let html = render(&result, !args.flag("no-compress"))?;
-        let dest = out_path.to_string_lossy().into_owned();
-        written = Some((dest.clone(), html.len() as u64));
-        write_output(&dest, html.as_bytes())?;
+        if report_to_stdout {
+            let mut out = std::io::stdout().lock();
+            out.write_all(html.as_bytes())
+                .and_then(|()| out.flush())
+                .map_err(|e| {
+                    Error::new(format!("cannot write the report to standard output: {e}"))
+                })?;
+            written = Some(("standard output".to_string(), html.len() as u64));
+        } else {
+            let dest = out_path.to_string_lossy().into_owned();
+            written = Some((dest.clone(), html.len() as u64));
+            write_output(&dest, html.as_bytes())?;
+        }
     }
     // `--json -` is the summary on standard output, for a pipe or a CI step;
     // the counts line goes to standard error so the output stays one document.
-    let json_to_stdout = args.get("json", None) == Some("-");
     if let Some(path) = args.get("json", None) {
         let summary = serde_json::to_string_pretty(&result.summary())?;
         if json_to_stdout {
@@ -616,7 +635,7 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
         .as_ref()
         .map(|(dest, bytes)| format!("Report: {dest} ({:.0} KB)", *bytes as f64 / 1024.0));
     for text in std::iter::once(line).chain(report_line) {
-        if json_to_stdout {
+        if json_to_stdout || report_to_stdout {
             eprintln!("{text}");
         } else {
             println!("{text}");
@@ -672,6 +691,66 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
 
 /// Writes an output where it was asked for: a local path, or an object
 /// storage or HTTP URL, by way of a temporary file.
+/// Refuses, before any input is read, an output that would land on an input
+/// (the report written over A, an export over the file it came from) or
+/// through a link. Inputs and outputs are compared as files, not as
+/// spellings: `./a.csv`, an absolute path and a hard link all name A.
+fn check_outputs(args: &Args, inputs: [(&str, &str); 2]) -> Result<()> {
+    let local = |v: &str| v != "-" && !compara::source::is_remote(v);
+    let mut outputs: Vec<(&str, PathBuf)> = Vec::new();
+    for (flag, short, shown) in [("out", Some("o"), "-o"), ("json", None, "--json")] {
+        if let Some(v) = args.get(flag, short).filter(|v| local(v)) {
+            compara::output::refuse_link(Path::new(v)).map_err(|e| {
+                Error::new(format!(
+                    "{shown}: {e}, or write to standard output with `{shown} -`"
+                ))
+            })?;
+            outputs.push((shown, PathBuf::from(v)));
+        }
+    }
+    if let Some(dir) = args.get("export-dir", None).filter(|v| local(v)) {
+        let dir = Path::new(dir);
+        compara::output::refuse_link(dir).map_err(|e| Error::new(format!("--export-dir: {e}")))?;
+        for name in ["added.csv", "removed.csv", "changed.csv"] {
+            let file = dir.join(name);
+            compara::output::refuse_link(&file)
+                .map_err(|e| Error::new(format!("--export-dir: {e}")))?;
+            outputs.push(("--export-dir", file));
+        }
+    }
+    for (flag, out) in &outputs {
+        for (side, spec) in inputs {
+            if local(spec) && same_file(out, Path::new(spec)) {
+                return Err(Error::new(format!(
+                    "{flag} would write {} over input {side} ({spec}); name another file",
+                    out.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether two paths name one existing file: the same device and inode on
+/// Unix, so a hard link counts; the same canonical path elsewhere.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (fs::canonicalize(a), fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    }
+}
+
 fn write_output(dest: &str, bytes: &[u8]) -> Result<()> {
     if compara::source::is_remote(dest) {
         let dir = compara::source::TempDir::new("out")?;

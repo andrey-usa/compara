@@ -35,20 +35,31 @@ fn cannot(dest: &Path, e: &io::Error) -> Error {
     Error::new(format!("cannot write {}: {e}", dest.display()))
 }
 
+/// Refuses a symbolic link at `path`, the name of a file or a directory a run
+/// was told to write; anything else, or nothing there, passes. The check a
+/// run makes before it reads its inputs, so a refusal costs no compare; the
+/// write itself checks again.
+pub fn refuse_link(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let to = fs::read_link(path)
+                .map(|t| format!(" (to {})", t.display()))
+                .unwrap_or_default();
+            Err(Error::new(format!(
+                "{} is a symbolic link{to}; compara writes only the file it is given, \
+                 never through a link: name the file itself, or remove the link",
+                path.display()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 impl Output {
     /// Opens `dest` for writing, as described in the module comment.
     pub fn create(dest: &Path) -> Result<Output> {
+        refuse_link(dest)?;
         let replaced = match fs::symlink_metadata(dest) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                let to = fs::read_link(dest)
-                    .map(|t| format!(" (to {})", t.display()))
-                    .unwrap_or_default();
-                return Err(Error::new(format!(
-                    "{} is a symbolic link{to}; compara writes only the file it is given, \
-                     never through a link: name the file itself, or remove the link",
-                    dest.display()
-                )));
-            }
             Ok(meta) if meta.is_dir() => {
                 return Err(Error::new(format!(
                     "cannot write {}: it is a directory; name a file",

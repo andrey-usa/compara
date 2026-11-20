@@ -13,7 +13,7 @@
 | `--threads` | how wide the engines run; the default is every core |
 | `--memory` | memory to plan for (e.g. `8G`); decides when large text files are joined in one pass instead of two, and how many columns of two Parquet files are read at once (a Parquet pair that needs more than a stated budget is refused) |
 | `--max-rows` | rows embedded per report section (default 50 000) |
-| `-o`, `--out` | write the HTML report here; there is no report without it |
+| `-o`, `--out` | write the HTML report here, or to standard output with `-o -`; there is no report without it |
 | `--export-dir` | full, uncapped changed/added/removed CSVs |
 | `--json` | write a JSON summary (counts and column stats; schema in `docs/contract.schema.json`) |
 | `--summary` | print the counts and refuse any flag that writes a file (the default without `-o`, `--json` or `--export-dir`) |

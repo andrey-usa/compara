@@ -63,7 +63,11 @@ pub fn export_headers(opt: &Options, compared: &[String]) -> (Vec<String>, Vec<S
 }
 
 /// Creates the export directory if it is missing.
+///
+/// A link at the directory's name is refused, as one at a file's is: the
+/// files would land wherever it points.
 pub fn create_export_dir(dir: &Path) -> Result<()> {
+    crate::output::refuse_link(dir)?;
     fs::create_dir_all(dir)
         .map_err(|e| Error::new(format!("cannot create export-dir {}: {e}", dir.display())))
 }

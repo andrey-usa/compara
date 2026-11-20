@@ -252,3 +252,97 @@ fn outputs_replace_what_was_there_and_leave_nothing_beside_it() {
     exported.sort();
     assert_eq!(exported, ["added.csv", "changed.csv", "removed.csv"]);
 }
+
+/// `-o -` puts the report on standard output and the counts on standard
+/// error, as `--json -` does for the summary; both at once is refused.
+#[test]
+fn the_report_can_go_to_standard_output() {
+    let fx = Fixture::new();
+    let args = ["compare", "a.csv", "b.csv", "-k", "account_id,txn_id"];
+    let (_, plain_out, _) = run(&fx.0, &args);
+    let mut to_stdout = args.to_vec();
+    to_stdout.extend(["-o", "-"]);
+    let (code, out, err) = run(&fx.0, &to_stdout);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        out.starts_with("<!doctype html>"),
+        "{}",
+        &out[..out.len().min(80)]
+    );
+    assert!(out.trim_end().ends_with("</html>"));
+    assert_eq!(counts(&err), counts(&plain_out), "the counts moved: {err}");
+    assert!(err.contains("Report: standard output"), "{err}");
+    assert!(files(&fx.0).is_empty(), "wrote {:?}", files(&fx.0));
+
+    to_stdout.extend(["--json", "-"]);
+    let (code, _, err) = run(&fx.0, &to_stdout);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("standard output"), "{err}");
+}
+
+/// An output that names an input is refused before anything is read, however
+/// it is spelled: the input would be replaced by the report.
+#[test]
+fn an_output_that_names_an_input_is_refused() {
+    let fx = Fixture::new();
+    let before = fs::read(fx.path("a.csv")).unwrap();
+    fs::create_dir(fx.path("ex")).unwrap();
+    fs::copy(fx.path("b.csv"), fx.path("ex/added.csv")).unwrap();
+    let a_abs = fx.path("a.csv").to_string_lossy().into_owned();
+    for (inputs, flags) in [
+        (["a.csv", "b.csv"], vec!["-o", "a.csv"]),
+        (["a.csv", "b.csv"], vec!["-o", a_abs.as_str()]),
+        (["a.csv", "b.csv"], vec!["--json", "./a.csv"]),
+        (["a.csv", "ex/added.csv"], vec!["--export-dir", "ex"]),
+    ] {
+        let mut args = vec!["compare", inputs[0], inputs[1], "-k", "account_id,txn_id"];
+        args.extend(&flags);
+        let (code, _, err) = run(&fx.0, &args);
+        assert_eq!(code, 2, "{flags:?}: {err}");
+        assert!(err.contains("over input"), "{flags:?}: {err}");
+    }
+    assert_eq!(fs::read(fx.path("a.csv")).unwrap(), before, "A was changed");
+    #[cfg(unix)]
+    {
+        fs::hard_link(fx.path("a.csv"), fx.path("same.html")).unwrap();
+        let (code, _, err) = run(
+            &fx.0,
+            &[
+                "compare",
+                "a.csv",
+                "b.csv",
+                "-k",
+                "account_id,txn_id",
+                "-o",
+                "same.html",
+            ],
+        );
+        assert_eq!(code, 2, "a hard link to A: {err}");
+        assert_eq!(fs::read(fx.path("a.csv")).unwrap(), before, "A was changed");
+    }
+}
+
+/// A link at the export directory's own name is refused too: the files
+/// would land wherever it points.
+#[cfg(unix)]
+#[test]
+fn a_link_at_the_export_directory_is_refused() {
+    let fx = Fixture::new();
+    fs::create_dir(fx.path("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(fx.path("elsewhere"), fx.path("ex")).unwrap();
+    let (code, _, err) = run(
+        &fx.0,
+        &[
+            "compare",
+            "a.csv",
+            "b.csv",
+            "-k",
+            "account_id,txn_id",
+            "--export-dir",
+            "ex",
+        ],
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("symbolic link"), "{err}");
+    assert_eq!(fs::read_dir(fx.path("elsewhere")).unwrap().count(), 0);
+}
