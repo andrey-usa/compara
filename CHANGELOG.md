@@ -36,6 +36,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A JSON file framed by its braces (one top-level array, or objects one
+  after another as `jq .` writes them) with anything but space and a
+  comma between two rows was read as some other rows. A stray `]` in a
+  stream of objects ended the rows of the part of the file holding it, so
+  the rows read moved with the thread count (100,000 read as 50,001 at
+  one or two threads, 99,998 at four and up, exit 1); text after an
+  array's closing `]` was dropped, and text after an object was skipped to
+  the end of its line with any object on it (99,999 of 100,000). Such a
+  file is now refused with the line and what to do, at every thread
+  count, as is an object in it that cannot be followed to its closing
+  brace (`[1, 2}`, a number running into a `{`).
 - A JSON member name that is not UTF-8 (a Latin-1 `caf\xE9`, say) was
   listed with a replacement character but looked up as written, so the
   column had no values on either side and its changes went unreported

@@ -905,6 +905,82 @@ fn json_lines_that_are_not_one_object_each_are_refused() {
     }
 }
 
+/// The refusal `compare` gives `bad` against itself at threads 1, 2, 4 and 8,
+/// which must be the same at each.
+fn refused_at_every_thread_count(bad: &str) -> String {
+    let f = json_fixture(bad, bad);
+    let mut said: Option<String> = None;
+    for threads in [1usize, 2, 4, 8] {
+        let mut opt = Options::with_key(["id"]);
+        opt.threads = Some(threads);
+        let err = match compare(&f.a, &f.b, &mut opt) {
+            Ok(r) => panic!("threads {threads}: read as {}", serde_json::json!(r.counts)),
+            Err(err) => err,
+        };
+        assert!(err.is_input(), "threads {threads}: {err}");
+        let text = err.to_string();
+        match &said {
+            None => said = Some(text),
+            Some(first) => assert_eq!(&text, first, "threads {threads}"),
+        }
+    }
+    said.expect("a refusal")
+}
+
+/// A framed file big enough to be split for threads, with something between
+/// its rows that is not space, a comma or the next object, is refused with
+/// the line, the same at every thread count. A `]` in a stream of objects
+/// was the end of the rows for the piece of the file holding it, so the rows
+/// read moved with the thread count (50,001 of 100,000 at one or two
+/// threads, 99,998 at four and up); text after an array's closing `]`, or
+/// after an object on its line, was dropped with any object in it.
+#[test]
+fn framed_json_with_text_between_rows_is_refused_at_every_thread_count() {
+    let rows = 120_000;
+    let stream = nested_stream(rows, 2, false);
+    assert!(
+        stream.len() > 8 << 20,
+        "fixture must exceed the chunking threshold"
+    );
+    let middle = stream[stream.len() / 2..]
+        .find("\n{\n")
+        .map(|at| stream.len() / 2 + at + 1)
+        .expect("a row start past the middle");
+    let line = 1 + stream[..middle].matches('\n').count();
+    let insert = |text: &str| format!("{}{text}{}", &stream[..middle], &stream[middle..]);
+    for (bad, said) in [
+        (
+            insert("]\n"),
+            format!("line {line} (\"]\") closes no array"),
+        ),
+        (
+            insert(" x\n"),
+            format!("line {line} (\"x\") is where the next row"),
+        ),
+        (
+            insert("{\"id\": -1} x {\"id\": -2}\n"),
+            format!("line {line} (\"x {{\\\"id\\\": -2}}\") is where the next row"),
+        ),
+        (
+            insert(",,\n"),
+            format!("line {line} (\",\") is where the next row"),
+        ),
+    ] {
+        let got = refused_at_every_thread_count(&bad);
+        assert!(got.contains(&said), "{said}: {got}");
+    }
+    let array = nested_array(rows, 2, false);
+    for (tail, said) in [
+        ("x\n", "(\"x\") follows the closing ]"),
+        ("[{\"id\": -1}]\n", "follows the closing ]"),
+        ("{\"id\": -1}\n", "follows the closing ]"),
+    ] {
+        let got = refused_at_every_thread_count(&format!("{array}{tail}"));
+        assert!(got.contains(said), "{tail:?}: {got}");
+        assert!(got.contains("jq -c '.[]'"), "{tail:?}: {got}");
+    }
+}
+
 /// `changed` for one pair, at every thread count, so a proof that fires on one
 /// chunking and not another shows up.
 fn changed_json(a_body: &str, b_body: &str) -> i64 {
