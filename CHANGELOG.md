@@ -222,7 +222,10 @@ All notable changes to this project are documented here. The format follows
 - The HTML report carries a Content-Security-Policy that forbids it any
   connection, image, frame or form: it already loaded nothing and showed
   values as text, and now a value that ever got past the escaping could not
-  send the report's data anywhere either.
+  fetch, post, beacon or load an image to send the report's data. A script
+  could still navigate the page or open a window to an address that carries
+  it (a policy cannot forbid that), so the escaping stays what keeps scripts
+  out.
 
 ## [0.7.0] - 2026-11-17
 

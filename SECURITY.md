@@ -37,7 +37,9 @@ or report a wrong count is a bug we want to hear about.
 - The HTML report shows cell values as text. It loads nothing from the
   network and runs no code from the data, and its Content-Security-Policy
   forbids it any connection, image or form, so a value that got past the
-  escaping could not load or send anything either.
+  escaping could not fetch, post or load anything. It does not stop a script
+  from navigating the page or opening a window to an address that carries
+  data: the escaping is what keeps scripts out, the policy a second layer.
 - Exported CSVs (`--export-dir`, the report's download) keep values exactly
   as they were. A value beginning with `=`, `+`, `-` or `@` is a formula to a
   spreadsheet application: open untrusted exports as text.
