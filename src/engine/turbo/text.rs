@@ -490,22 +490,9 @@ fn later_keys<const LINES: bool>(
             .position(|&b| !json_space(b))
             .filter(|&at| data[at] == b'[')
     };
-    // Each of the first object's members as a compact writer spells it,
-    // `"name":`, so the common row is asked one comparison a member. A name
-    // that needs an escape has no such spelling and takes the walk below.
-    let spelled: Vec<Vec<u8>> = known
-        .iter()
-        .map(|name| {
-            if name.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20) {
-                return Vec::new();
-            }
-            let mut text = Vec::with_capacity(name.len() + 3);
-            text.push(b'"');
-            text.extend_from_slice(name.as_bytes());
-            text.extend_from_slice(b"\":");
-            text
-        })
-        .collect();
+    // Each of the first object's members as this piece's rows spell it, so
+    // the common row is asked one comparison a member.
+    let spelled = spellings::<LINES>(slab, lo, end, open, known);
     // Names are looked up, not searched for: a file built to carry a new key
     // in every row would otherwise cost the square of its rows. Each to its
     // place in the first object.
@@ -774,6 +761,112 @@ fn later_keys<const LINES: bool>(
         rows,
         repeats,
     })
+}
+
+/// Each of the first object's members as a compact writer spells it,
+/// `"name":`, unless the first row of `data[lo..end]` writes it with escapes
+/// at its own place (Python's `json.dumps` writes `café` as `caf\u00e9`, and
+/// in every row): then as that row spells it. A name that needs an escape and
+/// is not written so there has no spelling and takes the walk. Out of line:
+/// once a piece.
+#[inline(never)]
+fn spellings<const LINES: bool>(
+    slab: &Slab,
+    lo: usize,
+    end: usize,
+    open: Option<usize>,
+    known: &[String],
+) -> Vec<Vec<u8>> {
+    let data = slab.data();
+    let mut spelled: Vec<Vec<u8>> = known
+        .iter()
+        .map(|name| {
+            if name.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20) {
+                return Vec::new();
+            }
+            let mut text = Vec::with_capacity(name.len() + 3);
+            text.push(b'"');
+            text.extend_from_slice(name.as_bytes());
+            text.extend_from_slice(b"\":");
+            text
+        })
+        .collect();
+    let mut at = lo;
+    while at < end && json_space(data[at]) {
+        at += 1;
+    }
+    if open == Some(at) {
+        at += 1;
+    }
+    escaped_spellings::<LINES>(slab, at, end, known, &mut spelled);
+    spelled
+}
+
+/// The spellings the object at `data[at]` gives, with escapes, to the first
+/// object's names it writes at their own places, each followed by its colon,
+/// in place of `spelled`'s: those bytes spell that name wherever they stand,
+/// so a row that writes them is told by them as a plain name is. Read up to
+/// the first member that is not one: anything this does not follow is left
+/// to the walk, which says what is wrong with it.
+#[cold]
+#[inline(never)]
+fn escaped_spellings<const LINES: bool>(
+    slab: &Slab,
+    mut at: usize,
+    end: usize,
+    known: &[String],
+    spelled: &mut [Vec<u8>],
+) {
+    let data = slab.data();
+    let scan = Swar;
+    let (mut lines, mut lost) = (false, false);
+    while at < end && json_space(data[at]) {
+        at += 1;
+    }
+    if at >= end || data[at] != b'{' {
+        return;
+    }
+    at += 1;
+    for (name, text) in known.iter().zip(spelled.iter_mut()) {
+        while at < end && matches!(data[at], b',' | b' ' | b'\t' | b'\r') {
+            at += 1;
+        }
+        if at >= end || data[at] != b'"' {
+            return;
+        }
+        let key_from = at + 1;
+        let (key_end, escaped) = later_string::<_, LINES>(scan, data, at, end, &mut lines);
+        // A name holding a raw line feed is the line-read walk's to refuse,
+        // and one that is not UTF-8 the walk's too.
+        if lines || key_end > end || key_end <= key_from || data.get(key_end) != Some(&b':') {
+            return;
+        }
+        let key = &data[key_from..key_end - 1];
+        if escaped {
+            if std::str::from_utf8(key).is_err() {
+                return;
+            }
+            let spells = text_of(
+                slab,
+                pack(key_from as u64, (key_end - 1 - key_from) as u64, true),
+            );
+            if spells != *name {
+                return;
+            }
+            text.clear();
+            text.extend_from_slice(&data[key_from - 1..=key_end]);
+        } else if key != name.as_bytes() {
+            return;
+        }
+        at = key_end + 1;
+        while at < end && json_space(data[at]) {
+            at += 1;
+        }
+        at = later_value_end::<_, LINES>(scan, data, at, end, &mut lines, &mut lost);
+        if lines || lost {
+            return;
+        }
+    }
 }
 
 /// What [`json_later_keys`] found in its rows.
@@ -4205,6 +4298,12 @@ mod tests {
             "{\"k\":1,\"v\":2}\n{\"v\":4,\"k\":3}\n{\"v\":5}\n{\"w\":1,\"k\":2,\"v\":3}\n",
             "{\"k\":1,\"v\":2}\n{\"k\":3,\"x\":0,\"v\":4,\"y\":1}\n{\"y\":1,\"x\":2}\n",
             "{\"k\":1,\"caf\\u00e9\":2}\n{\"caf\u{e9}\":3,\"k\":4}\n",
+            // A name its writer escapes at its place in every row, and in
+            // another spelling now and then.
+            "{\"k\":1,\"caf\\u00e9\":2}\n{\"k\":3,\"caf\\u00e9\":4}\n{\"k\":5,\"caf\\u00e9\":6}\n",
+            "{\"k\":1,\"caf\\u00e9\":2}\n{\"k\":3,\"caf\\u00e9\":4}\n{\"k\":5,\"caf\u{e9}\":6}\n\
+             {\"k\":7,\"caf\\u00E9\":8}\n{\"caf\\u00e9\":9,\"k\":1}\n{\"k\":3,\"caf\\u00e9\":4}\n",
+            "{\"k\":1,\"\\ud83d\\ude00\":2}\n{\"k\":3,\"\\ud83d\\ude00\":4}\n{\"k\":5,\"\u{1f600}\":6}\n",
             "[{\"k\":1,\"v\":{\"k\":2,\"k\":3}},\n {\"v\":[{\"v\":1}],\"k\":2}]\n",
         ] {
             assert!(!walk(text).repeats, "{text}");
@@ -4220,11 +4319,101 @@ mod tests {
             "{\"k\":1,\"v\":2}\n{\"w\":1,\"k\":2,\"w\":3}\n",
             "{\"k\":1,\"v\":2}\n{\"v\":2,\"\\u006b\":1,\"k\":3}\n",
             "{\"caf\\u00e9\":1}\n{\"caf\u{e9}\":3,\"caf\\u00e9\":4}\n",
+            // A name told by the escaped spelling its first row taught.
+            "{\"k\":1,\"caf\\u00e9\":2}\n{\"k\":3,\"caf\\u00e9\":4}\n{\"k\":5,\"caf\\u00e9\":6,\"caf\u{e9}\":7}\n",
+            "{\"k\":1,\"caf\\u00e9\":2}\n{\"k\":3,\"caf\\u00e9\":4}\n{\"k\":5,\"caf\\u00e9\":6,\"caf\\u00e9\":7}\n",
+            "{\"k\":1,\"caf\\u00e9\":2}\n{\"k\":3,\"caf\\u00e9\":4}\n{\"caf\\u00e9\":5,\"k\":6,\"caf\\u00e9\":7}\n",
             "{\"k\":1,\"v\":2}\n{\"v\":,\"k\":1}\n",
             "[{\"k\":1,\"v\":2},\n {\"v\":1,\"k\":2,\"v\":3}]\n",
         ] {
             assert!(walk(text).repeats, "{text}");
         }
+    }
+
+    /// A name the first object escapes is learned by its spelling, and that
+    /// spelling tells only that name: one that differs from it only by an
+    /// escape (the six bytes `\u0062` as text, `\\u0062` as written) is a
+    /// column of its own, wherever the learned spelling stood.
+    #[test]
+    fn a_learned_spelling_tells_only_its_own_name() {
+        let text = "{\"k\":1,\"a\\u0062\":2}\n{\"k\":3,\"a\\u0062\":4}\n{\"k\":5,\"a\\\\u0062\":6}\n\
+                    {\"k\":7,\"ab\":8}\n{\"k\":9,\"a\\u0062\":1,\"a\\\\u0062\":2}\n";
+        let found = walk(text);
+        assert_eq!(found.names, ["a\\u0062"]);
+        assert_eq!(found.rows, 5);
+        assert!(!found.repeats);
+    }
+
+    /// A piece's first row teaches the spelling it escapes a name with at
+    /// the name's own place, followed by its colon, and nothing past the
+    /// first member that is not so: a name out of its place, one spaced from
+    /// its colon, one holding a raw line feed (line-read) or bytes that are
+    /// not UTF-8, or one that spells another name.
+    #[test]
+    fn the_first_row_teaches_the_spellings_it_escapes() {
+        let known: Vec<String> = ["k", "caf\u{e9}", "a/b", "\u{1f600}", "v"]
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        let taught = |row: &str| -> Vec<String> {
+            let slab = json_slab(row);
+            spellings::<true>(&slab, 0, row.len(), None, &known)
+                .iter()
+                .map(|t| String::from_utf8_lossy(t).into_owned())
+                .collect()
+        };
+        let plain = [
+            "\"k\":",
+            "\"caf\u{e9}\":",
+            "\"a/b\":",
+            "\"\u{1f600}\":",
+            "\"v\":",
+        ];
+        assert_eq!(
+            taught(
+                "{\"k\":1, \"caf\\u00e9\":\"x\\\"\",\"a\\/b\":[1,{\"c\":2}],\"\\ud83d\\ude00\":3,\"v\":4}\n"
+            ),
+            [
+                "\"k\":",
+                "\"caf\\u00e9\":",
+                "\"a\\/b\":",
+                "\"\\ud83d\\ude00\":",
+                "\"v\":"
+            ]
+        );
+        for row in [
+            "{\"caf\\u00e9\":1,\"k\":2}\n",
+            "{\"k\":1,\"caf\\u00e9\" :2}\n",
+            "{\"k\":1,\"caf\\u00e8\":2}\n",
+            "{\"k\":1,\"caf\\u00e9\\n\":2}\n",
+            "[{\"k\":1,\"caf\\u00e9\":2}]\n",
+        ] {
+            assert_eq!(taught(row), plain, "{row}");
+        }
+        // Up to the member that is not one, and not past it.
+        let row = "{\"k\":1,\"caf\\u00e9\":2,\"x\\u0041\":3,\"\\ud83d\\ude00\":4}\n";
+        assert_eq!(taught(row)[1], "\"caf\\u00e9\":");
+        assert_eq!(taught(row)[3], plain[3]);
+        // A raw line feed in the name, and bytes that are not UTF-8.
+        let mut bytes = b"{\"k\":1,\"caf\\u00e9\n\":2}\n".to_vec();
+        let slab = Slab::owned(bytes.clone(), Dialect::Json);
+        assert_eq!(
+            spellings::<true>(&slab, 0, bytes.len(), None, &known)[1],
+            plain[1].as_bytes()
+        );
+        bytes = b"{\"k\":1,\"caf\\u00e9\xff\":2}\n".to_vec();
+        let slab = Slab::owned(bytes.clone(), Dialect::Json);
+        assert_eq!(
+            spellings::<true>(&slab, 0, bytes.len(), None, &known)[1],
+            plain[1].as_bytes()
+        );
+        // A framed file's first row, past its `[`.
+        let text = "[{\"k\":1,\"caf\\u00e9\":2}]\n";
+        let slab = json_slab(text);
+        assert_eq!(
+            spellings::<false>(&slab, 0, text.len(), Some(0), &known)[1],
+            b"\"caf\\u00e9\":"
+        );
     }
 
     #[test]
