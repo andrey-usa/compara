@@ -171,6 +171,18 @@ impl Drop for Counted {
     }
 }
 
+/// One start at a time under a heap limit, from the look at the room to the
+/// new thread's set-up: two threads starting one each at once both saw room
+/// for one, and the second set-up found none (measured: 3 of 100 runs of a
+/// 16-lane comparison at one limit aborted). Held only around a start, which
+/// a set-up keeps to tens of microseconds; a lock, not a count, so that it
+/// allocates nothing.
+fn one_start() -> std::sync::MutexGuard<'static, ()> {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ONE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// What a refused thread is: a bare kind, since an error with a message
 /// would allocate, at the limit.
 fn refused() -> std::io::Error {
@@ -242,6 +254,7 @@ where
     if crate::memory::heap_limit().is_none() {
         return Builder::new().spawn_scoped(scope, f);
     }
+    let _one = one_start();
     let mut starting = Starting::begin();
     match fits() {
         None => {
@@ -275,6 +288,7 @@ where
     if crate::memory::heap_limit().is_none() {
         return named.spawn(f);
     }
+    let _one = one_start();
     let mut starting = Starting::begin();
     match fits() {
         None => {
@@ -608,6 +622,29 @@ mod tests {
             let there = || std::thread::current().id();
             let ran_on = std::thread::scope(|scope| super::super::spawn(scope, &there).join());
             assert_ne!(ran_on.expect("the work ran"), std::thread::current().id());
+            // One start at a time: a start waits while another has the turn.
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                let turn = super::super::one_start();
+                let started = AtomicBool::new(false);
+                std::thread::scope(|scope| {
+                    let starter = std::thread::Builder::new()
+                        .spawn_scoped(scope, || {
+                            std::thread::scope(|inner| {
+                                let h = super::super::spawn_scoped(inner, || ()).expect("room");
+                                started.store(true, Ordering::Release);
+                                h.join().expect("joined");
+                            });
+                        })
+                        .expect("a thread with room for it");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let early = started.load(Ordering::Acquire);
+                    drop(turn);
+                    starter.join().expect("joined");
+                    assert!(!early, "a start went ahead of the one under way");
+                });
+                assert!(started.load(Ordering::Acquire));
+            }
             let used = data_in_use();
             // Full to the page: nothing left for a new mapping.
             set_soft_data_limit(used, was.max);
