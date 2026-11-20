@@ -138,6 +138,24 @@ fn a_file_name_that_spells_a_slot_stays_a_file_name() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// The page forbids the network itself, ahead of any script, so a value that
+/// ever got past the escaping still could not load or send anything.
+#[test]
+fn the_report_forbids_the_network_itself() {
+    let (result, dir) = sample();
+    for compress in [true, false] {
+        let html = render(&result, compress).expect("render");
+        let csp = html
+            .find("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none';")
+            .expect("a Content-Security-Policy");
+        assert!(
+            csp < html.find("<script").expect("a script"),
+            "the policy comes after a script"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// The compact `[column, a, b]` triple every implementation reads.
 #[test]
 fn a_cell_diff_serialises_as_a_triple() {

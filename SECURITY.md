@@ -30,11 +30,14 @@ or report a wrong count is a bug we want to hear about.
   Files are made with mode 0600 and directories 0700, never at a name that
   already exists, and removed when the run ends.
 - The files a run is told to write (`-o`, `--json`, `--export-dir`) are
-  written only at the names given: a symbolic link at one is refused, not
-  followed, and each file is written beside its name and moved onto it once
-  complete.
+  written only at the names given: a symbolic link at one (or at the
+  export directory) is refused, not followed, a name that is one of the
+  inputs is refused before anything is read, and each file is written
+  beside its name and moved onto it once complete.
 - The HTML report shows cell values as text. It loads nothing from the
-  network and runs no code from the data.
+  network and runs no code from the data, and its Content-Security-Policy
+  forbids it any connection, image or form, so a value that got past the
+  escaping could not load or send anything either.
 - Exported CSVs (`--export-dir`, the report's download) keep values exactly
   as they were. A value beginning with `=`, `+`, `-` or `@` is a formula to a
   spreadsheet application: open untrusted exports as text.

@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `-o -` writes the HTML report to standard output, with the counts on
+  standard error, as `--json -` does for the summary (both at once is
+  refused). It replaces `-o /dev/stdout`, which is a link and now refused.
+
 ### Changed
 
 - An `https://` file is read over HTTP/1.1, a connection to each part, also
@@ -13,6 +19,10 @@ All notable changes to this project are documented here. The format follows
   public URLs among them), as `s3://`, `gs://` and `az://` already were:
   over one HTTP/2 connection every part's TLS and framing ran on one
   thread.
+- An output that names one of the inputs is refused before anything is
+  read (exit 2): `-o a.csv`, `--json ./a.csv`, a hard link to A, or an
+  `--export-dir` whose `added.csv` is B would have replaced the input. Paths
+  are compared as files, not as spellings.
 - A JSON file that names columns with escapes, as Python's `json.dumps`
   does by default for any name outside ASCII, is compared in a quarter
   fewer instructions where an ignored value differs in every row: the
@@ -206,8 +216,13 @@ All notable changes to this project are documented here. The format follows
   a file they would write (exit 2, saying so) and leave what it points to
   alone. They wrote through it: in a shared directory (`/tmp`, a CI
   workspace) a link left at `report.html` turned the run into an overwrite
-  of the file it named. `/dev/stdout` is such a link; a FIFO or a device
-  named directly (`/dev/null`) is still written.
+  of the file it named. A link at the export directory's own name is
+  refused too. `/dev/stdout` is such a link (`-o -` writes the report there);
+  a FIFO or a device named directly (`/dev/null`) is still written.
+- The HTML report carries a Content-Security-Policy that forbids it any
+  connection, image, frame or form: it already loaded nothing and showed
+  values as text, and now a value that ever got past the escaping could not
+  send the report's data anywhere either.
 
 ## [0.7.0] - 2026-11-17
 
