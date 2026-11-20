@@ -2421,14 +2421,14 @@ fn plain(text: &str) -> String {
     out
 }
 
-/// A client to read with, which waits [`read_timeout`] for the server's
-/// answer and then for each piece of it, or to upload with, which does not:
-/// that wait runs from the request's first byte to its answer, and a large
-/// body takes longer than that to send. An upload is watched instead
-/// ([`Sent`]), and sets no TCP_USER_TIMEOUT: the client's own 30 s ends a
-/// connection whose server has kept its receive window shut that long in
-/// all, reading or not -- one reading 1 KB a second was cut off at 30 s,
-/// and with 90 and 150 s at 91 and 151 s, its window opening on the way
+/// A client to read with, over HTTP/1.1, which waits [`read_timeout`] for
+/// the server's answer and then for each piece of it, or to upload with,
+/// which does not: that wait runs from the request's first byte to its
+/// answer, and a large body takes longer than that to send. An upload is
+/// watched instead ([`Sent`]), and sets no TCP_USER_TIMEOUT: the client's own
+/// 30 s ends a connection whose server has kept its receive window shut that
+/// long in all, reading or not -- one reading 1 KB a second was cut off at
+/// 30 s, and with 90 and 150 s at 91 and 151 s, its window opening on the way
 /// (Linux 6.18, loopback; local, indicative).
 fn http_client(reading: bool) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
@@ -2436,6 +2436,13 @@ fn http_client(reading: bool) -> Result<reqwest::Client> {
         .connect_timeout(std::time::Duration::from_secs(30));
     if reading {
         builder = builder.read_timeout(read_timeout());
+        // Reads in parts go over HTTP/1.1, a connection each, as
+        // object_store's stores do: over one HTTP/2 connection every part's
+        // TLS and framing ran on the thread that opened it, which also
+        // writes the file, and its streams handed each piece across threads
+        // twice. 1 GiB from an h2 server over loopback: 2.2 s of CPU and
+        // 3.7 s against 1.1 s and 2.1 s (local, indicative).
+        builder = builder.http1_only();
     } else {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         {

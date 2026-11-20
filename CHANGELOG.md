@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- An `https://` file is read over HTTP/1.1, a connection to each part, also
+  from a server that offers HTTP/2 (CloudFront, GitHub, GCS public URLs), as
+  `s3://`, `gs://` and `az://` already were: over one HTTP/2 connection every
+  part's TLS and framing ran on one thread. 1 GiB from an HTTP/2 server over
+  loopback: 3.4 s to 2.1 s, and 1.6 s of CPU to 1.1 s (local, indicative).
 - A JSON file that names columns with escapes, as Python's `json.dumps`
   does by default for any name outside ASCII, is compared in a quarter
   fewer instructions where an ignored value differs in every row: the
