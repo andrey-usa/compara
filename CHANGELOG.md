@@ -203,6 +203,9 @@ All notable changes to this project are documented here. The format follows
   their names and moved into place once complete: a run that fails, is
   stopped or fills the disk leaves the file that was there before, not
   half of a new one, and a file that is replaced keeps its permissions.
+  A killed run can leave its unfinished `.compara-<pid>-<n>.part` there,
+  safe to delete. A file the user may write in a directory that takes no
+  new file is written in place, as before.
 - A file named with `__PAYLOAD__` (or `__MODE__`, `__TITLE__`) in it gave a
   blank report that said the browser could not decode it: the template's
   slots were looked for in text already put in, and the payload went into

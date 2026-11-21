@@ -11,7 +11,10 @@
 //! workspace) a link someone else left at `report.html` would otherwise turn
 //! the report into an overwrite of whatever the link points to. A FIFO or a
 //! device named directly (`/dev/null`) is written as it is, since it cannot be
-//! replaced and writing into it is what was asked.
+//! replaced and writing into it is what was asked. A file the user may write
+//! in a directory they may not add to is written in place too, as it was
+//! before outputs landed in one step: there a failed run can leave it half
+//! written.
 
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
@@ -59,6 +62,7 @@ impl Output {
     /// Opens `dest` for writing, as described in the module comment.
     pub fn create(dest: &Path) -> Result<Output> {
         refuse_link(dest)?;
+        let mut checked = None;
         let replaced = match fs::symlink_metadata(dest) {
             Ok(meta) if meta.is_dir() => {
                 return Err(Error::new(format!(
@@ -83,14 +87,20 @@ impl Output {
                 // A rename ignores the mode of the file it replaces; writing
                 // to the name does not. Asking the system whether this user
                 // may write it keeps a write-protected file protected.
-                OpenOptions::new().write(true).open(dest).map_err(|e| {
-                    Error::new(format!(
-                        "cannot write {}: {e}; the file is write-protected, and compara \
-                         replaces what is at the name: make it writable or name another file",
-                        dest.display()
-                    ))
-                })?;
-                Some(meta.permissions())
+                OpenOptions::new()
+                    .write(true)
+                    .open(dest)
+                    .map_err(|e| match e.kind() {
+                        io::ErrorKind::PermissionDenied => Error::new(format!(
+                            "cannot write {}: {e}; the file is write-protected, and compara \
+                             replaces what is at the name: make it writable or name another file",
+                            dest.display()
+                        )),
+                        _ => cannot(dest, &e),
+                    })?;
+                let mode = meta.permissions();
+                checked = Some(meta);
+                Some(mode)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(cannot(dest, &e)),
@@ -128,6 +138,24 @@ impl Output {
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied && checked.is_some() => {
+                    // A directory this user may not add to, holding a file
+                    // they may write: written in place, as before.
+                    let file = OpenOptions::new()
+                        .write(true)
+                        .open(dest)
+                        .map_err(|e| cannot(dest, &e))?;
+                    #[cfg(unix)]
+                    if let Some(meta) = &checked {
+                        is_the_checked_file(&file, meta).map_err(|e| cannot(dest, &e))?;
+                    }
+                    file.set_len(0).map_err(|e| cannot(dest, &e))?;
+                    return Ok(Output {
+                        dest: dest.to_path_buf(),
+                        temp: None,
+                        file: Some(file),
+                    });
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     return Err(Error::new(format!(
                         "cannot write {}: the directory {} does not exist; create it first",
@@ -376,6 +404,25 @@ mod tests {
         let err = write(&dest, b"new").unwrap_err().to_string();
         assert!(err.contains("write-protected"), "{err}");
         assert_eq!(fs::read(&dest).unwrap(), b"old");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_writable_file_in_a_directory_that_takes_no_new_file_is_written_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("locked");
+        let dest = dir.join("report.html");
+        fs::write(&dest, b"the old report, longer than the new").unwrap();
+        fs::set_permissions(&dir, Permissions::from_mode(0o555)).unwrap();
+        // A user the modes do not bind (root) may add to it: nothing to show.
+        let binds = fs::write(dir.join("probe"), b"").is_err();
+        if binds {
+            write(&dest, b"new").unwrap();
+            assert_eq!(fs::read(&dest).unwrap(), b"new");
+            assert_eq!(left_in(&dir), ["report.html"]);
+        }
+        fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
