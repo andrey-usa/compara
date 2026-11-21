@@ -689,8 +689,6 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     Ok(code)
 }
 
-/// Writes an output where it was asked for: a local path, or an object
-/// storage or HTTP URL, by way of a temporary file.
 /// Refuses, before any input is read, an output that would land on an input
 /// (the report written over A, an export over the file it came from) or
 /// through a link. Inputs and outputs are compared as files, not as
@@ -753,6 +751,8 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Writes an output where it was asked for: a local path, or an object
+/// storage or HTTP URL, by way of a temporary file.
 fn write_output(dest: &str, bytes: &[u8]) -> Result<()> {
     if compara::source::is_remote(dest) {
         let dir = compara::source::TempDir::new("out")?;
