@@ -311,13 +311,20 @@ def main() -> None:
                 self.rfile.read(n // 2)
                 return self.close_now()
             if fault == "dribble":
+                # Paced by the clock, not by a sleep a piece: a sleep that
+                # runs long (macOS runners' timers, a loaded box) is made up
+                # on the next piece, so the body is read at --rate overall.
+                # A 31 ms sleep a KB had read at under 16 KB/s on macOS.
                 data = b""
+                start = time.monotonic()
                 while len(data) < n:
                     piece = self.rfile.read(min(1024, n - len(data)))
                     if not piece:
                         break
                     data += piece
-                    time.sleep(1024 / args.rate)
+                    ahead = start + len(data) / args.rate - time.monotonic()
+                    if ahead > 0:
+                        time.sleep(ahead)
             else:
                 data = self.body()
             if fault == "stall":
