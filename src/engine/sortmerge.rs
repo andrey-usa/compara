@@ -231,6 +231,7 @@ fn stream_into(
         .collect();
     let key_size = opt.key.len();
     let budget = batch_bytes(opt);
+    let halves = room_halves(&index, opt.ignore_case);
 
     // Sorts a full batch and writes it as the run numbered `n`.
     let spill = |batch: &Packed, n: usize, rowbuf: &mut Vec<u8>| -> Result<PathBuf> {
@@ -304,13 +305,12 @@ fn stream_into(
                 .map_err(|e| crate::engine::native::read_error(path, e, "sortmerge"))?
             {
                 rows += 1;
-                // The row's text is at most the record's, and a batch that
-                // cannot grow to take it -- under a heap limit, `ulimit -d`
-                // or a container's -- is spilled as it is, early, rather than
-                // aborting the process. An empty one waits for the batch
-                // being written to come back, and only a row no batch has
-                // room for, with both here, is refused.
-                let need = record.as_slice().len();
+                // A batch that cannot grow to take the row -- under a heap
+                // limit, `ulimit -d` or a container's -- is spilled as it is,
+                // early, rather than aborting the process. An empty one waits
+                // for the batch being written to come back, and only a row no
+                // batch has room for, with both here, is refused.
+                let need = record.as_slice().len() * halves / 2;
                 while !batch.try_room(need) {
                     if !batch.is_empty() {
                         sent = true;
@@ -379,6 +379,18 @@ fn stream_into(
             merge_budget,
         })
     })
+}
+
+/// How long a row can be against its record, in halves: the room a row asks
+/// a batch for, so that it is never written past. A column read twice
+/// (`-k id,id`) is held twice, and lower case can be half as long again
+/// (U+023A is two bytes, its lower case three; see
+/// `lower_case_grows_by_half_at_most`).
+fn room_halves(index: &[Option<usize>], ignore_case: bool) -> usize {
+    let mut read: Vec<usize> = index.iter().flatten().copied().collect();
+    read.sort_unstable();
+    let repeats = read.chunk_by(|x, y| x == y).map(<[usize]>::len).max();
+    repeats.unwrap_or(1) * if ignore_case { 3 } else { 2 }
 }
 
 // ---------------------------------------------------------------------------
@@ -1526,6 +1538,31 @@ pub fn available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The room the sort asks for a lower-cased row: no character's lower
+    /// case is more than half as long again in UTF-8.
+    #[test]
+    fn lower_case_grows_by_half_at_most() {
+        for c in (0..=0x10FFFF).filter_map(char::from_u32) {
+            let lower: usize = c.to_lowercase().map(char::len_utf8).sum();
+            assert!(
+                2 * lower <= 3 * c.len_utf8(),
+                "{c:?} is {} bytes and {lower} lower-cased",
+                c.len_utf8()
+            );
+        }
+        // The bound is met, not loose: U+023A's lower case is a byte longer.
+        assert_eq!("\u{23A}".to_lowercase().len(), 3);
+    }
+
+    #[test]
+    fn a_row_asks_room_for_columns_read_twice_and_lower_case() {
+        assert_eq!(room_halves(&[Some(0), Some(2), None], false), 2);
+        assert_eq!(room_halves(&[Some(0), Some(2), None], true), 3);
+        assert_eq!(room_halves(&[Some(1), Some(1), Some(0)], false), 4);
+        assert_eq!(room_halves(&[Some(1), Some(1), Some(1)], true), 9);
+        assert_eq!(room_halves(&[None, None], false), 2);
+    }
 
     /// What the sort did before the prefix: every comparison on the cells.
     fn reference(batch: &Packed, key_size: usize) -> Vec<u32> {
