@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `sortmerge` read every spilled run through a 64 KB buffer of its own, so
+  under a heap limit (`ulimit -d`, a container's) a large file's buffers grew
+  with the file, not the limit, and the merge aborted (exit 134) or ran out
+  of open files. Each run is now read through a share of the heap the merge
+  may have, taken with a refusal rather than an abort, and runs beyond what
+  fits, or beyond what `ulimit -n` allows, are merged in passes first; equal
+  keys keep their order in the file. A row also asks its batch for room
+  enough for lower case (`--ignore-case`) and for a column named twice.
+- Under `--engine auto`, a CSV pair that does not fit `turbo` falls back to
+  `sortmerge` from 24 MB of heap, the least a named `sortmerge` starts with,
+  where it was refused below 48 MB.
+
 ## [0.8.0] - 2026-11-21
 
 ### Added
