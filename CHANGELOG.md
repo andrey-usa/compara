@@ -24,11 +24,13 @@ All notable changes to this project are documented here. The format follows
   `--export-dir` whose `added.csv` is B would have replaced the input. Paths
   are compared as files, not as spellings.
 - A JSON file that names columns with escapes, as Python's `json.dumps`
-  does by default for any name outside ASCII, is compared in a quarter
-  fewer instructions where an ignored value differs in every row: the
-  check that a matched row is unchanged gave up at such a name and parsed
-  both rows instead. 200,000 rows with one such name: 4,080.6M
-  instructions to 2,997.9M (callgrind, one thread).
+  does by default for any name outside ASCII, is compared in under half
+  the instructions where an ignored value differs in every row: such a
+  name is matched by the spelling the file gives it, and the check that a
+  matched row is unchanged reads past it instead of parsing both rows.
+  200,000 rows with one such name: A,AAA.AM instructions to B,BBB.BM
+  ([run RUN](https://github.com/andrey-usa/compara/actions/runs/RUN), cachegrind, one thread,
+  against 0.7.0).
 - In a container (or under `ulimit -d`), a pair whose key indexes
   cannot fit the heap goes to the sortmerge engine once its rows
   are counted, instead of after building indexes it then throws away:
@@ -40,8 +42,9 @@ All notable changes to this project are documented here. The format follows
   shape: when its objects times the columns compared pass 17.2 billion
   cells (2^34) and 256 for each byte of the file. 200,000 objects of 2 of
   20,000 keys each (7.7 MB) were refused as "not one table", even with
-  `-c` naming every column; they compare in 0.24 s (local, indicative). The
-  refusal says how many cells, and names `--compare`.
+  `-c` naming every column; with it they compare in 0.26 s ([run 44738688220](https://github.com/andrey-usa/compara/actions/runs/44738688220),
+  warm cache, median of five). The refusal says how many cells, and names
+  `--compare`.
 - `-c` (or `-i`, `-k`) naming many columns is checked against the files'
   headers by lookup, not a search per name: comparing a sparse JSON table
   with `-c` naming all 20,000 of its columns took 0.87 s and now takes
@@ -121,17 +124,19 @@ All notable changes to this project are documented here. The format follows
   line counting on. A read now waits 30 s for the answer and for each piece
   of it, what AWS's Java SDK waits and `curl --speed-time`'s default
   (`COMPARA_READ_TIMEOUT=<seconds>` waits longer), then asks again as for a
-  dropped connection; when the fourth try stalls too, the error names the
-  URL and says it stalled. Object stores wait the same and ask again as
+  dropped connection; a server that sends nothing at all is given up on as
+  the next entry says. Object stores wait the same and ask again as
   they do after any failure, and their reads no longer stop at five minutes
   a request, which cut off an 8 MB part on a link under 28 KB/s. A server
   sending 1 KB a second is waited for.
-- A URL whose server stalled every request was given up on only after
-  each request's four tries of 30 s, 124 s in all, or an object store's own
-  retries, 181 s. A transfer now ends once its server has sent nothing on
-  any request for twice the read timeout, 60 s, and says so; one request
-  stalled while others are answered, or every request in flight stalled
-  once, still reads through (fault runs over loopback, HTTP and S3).
+- A URL whose server stalled every request held the compare for good,
+  over HTTP and from an object store alike. A transfer now ends once its
+  server has sent nothing on any request for twice the read timeout, and
+  says so; one request stalled while others are answered, or every request
+  in flight stalled once, still reads through. Every request stalled, at
+  the default timeout: no end in 150 s to an error at CC.C s over HTTP and
+  DD.D s as S3 ([run RUN](https://github.com/andrey-usa/compara/actions/runs/RUN), over
+  loopback, median of three, against 0.7.0).
 - A plain `http(s)://` PUT -- an output to a presigned URL -- had no time
   limit: a server that took the connection and then stopped, reading
   nothing, or reading it all and never answering, held compara for good;
@@ -144,10 +149,11 @@ All notable changes to this project are documented here. The format follows
   slowest pace waited for: compara sees only what the sockets take, and
   they hold megabytes, so a stopped server and a slow one look the same
   until then. The error says what happened, that compara gives up on a
-  server taking less than 16 KB/s, and what to do. Over loopback (local,
-  indicative): a 19 KB body to a server that never answers, no end to
-  33 s; 398 KB never read, 30 s to 56 s; 398 KB read at 32 KB/s, done in
-  12 s; at 1 KB/s, cut off at 30 s before and at 55 s now, the floor named.
+  server taking less than 16 KB/s, and what to do. Against 0.7.0 ([run RUN](https://github.com/andrey-usa/compara/actions/runs/RUN),
+  over loopback, median of three): a 19 KB body to a server that reads it
+  and never answers, no end in 150 s to an error at EE.E s; 398 KB never
+  read, FF.F s to GG.G s; 398 KB read at 32 KB/s, done in HH.H s by both;
+  at 1 KB/s, cut off at II.I s before and at JJ.J s now, the floor named.
 - An output to a URL whose server reset the connection under a body of
   megabytes killed compara with SIGPIPE, exit 141 and no message (SIGPIPE's
   default, restored so that `compara head | head -1` ends quietly, caught
