@@ -63,6 +63,22 @@ impl Server {
         Some(Server { child, url, log })
     }
 
+    /// Each request's Range header (or what the log says in its place) and
+    /// the bytes sent for it, from the server's log.
+    fn requests(&self) -> Vec<(String, u64)> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .map(|v| {
+                (
+                    v["range"].as_str().unwrap_or("").to_string(),
+                    v["sent"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect()
+    }
+
     /// The bytes the server has sent, from its request log.
     fn sent(&self) -> u64 {
         std::fs::read_to_string(&self.log)
@@ -602,6 +618,88 @@ fn columns_of_a_remote_parquet_file_read_only_the_footer() {
         "columns fetched {} bytes",
         server.sent()
     );
+}
+
+/// A server that gives no end of an object by `bytes=-n` is read from its
+/// start, then in ranges that name their first byte, to the local answer:
+/// one that answers 501 (Fastly, in front of GitHub's release assets) or 416
+/// with no size. They had been an error (501, after three more tries) and an
+/// empty file (416). Parquet still fetches its footer and the columns asked
+/// for, not the file. One that sends the whole object is a download, as
+/// before. A server that refuses every range says so, and what to do.
+#[test]
+fn a_server_that_takes_no_suffix_range_is_read_in_ranges() {
+    let f = fixture("20k", &["--format", "parquet"]);
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let want = compare(&local("t_a.csv"), &local("t_b.csv"), &KEY, &[], None);
+    assert!(std::fs::metadata(bucket.join("t_a.csv")).unwrap().len() > 4 << 16);
+    // Parts of 64 KB: a whole answer is then larger than a part.
+    let env = [("COMPARA_FETCH_PART", "65536")];
+    for mode in ["suffix-501", "suffix-416", "suffix-200"] {
+        let Some(server) = Server::start(&f.0, &["--fault", mode]) else {
+            eprintln!("skipping: no python to run the object server");
+            return;
+        };
+        let u = &server.url;
+        let got = compare_urls(
+            &format!("{u}/bkt/t_a.csv"),
+            &format!("{u}/bkt/t_b.csv"),
+            &env,
+        );
+        assert_eq!(
+            (want.0, &want.2, &want.3),
+            (got.0, &got.2, &got.3),
+            "{mode}: {}",
+            got.1
+        );
+        let ranged = server
+            .requests()
+            .iter()
+            .filter(|(range, sent)| {
+                range.starts_with("bytes=") && !range.starts_with("bytes=-") && *sent > 0
+            })
+            .count();
+        if mode != "suffix-200" {
+            assert!(ranged >= 8, "{mode}: {ranged} ranges by their first byte");
+        }
+        let start = server.requests().len();
+        let out = Command::new(env!("CARGO_BIN_EXE_compara"))
+            .args(["columns", &format!("{u}/bkt/t_a.parquet")])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{mode}: {out:?}");
+        let names = String::from_utf8_lossy(&out.stdout);
+        assert!(names.lines().any(|l| l == "txn_id"), "{mode}: {names}");
+        let sent: u64 = server.requests()[start..].iter().map(|r| r.1).sum();
+        let size = std::fs::metadata(bucket.join("t_a.parquet")).unwrap().len();
+        // The start and the end, 64 KB each; a whole answer is the file.
+        if mode != "suffix-200" {
+            assert!(
+                sent < 140_000,
+                "{mode}: columns fetched {sent} of {size} bytes"
+            );
+        }
+    }
+    let Some(server) = Server::start(&f.0, &["--fault", "ranges-501"]) else {
+        return;
+    };
+    let u = &server.url;
+    let (code, err, ..) = compare_urls(
+        &format!("{u}/bkt/t_a.csv"),
+        &format!("{u}/bkt/t_b.csv"),
+        &[],
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("/bkt/t_")
+            && err.contains("bytes=-65536")
+            && err.contains("HTTP 501")
+            && err.contains("download it first"),
+        "{err}"
+    );
+    // Not asked again: 501 says the server does not do it.
+    assert!(server.requests().len() <= 4, "{:?}", server.requests());
 }
 
 /// Outputs to object storage: the report, the summary and the export land in

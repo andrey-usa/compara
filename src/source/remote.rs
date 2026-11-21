@@ -172,8 +172,11 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
         }
         Err(e) => return Err(e.into_error(spec)),
     };
-    let (size, tail, etag) = match got {
-        Got::Tail(size, tail, etag) => (size, tail, etag),
+    // What is held already: the end of the object, or its start where the
+    // server gives no end by `bytes=-n`.
+    let (size, tail, etag, tail_at) = match got {
+        Got::Tail(size, tail, etag) => (size, tail, etag, None),
+        Got::Head(size, head, etag) => (size, head, etag, Some(0)),
         Got::Whole(path, size) => {
             let secs = started.elapsed().as_secs_f64();
             return Ok(Source {
@@ -201,12 +204,13 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
         held: None,
     };
     file.set_len(size)?;
-    let tail_at = size - tail.len() as u64;
+    let tail_at = tail_at.unwrap_or(size - tail.len() as u64);
+    let tail_end = tail_at + tail.len() as u64;
     write_at(&file, &tail, tail_at)?;
 
     let mut note = String::new();
     let mut ranges: Vec<Range<u64>> = Vec::new();
-    let parquet = size >= 12 && tail.ends_with(b"PAR1");
+    let parquet = tail_end == size && size >= 12 && tail.ends_with(b"PAR1");
     if parquet {
         let footer_len =
             u32::from_le_bytes(tail[tail.len() - 8..tail.len() - 4].try_into().unwrap()) as u64;
@@ -234,10 +238,11 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
         ranges.push(0..4.min(tail_at));
         ranges.extend(chunks);
         note = format!(", {wanted} of {} columns", names.len());
-    } else if tail_at > 0 {
+    } else {
         ranges.push(0..tail_at);
+        ranges.push(tail_end..size);
     }
-    let ranges = coalesce(ranges, tail_at);
+    let ranges = coalesce(ranges, if tail_end == size { tail_at } else { size });
     let fetched: u64 = ranges.iter().map(|r| r.end - r.start).sum::<u64>() + tail.len() as u64;
     room_for(fetched, spec)?;
     fetch_ranges(&reader, &file, ranges, etag.as_deref(), size, spec).await?;
@@ -1188,6 +1193,9 @@ impl Drop for QuietPipe {
 enum Got {
     /// Its size, its last bytes, its strong validator.
     Tail(u64, Vec<u8>, Option<String>),
+    /// Its size, its first bytes (fewer than its size), its strong
+    /// validator: from a server that gives no end by `bytes=-n`.
+    Head(u64, Vec<u8>, Option<String>),
     /// A server that doesn't do ranges sent the whole object: already
     /// written to this temporary file, of this size.
     Whole(PathBuf, u64),
@@ -1198,6 +1206,9 @@ impl Got {
     fn ranged(self, spec: &str) -> Result<(u64, Vec<u8>, Option<String>)> {
         match self {
             Got::Tail(size, tail, etag) => Ok((size, tail, etag)),
+            Got::Head(..) => Err(Error::new(format!(
+                "{spec}: the store sent the start of the object for its end"
+            ))),
             Got::Whole(path, ..) => {
                 let _ = std::fs::remove_file(path);
                 Err(Error::new(format!(
@@ -1306,8 +1317,10 @@ fn brief(e: &str) -> String {
     out
 }
 
-/// The object's size and its last [`TAIL`] bytes (all of it, if smaller). A
-/// plain HTTP server that answers 5xx or 429, or drops the connection, is
+/// The object's size and its last [`TAIL`] bytes (all of it, if smaller),
+/// or its first from a plain HTTP server that gives no end by `bytes=-n`
+/// ([`start_of`]). A plain HTTP server that answers 5xx (not 501) or 429, or
+/// drops the connection, is
 /// asked again, three times, a little later each time, as a range is, and so
 /// is any server whose answer does not hold the bytes it says it does;
 /// object_store asks again itself after its own failures. A server that
@@ -1321,7 +1334,8 @@ async fn tail(reader: &Reader, spec: &str) -> std::result::Result<Got, FetchErro
             let result = tail_once(reader, spec, &heard).await;
             let retryable = match &result {
                 Err(FetchError::Transient(_) | FetchError::Stalled { .. }) => true,
-                Err(Refused(status)) => *status >= 500 || *status == 429,
+                // 501 says the server does not do what was asked.
+                Err(Refused(status)) => (*status >= 500 && *status != 501) || *status == 429,
                 _ => false,
             };
             if !retryable || attempt >= 3 {
@@ -1400,110 +1414,240 @@ async fn tail_once(
             Ok(Got::Tail(size, bytes, etag))
         }
         Reader::Http(client, url) => {
-            let response = client
-                .get(url)
-                .header(reqwest::header::RANGE, format!("bytes=-{TAIL}"))
-                .send()
-                .await
-                .map_err(|e| {
-                    // A connection made and then dropped or reset is worth
-                    // another try; one that could not be made, a refused
-                    // redirect or a malformed request is not.
-                    stall_of(&e, false).unwrap_or_else(|| {
-                        if e.is_timeout() || (e.is_request() && !e.is_connect()) {
-                            FetchError::Transient(said(&e))
-                        } else {
-                            FetchError::Other(said(&e))
-                        }
-                    })
-                })?;
-            let status = response.status();
-            if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            let suffix = format!("bytes=-{TAIL}");
+            match ask(client, url, &suffix, heard).await? {
+                Answer::Part(span, size, bytes, etag) => {
+                    the_end(&span, size, bytes.len())?;
+                    Ok(Got::Tail(size, bytes, etag))
+                }
+                Answer::Whole(response) => whole(response, spec, heard).await,
                 // An empty body: nothing to take the end of.
-                return Ok(Got::Tail(0, Vec::new(), None));
-            }
-            // A strong validator only: a weak one does not promise the bytes.
-            let etag = response
-                .headers()
-                .get(reqwest::header::ETAG)
-                .and_then(|v| v.to_str().ok())
-                .filter(|v| !v.starts_with("W/"))
-                .map(str::to_string);
-            if !status.is_success() {
-                return Err(Refused(status.as_u16()));
-            }
-            if status == reqwest::StatusCode::PARTIAL_CONTENT {
-                let (span, total) = match response
-                    .headers()
-                    .get(reqwest::header::CONTENT_RANGE)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(content_range)
-                {
-                    Some((span, Some(total))) => (span, total),
-                    _ => {
-                        return Err(FetchError::Other(
-                            "a partial response without a total size".into(),
-                        ));
-                    }
-                };
-                // An answer cut off is asked for again, as a part's is.
-                let mut bytes = Vec::with_capacity((span.end - span.start).min(TAIL) as usize);
-                let mut response = response;
-                while let Some(chunk) = response.chunk().await.map_err(|e| {
-                    stall_of(&e, true).unwrap_or_else(|| FetchError::Transient(e.to_string()))
-                })? {
-                    heard.now();
-                    bytes.extend_from_slice(&chunk);
-                    // No more is held than was asked for.
-                    if bytes.len() as u64 > span.end - span.start {
-                        break;
-                    }
+                Answer::Status(416, Some(0)) => Ok(Got::Tail(0, Vec::new(), None)),
+                // Not empty, by the size it names: no end by this form.
+                Answer::Status(416, Some(size)) => end_of(client, url, size, spec, heard).await,
+                // No end by this form (Fastly: 501 Unsupported client range),
+                // or an empty object: the start says which, and the size.
+                Answer::Status(refused @ (416 | 501), _) => {
+                    start_of(client, url, &suffix, refused, spec, heard).await
                 }
-                the_end(&span, total, bytes.len())?;
-                return Ok(Got::Tail(total, bytes, etag));
+                Answer::Status(status, _) => Err(Refused(status)),
             }
-            // The server sent the whole object: it does not do ranges, so this
-            // response is the download. It goes to disk as it comes, never
-            // whole into memory (a 1 GB object aborted the process), with
-            // the temporary directory's room checked first and as it grows.
-            let other = |e: Error| FetchError::Other(e.to_string());
-            const STEP: u64 = 64 << 20;
-            if let Some(len) = response.content_length() {
-                room_for(len, spec).map_err(other)?;
-            }
-            let (path, mut file) = temp_file("download").map_err(other)?;
-            let mut written = 0u64;
-            let mut checked = 0u64;
-            let mut response = response;
-            let result: std::result::Result<(), FetchError> = async {
-                while let Some(chunk) = response.chunk().await.map_err(|e| {
-                    stall_of(&e, true).unwrap_or_else(|| {
-                        if e.is_timeout() || e.is_body() {
-                            FetchError::Transient(e.to_string())
-                        } else {
-                            FetchError::Other(e.to_string())
-                        }
-                    })
-                })? {
-                    heard.now();
-                    std::io::Write::write_all(&mut file, &chunk)
-                        .map_err(|e| FetchError::Other(format!("{spec}: {e}")))?;
-                    written += chunk.len() as u64;
-                    if written >= checked + STEP {
-                        room_for(STEP, spec).map_err(other)?;
-                        checked = written;
-                    }
-                }
-                Ok(())
-            }
-            .await;
-            if let Err(e) = result {
-                let _ = std::fs::remove_file(&path);
-                return Err(e);
-            }
-            Ok(Got::Whole(path, written))
         }
     }
+}
+
+/// What a ranged GET got.
+enum Answer {
+    /// 206: the bytes its Content-Range says it holds, the object's size,
+    /// the bytes (at most [`TAIL`]), the strong validator.
+    Part(Range<u64>, u64, Vec<u8>, Option<String>),
+    /// 200: the whole object, its body still to come.
+    Whole(reqwest::Response),
+    /// Any other status, and the size a 416's `bytes */<size>` names.
+    Status(u16, Option<u64>),
+}
+
+/// One GET of at most [`TAIL`] bytes, `range` its Range header. A server
+/// that answers 5xx or drops the connection is asked again by [`tail`].
+async fn ask(
+    client: &reqwest::Client,
+    url: &str,
+    range: &str,
+    heard: &Heard,
+) -> std::result::Result<Answer, FetchError> {
+    let response = client
+        .get(url)
+        .header(reqwest::header::RANGE, range)
+        .send()
+        .await
+        .map_err(|e| {
+            // A connection made and then dropped or reset is worth
+            // another try; one that could not be made, a refused
+            // redirect or a malformed request is not.
+            stall_of(&e, false).unwrap_or_else(|| {
+                if e.is_timeout() || (e.is_request() && !e.is_connect()) {
+                    FetchError::Transient(said(&e))
+                } else {
+                    FetchError::Other(said(&e))
+                }
+            })
+        })?;
+    let status = response.status();
+    let header = |name| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v: &reqwest::header::HeaderValue| v.to_str().ok())
+    };
+    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        let size = header(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.trim().strip_prefix("bytes */"))
+            .and_then(|n| n.trim().parse::<u64>().ok());
+        return Ok(Answer::Status(416, size));
+    }
+    if !status.is_success() {
+        return Ok(Answer::Status(status.as_u16(), None));
+    }
+    if status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Ok(Answer::Whole(response));
+    }
+    // A strong validator only: a weak one does not promise the bytes.
+    let etag = header(reqwest::header::ETAG)
+        .filter(|v| !v.starts_with("W/"))
+        .map(str::to_string);
+    let Some((span, Some(size))) = header(reqwest::header::CONTENT_RANGE).and_then(content_range)
+    else {
+        return Err(FetchError::Other(
+            "a partial response without a total size".into(),
+        ));
+    };
+    // An answer cut off is asked for again, as a part's is.
+    let mut bytes = Vec::with_capacity((span.end - span.start).min(TAIL) as usize);
+    let mut response = response;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| stall_of(&e, true).unwrap_or_else(|| FetchError::Transient(e.to_string())))?
+    {
+        heard.now();
+        bytes.extend_from_slice(&chunk);
+        // No more is held than was asked for.
+        if bytes.len() as u64 > span.end - span.start {
+            break;
+        }
+    }
+    Ok(Answer::Part(span, size, bytes, etag))
+}
+
+/// The end of an object of `size` bytes, asked for by its first byte
+/// (`bytes=<size - TAIL>-<size - 1>`), the form every server that takes
+/// ranges takes.
+async fn end_of(
+    client: &reqwest::Client,
+    url: &str,
+    size: u64,
+    spec: &str,
+    heard: &Heard,
+) -> std::result::Result<Got, FetchError> {
+    if size == 0 {
+        return Ok(Got::Tail(0, Vec::new(), None));
+    }
+    let from = size.saturating_sub(TAIL);
+    match ask(client, url, &format!("bytes={from}-{}", size - 1), heard).await? {
+        Answer::Part(span, size, bytes, etag) => {
+            the_end(&span, size, bytes.len())?;
+            Ok(Got::Tail(size, bytes, etag))
+        }
+        Answer::Whole(response) => whole(response, spec, heard).await,
+        Answer::Status(status, _) => Err(Refused(status)),
+    }
+}
+
+/// The start of an object and its size, from a server that refused its end
+/// by `suffix` with `refused`: the first [`TAIL`] bytes, by their first
+/// byte. A Parquet file's end is asked for after it, its footer being there.
+/// One request more than a server that takes `suffix` needs, two for
+/// Parquet; DuckDB's httpfs asks a HEAD and then ranges by their first byte,
+/// with `bytes=0-1` where the HEAD fails.
+async fn start_of(
+    client: &reqwest::Client,
+    url: &str,
+    suffix: &str,
+    refused: u16,
+    spec: &str,
+    heard: &Heard,
+) -> std::result::Result<Got, FetchError> {
+    let range = format!("bytes=0-{}", TAIL - 1);
+    match ask(client, url, &range, heard).await? {
+        Answer::Part(span, size, bytes, etag) => {
+            if span.start != 0 || span.end > size || span.end - span.start != bytes.len() as u64 {
+                return Err(FetchError::Transient(format!(
+                    "the start of the object came as {} bytes for bytes {}-{} of {size}",
+                    bytes.len(),
+                    span.start,
+                    span.end.saturating_sub(1)
+                )));
+            }
+            if span.end == size {
+                return Ok(Got::Tail(size, bytes, etag));
+            }
+            if bytes.starts_with(b"PAR1") {
+                return end_of(client, url, size, spec, heard).await;
+            }
+            Ok(Got::Head(size, bytes, etag))
+        }
+        Answer::Whole(response) => whole(response, spec, heard).await,
+        // Nothing at the first byte: an empty object.
+        Answer::Status(416, None | Some(0)) => Ok(Got::Tail(0, Vec::new(), None)),
+        Answer::Status(status, _) if status == 429 || (status >= 500 && status != 501) => {
+            Err(Refused(status))
+        }
+        Answer::Status(status, _) => Err(FetchError::Other(format!(
+            "the server refused the end of the file (Range: {suffix}, {}) and its start \
+             (Range: {range}, {}), so it cannot be read in ranges; download it first \
+             (curl -L -o FILE URL) and compare the local copy",
+            said_status(refused),
+            said_status(status)
+        ))),
+    }
+}
+
+/// `HTTP 501 Not Implemented`.
+fn said_status(status: u16) -> String {
+    match reqwest::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+    {
+        Some(reason) => format!("HTTP {status} {reason}"),
+        None => format!("HTTP {status}"),
+    }
+}
+
+/// A server that does not do ranges sent the whole object: this response is
+/// the download. It goes to disk as it comes, never whole into memory (a
+/// 1 GB object aborted the process), with the temporary directory's room
+/// checked first and as it grows.
+async fn whole(
+    response: reqwest::Response,
+    spec: &str,
+    heard: &Heard,
+) -> std::result::Result<Got, FetchError> {
+    let other = |e: Error| FetchError::Other(e.to_string());
+    const STEP: u64 = 64 << 20;
+    if let Some(len) = response.content_length() {
+        room_for(len, spec).map_err(other)?;
+    }
+    let (path, mut file) = temp_file("download").map_err(other)?;
+    let mut written = 0u64;
+    let mut checked = 0u64;
+    let mut response = response;
+    let result: std::result::Result<(), FetchError> = async {
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            stall_of(&e, true).unwrap_or_else(|| {
+                if e.is_timeout() || e.is_body() {
+                    FetchError::Transient(e.to_string())
+                } else {
+                    FetchError::Other(e.to_string())
+                }
+            })
+        })? {
+            heard.now();
+            std::io::Write::write_all(&mut file, &chunk)
+                .map_err(|e| FetchError::Other(format!("{spec}: {e}")))?;
+            written += chunk.len() as u64;
+            if written >= checked + STEP {
+                room_for(STEP, spec).map_err(other)?;
+                checked = written;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(Got::Whole(path, written))
 }
 
 /// Whether the answer for the end of an object of `size` bytes, `len` bytes

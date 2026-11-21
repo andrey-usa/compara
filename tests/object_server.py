@@ -25,7 +25,14 @@ one only), at most --fault-max M of them (0: no limit): `silent` sends
 nothing at all; `stall` the headers and then nothing; `drop` half the body,
 then closes the connection; `reset` closes it before answering; `overlong`
 sends 1,000 bytes past the range asked, its Content-Length saying so;
-`dribble` sends the body 1 KB a second. With
+`dribble` sends the body 1 KB a second. Three modes hit every request for
+the end of an object (`bytes=-n`) instead, whatever --fault-at says, and
+leave ranges with a first byte alone: `suffix-501` answers it 501
+Unsupported client range, as Fastly does (GitHub release assets);
+`suffix-416` answers 416 with no Content-Range, as a server that takes no
+such form may; `suffix-200` sends the whole object, as a server that ignores
+a Range it does not parse must. `ranges-501` answers every GET with a Range
+501. With
 --fault-puts the fault hits PUTs instead, counted the same way: `silent`
 reads nothing and never answers; `stall` reads the body and never answers;
 `dribble` reads it 1 KB at a time, --rate bytes a second (1024), then
@@ -62,7 +69,8 @@ def main() -> None:
     ap.add_argument("--ignore-if-match", action="store_true")
     ap.add_argument("--no-etag", action="store_true")
     ap.add_argument("--grow", action="store_true")
-    ap.add_argument("--fault", choices=["silent", "stall", "drop", "reset", "overlong", "dribble"])
+    ap.add_argument("--fault", choices=["silent", "stall", "drop", "reset", "overlong", "dribble",
+                                        "suffix-501", "suffix-416", "suffix-200", "ranges-501"])
     ap.add_argument("--fault-at", type=int, default=0)
     ap.add_argument("--fault-every", type=int, default=0)
     ap.add_argument("--fault-max", type=int, default=0)
@@ -127,9 +135,9 @@ def main() -> None:
                 return None, parts
             return full, parts
 
-        def refuse(self, code):
+        def refuse(self, code, reason=None):
             body = b"<Error><Code>Refused</Code></Error>"
-            self.send_response(code)
+            self.send_response(code, reason)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Content-Type", "application/xml")
             self.end_headers()
@@ -209,8 +217,13 @@ def main() -> None:
             if fault == "silent":
                 time.sleep(3600)
                 return self.close_now()
+            suffix = bool(asked) and not head and asked.strip().startswith("bytes=-")
+            if (suffix and args.fault == "suffix-501") or (asked and not head and args.fault == "ranges-501"):
+                return self.refuse(501, "Unsupported client range")
+            if suffix and args.fault == "suffix-416":
+                return self.refuse(416)
             start, end, partial = 0, size, False
-            if asked and not args.no_ranges and not head:
+            if asked and not args.no_ranges and not head and not (suffix and args.fault == "suffix-200"):
                 m = re.fullmatch(r"bytes=(\d*)-(\d*)", asked.strip())
                 if not m or (m.group(1) == "" and m.group(2) == ""):
                     return self.refuse(416)
@@ -266,7 +279,13 @@ def main() -> None:
                     sent += len(body[i:i + 1024])
                     time.sleep(1)
             else:
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    # The client stopped reading: logged all the same, with
+                    # how much reached it unknown.
+                    self.record(asked, None)
+                    raise
                 sent = len(body)
             self.record(asked, sent)
 

@@ -51,6 +51,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- An `https://` file is read from a server that does not answer the
+  request for its end (`Range: bytes=-n`, which brings the size with it):
+  every GitHub release asset failed with `HTTP 501`, Fastly's
+  "Unsupported client range", after three more tries, and a server that
+  answered 416 without a size was read as an empty file. compara now asks
+  for the file's start, which says the size, and reads on in ranges that
+  name their first byte, as before in parallel and, for Parquet, only the
+  footer and the columns compared. One that refuses every range is an
+  error naming both requests and what to do.
 - A JSON file framed by its braces (one top-level array, or objects one
   after another as `jq .` writes them) with anything but space and a
   comma between two rows was read as some other rows. A stray `]` in a
