@@ -5,7 +5,7 @@
 //! not do ranges. Skipped where there is no Python to run the server.
 #![cfg(feature = "cloud")]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -63,9 +63,30 @@ impl Server {
         Some(Server { child, url, log })
     }
 
+    /// Waits until every request the server has taken is in its log. It
+    /// writes a request's line after the answer, so the compara that asked
+    /// can have it all and exit first: on a macOS runner the last parts of a
+    /// compare were counted against the `columns` run that followed it.
+    fn settle(&self) {
+        let host = self.url.strip_prefix("http://").unwrap();
+        let mut s = std::net::TcpStream::connect(host).unwrap();
+        write!(
+            s,
+            "GET /__settled HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut answer = String::new();
+        s.read_to_string(&mut answer).unwrap();
+        assert!(
+            answer.starts_with("HTTP/1.1 200") || answer.starts_with("HTTP/1.0 200"),
+            "the object server still had a request unlogged after 10 s: {answer}"
+        );
+    }
+
     /// Each request's Range header (or what the log says in its place) and
     /// the bytes sent for it, from the server's log.
     fn requests(&self) -> Vec<(String, u64)> {
+        self.settle();
         std::fs::read_to_string(&self.log)
             .unwrap_or_default()
             .lines()
@@ -81,6 +102,7 @@ impl Server {
 
     /// The bytes the server has sent, from its request log.
     fn sent(&self) -> u64 {
+        self.settle();
         std::fs::read_to_string(&self.log)
             .unwrap_or_default()
             .lines()

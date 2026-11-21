@@ -11,7 +11,9 @@ Last-Modified. That is enough to be an S3 endpoint for path-style requests
 the Range header do. --private refuses requests that carry neither an
 Authorization header nor a query string, as a private bucket refuses an
 unsigned GET. Every request is appended to --log as one JSON line: method,
-path, range asked, bytes sent.
+path, range asked, bytes sent. A request's line is written after its answer,
+so a client can have it all before the line is there: GET /__settled answers
+once every request taken is logged (503 after 10 s), and is not logged.
 
 --overwrite-after N serves every object, after N GETs, as a newer version:
 other bytes (digits in its second half moved on by one; --grow adds a line
@@ -79,6 +81,9 @@ def main() -> None:
     ap.add_argument("--rate", type=int, default=1024, help="a dribbled PUT's bytes a second")
     args = ap.parse_args()
     lock = threading.Lock()
+    # Requests read and not yet logged: GET /__settled waits for none.
+    settled = threading.Condition(lock)
+    busy = [0]
     gets = [0]
     ranged = [0]
     puts = [0]
@@ -121,6 +126,24 @@ def main() -> None:
 
         def log_message(self, *a):
             pass
+
+        def parse_request(self):
+            ok = super().parse_request()
+            if ok and self.path != "/__settled":
+                with settled:
+                    busy[0] += 1
+                self.counted = True
+            return ok
+
+        def handle_one_request(self):
+            self.counted = False
+            try:
+                super().handle_one_request()
+            finally:
+                if self.counted:
+                    with settled:
+                        busy[0] -= 1
+                        settled.notify_all()
 
         def record(self, asked, sent):
             if args.log:
@@ -417,6 +440,12 @@ def main() -> None:
             self.reply(204)
 
         def do_GET(self):
+            if self.path == "/__settled":
+                with settled:
+                    done = settled.wait_for(lambda: busy[0] == 0, timeout=10)
+                self.send_response(200 if done else 503)
+                self.send_header("Content-Length", "0")
+                return self.end_headers()
             self.serve(head=False)
 
         def do_HEAD(self):
