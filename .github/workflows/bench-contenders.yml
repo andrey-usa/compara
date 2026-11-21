@@ -154,6 +154,11 @@ jobs:
         with:
           python-version: '3.13'
 
+      # The escaped-name claim is an instruction count (cachegrind), as the perf gate's.
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: valgrind
+
       # One target directory for the three builds, so the dependencies (the same
       # versions in each) are compiled once; each binary is copied out before the
       # next build replaces it. Each is built from its own checkout of the commit.
@@ -180,6 +185,8 @@ jobs:
 
       # The sortmerge claim runs every tool in a cgroup of 512 MB (systemd-run, as
       # bench-contenders does), its inputs dropped from the page cache before each run.
+      # The stall and put claims wait on timers over loopback (tests/object_server.py):
+      # three rounds, a run killed at 150 s.
       - name: Measure
         env:
           ROWS: ${{ inputs.rows }}
