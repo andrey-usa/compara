@@ -28,8 +28,8 @@ All notable changes to this project are documented here. The format follows
   the instructions where an ignored value differs in every row: such a
   name is matched by the spelling the file gives it, and the check that a
   matched row is unchanged reads past it instead of parsing both rows.
-  200,000 rows with one such name: A,AAA.AM instructions to B,BBB.BM
-  ([run RUN](https://github.com/andrey-usa/compara/actions/runs/RUN), cachegrind, one thread,
+  200,000 rows with one such name: 3,890.7M instructions to 1,772.9M
+  ([run 44913596938](https://github.com/andrey-usa/compara/actions/runs/44913596938), cachegrind, one thread,
   against 0.7.0).
 - In a container (or under `ulimit -d`), a pair whose key indexes
   cannot fit the heap goes to the sortmerge engine once its rows
@@ -132,7 +132,7 @@ All notable changes to this project are documented here. The format follows
   longer stop at five minutes a request, which cut off an 8 MB part on a
   link under 28 KB/s. A server sending 1 KB a second is waited for. Every
   request stalled, at the default timeout: no end in 150 s to an error at
-  CC.C s over HTTP and DD.D s as S3 ([run RUN](https://github.com/andrey-usa/compara/actions/runs/RUN),
+  60.1 s over HTTP and 60.1 s as S3 ([run 44913596938](https://github.com/andrey-usa/compara/actions/runs/44913596938),
   over loopback, median of three, against 0.7.0).
 - A plain `http(s)://` PUT -- an output to a presigned URL -- had no time
   limit: a server that took the connection and then stopped, reading
@@ -146,11 +146,11 @@ All notable changes to this project are documented here. The format follows
   slowest pace waited for: compara sees only what the sockets take, and
   they hold megabytes, so a stopped server and a slow one look the same
   until then. The error says what happened, that compara gives up on a
-  server taking less than 16 KB/s, and what to do. Against 0.7.0 ([run RUN](https://github.com/andrey-usa/compara/actions/runs/RUN),
+  server taking less than 16 KB/s, and what to do. Against 0.7.0 ([run 44913596938](https://github.com/andrey-usa/compara/actions/runs/44913596938),
   over loopback, median of three): a 19 KB body to a server that reads it
-  and never answers, no end in 150 s to an error at EE.E s; 398 KB never
-  read, FF.F s to GG.G s; 398 KB read at 32 KB/s, done in HH.H s by both;
-  at 1 KB/s, cut off at II.I s before and at JJ.J s now, the floor named.
+  and never answers, no end in 150 s to an error at 32.1 s; 398 KB never
+  read, 30.3 s to 55.1 s; 398 KB read at 32 KB/s, done in 12.2 s by both;
+  at 1 KB/s, cut off at 30.3 s before and at 55.1 s now, the floor named.
 - An output to a URL whose server reset the connection under a body of
   megabytes killed compara with SIGPIPE, exit 141 and no message (SIGPIPE's
   default, restored so that `compara head | head -1` ends quietly, caught
