@@ -466,6 +466,15 @@ pub(super) fn same_bytes(a: &Slab, x: Field, b: &Slab, y: Field) -> bool {
     if !is_escaped(x) && !is_escaped(y) {
         return a.raw(x) == b.raw(y);
     }
+    same_escaped(a, x, b, y)
+}
+
+/// [`same_bytes`] where a side carries an escape. Out of line so that the
+/// plain path, nearly every cell of a CSV file, does not save and restore the
+/// registers this one needs: inlined, they cost every call 16 instructions,
+/// 0.85% of a turbo compare of the perf gate's 200k-row CSV pair.
+#[inline(never)]
+fn same_escaped(a: &Slab, x: Field, b: &Slab, y: Field) -> bool {
     // The same bytes read the same way are the same value, and two nested
     // values a writer spelled alike, as one writer does, are equal without
     // reading them a byte at a time.
