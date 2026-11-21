@@ -238,8 +238,10 @@ fn stream_into(
 
     // Full batches go to a thread that sorts and writes them while this one
     // reads on. The channel holds one, so at most two are in memory: the one
-    // being written and the one being filled.
+    // being written and the one being filled. A batch written comes back to
+    // be filled again, so after the first two the reading allocates nothing.
     let (to_spill, batches) = mpsc::sync_channel::<Packed>(0);
+    let (written, back) = mpsc::channel::<Packed>();
     std::thread::scope(|scope| {
         let spill = &spill;
         let spiller = crate::parallel::spawn_scoped(scope, move || -> Result<Vec<PathBuf>> {
@@ -247,6 +249,7 @@ fn stream_into(
             let mut rowbuf: Vec<u8> = Vec::new();
             for batch in batches {
                 spilled.push(spill(&batch, spilled.len(), &mut rowbuf)?);
+                let _ = written.send(batch);
             }
             Ok(spilled)
         });
@@ -259,6 +262,32 @@ fn stream_into(
             let mut batch = Packed::new(width);
             let mut rows = 0i64;
             let mut sent = false;
+            // Batches at the spiller, not back yet.
+            let mut out = 0usize;
+            // Hands the batch over to be sorted and written, and starts the
+            // next in one that came back, if one has; `false` if the spiller
+            // has failed (it says why when it is joined).
+            let mut hand_over = |batch: &mut Packed, out: &mut usize| -> Result<bool> {
+                let next = match back.try_recv() {
+                    Ok(b) => {
+                        *out -= 1;
+                        b
+                    }
+                    Err(_) => Packed::new(width),
+                };
+                let full = std::mem::replace(batch, next);
+                batch.clear();
+                if let Some((spilled, rowbuf)) = here.as_mut() {
+                    spilled.push(spill(&full, spilled.len(), rowbuf)?);
+                    *batch = full;
+                    batch.clear();
+                } else if to_spill.send(full).is_err() {
+                    return Ok(false);
+                } else {
+                    *out += 1;
+                }
+                Ok(true)
+            };
             let mut rdr = reader(path, opt)?;
             let mut record = csv::StringRecord::new();
             while rdr
@@ -266,14 +295,37 @@ fn stream_into(
                 .map_err(|e| crate::engine::native::read_error(path, e, "sortmerge"))?
             {
                 rows += 1;
+                // The row's text is at most the record's, and a batch that
+                // cannot grow to take it -- under a heap limit, `ulimit -d`
+                // or a container's -- is spilled as it is, early, rather than
+                // aborting the process. An empty one waits for the batch
+                // being written to come back, and only a row no batch has
+                // room for, with both here, is refused.
+                let need = record.as_slice().len();
+                while !batch.try_room(need) {
+                    if !batch.is_empty() {
+                        sent = true;
+                        if !hand_over(&mut batch, &mut out)? {
+                            return Ok((batch, rows)); // the spiller says why
+                        }
+                    } else if out > 0 {
+                        match back.recv() {
+                            Ok(b) => {
+                                out -= 1;
+                                batch = b;
+                                batch.clear();
+                            }
+                            Err(_) => return Ok((batch, rows)),
+                        }
+                    } else {
+                        return Err(no_room_to_sort(need, width));
+                    }
+                }
                 batch
                     .push_normalised(index.iter().map(|at| at.and_then(|i| record.get(i))), opt)?;
                 if batch.bytes() + batch.len() * 4 >= budget {
-                    let full = std::mem::replace(&mut batch, Packed::new(width));
                     sent = true;
-                    if let Some((spilled, rowbuf)) = here.as_mut() {
-                        spilled.push(spill(&full, spilled.len(), rowbuf)?);
-                    } else if to_spill.send(full).is_err() {
+                    if !hand_over(&mut batch, &mut out)? {
                         break; // the spiller failed, and says why below
                     }
                 }
@@ -419,8 +471,18 @@ const AHEAD_ROWS: usize = 4096;
 
 /// A cursor run on a thread of its own, a block of rows ahead of whoever reads
 /// it, so that both files' merges and the join run at once rather than in turn.
+///
+/// A block read to its end goes back to the thread to be filled again, so
+/// once the first few have grown to their size the read-ahead allocates
+/// nothing. Under a heap limit (`ulimit -d`, a container's) a block that
+/// cannot grow is handed over as it is, and a row with no room at all waits
+/// for the reader to give a block back: the merge slows down rather than
+/// aborting, and only a row that fits no block -- with every block back --
+/// is refused, with what to do.
 struct Ahead {
     blocks: mpsc::Receiver<Result<Packed>>,
+    /// Where a block read to its end goes back to be filled again.
+    spent: mpsc::Sender<Packed>,
     block: Packed,
     at: usize,
 }
@@ -435,6 +497,7 @@ impl Ahead {
         width: usize,
     ) -> Result<Box<dyn Cursor>> {
         let (to_join, blocks) = mpsc::sync_channel(2);
+        let (spent, returned) = mpsc::channel::<Packed>();
         // Handed over through a slot rather than moved: a refused spawn drops
         // its closure, and the cursor must outlive that.
         let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(inner)));
@@ -444,14 +507,47 @@ impl Ahead {
             let Some(mut inner) = taken else {
                 return;
             };
+            // Blocks handed over and not given back yet: the reader holds one
+            // and the channel up to two.
+            let mut out = 0usize;
             loop {
-                let mut block = Packed::new(width);
+                let mut block = match returned.try_recv() {
+                    Ok(b) => {
+                        out -= 1;
+                        b
+                    }
+                    Err(_) => Packed::new(width),
+                };
+                block.clear();
                 while block.len() < AHEAD_ROWS {
-                    let copied = match inner.peek() {
-                        Some((rows, row)) => block.push_row_of(rows, row),
-                        None => break,
+                    let Some((rows, row)) = inner.peek() else {
+                        break;
                     };
-                    if let Err(e) = copied.and_then(|_| inner.next()) {
+                    if !block.try_push_row_of(rows, row) {
+                        if !block.is_empty() {
+                            break; // handed over as it is; the next starts empty
+                        }
+                        if out > 0 {
+                            // The room a block the reader is done with holds
+                            // is this row's: wait for one, and try again in it.
+                            match returned.recv() {
+                                Ok(b) => {
+                                    out -= 1;
+                                    block = b;
+                                    block.clear();
+                                    continue;
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                        // Every block is back and the row still has no room:
+                        // the last try, which names what it needed.
+                        if let Err(e) = block.push_row_of(rows, row) {
+                            let _ = to_join.send(Err(no_room(e)));
+                            return;
+                        }
+                    }
+                    if let Err(e) = inner.next() {
                         let _ = to_join.send(Err(e));
                         return;
                     }
@@ -459,6 +555,7 @@ impl Ahead {
                 if block.is_empty() || to_join.send(Ok(block)).is_err() {
                     return;
                 }
+                out += 1;
             }
         });
         if spawned.is_err() {
@@ -469,6 +566,7 @@ impl Ahead {
         }
         let mut ahead = Ahead {
             blocks,
+            spent,
             block: Packed::new(width),
             at: 0,
         };
@@ -478,13 +576,45 @@ impl Ahead {
 
     /// The next block, or an empty one once the rows are done. An error on the
     /// other thread arrives here rather than looking like the end of the file.
+    /// The block read to its end goes back first, so a read-ahead waiting for
+    /// room has it before this waits on the read-ahead.
     fn refill(&mut self) -> Result<()> {
         self.at = 0;
-        match self.blocks.recv() {
-            Ok(block) => self.block = block?,
-            Err(_) => self.block.clear(),
+        let done = std::mem::take(&mut self.block);
+        if !done.is_empty() {
+            let _ = self.spent.send(done);
+        }
+        if let Ok(block) = self.blocks.recv() {
+            self.block = block?;
         }
         Ok(())
+    }
+}
+
+/// The refusal of a row the sort has no room for, with no batch left to
+/// spill or wait for.
+fn no_room_to_sort(text: usize, width: usize) -> Error {
+    crate::alloc::refuse("a batch of rows to sort", text + width * 4 + 8)
+        .context_after(what_to_do(""))
+}
+
+/// The refusal of a row the read-ahead has no room for with every block back.
+fn no_room(e: Error) -> Error {
+    e.context_after(format!(
+        " to read the sorted runs ahead of the merge{}",
+        what_to_do(", or `--threads 2` merges without reading ahead")
+    ))
+}
+
+/// What a refusal of room says after what ran out: the heap limit, if there
+/// is one, and what to do.
+fn what_to_do(or: &str) -> String {
+    match crate::memory::heap_limit() {
+        Some(h) => format!(
+            ", and this process may use {} (a container limit or `ulimit -d`): raise it{or}",
+            crate::source::human(h)
+        ),
+        None => format!(": the machine has no more to give; free some{or}"),
     }
 }
 

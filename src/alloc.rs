@@ -113,7 +113,7 @@ pub fn reserve_covers(size: usize) -> bool {
 }
 
 /// The refusal itself: what was being sized, and how big it was.
-fn refuse(what: &str, bytes: usize) -> Error {
+pub(crate) fn refuse(what: &str, bytes: usize) -> Error {
     release_reserve();
     Error::out_of_memory(format!(
         "out of memory: {what} needs {}",

@@ -66,6 +66,17 @@ impl Packed {
         let _ = self.starts.try_reserve(more);
     }
 
+    /// Room for one more row of up to `text` bytes, if the allocator has it:
+    /// `false` when it has not, with nothing taken. Amortised as pushing is,
+    /// so a row that fits what is already there costs three comparisons.
+    #[inline]
+    pub fn try_room(&mut self, text: usize) -> bool {
+        (self.text.capacity() - self.text.len() >= text || self.text.try_reserve(text).is_ok())
+            && (self.ends.capacity() - self.ends.len() >= self.width
+                || self.ends.try_reserve(self.width).is_ok())
+            && (self.starts.len() < self.starts.capacity() || self.starts.try_reserve(1).is_ok())
+    }
+
     /// The text a row holds on average, so far.
     pub fn bytes_per_row(&self) -> usize {
         self.text.len() / self.len().max(1)
@@ -121,9 +132,46 @@ impl Packed {
         self.push(normalised.iter().map(|c| c.as_deref()))
     }
 
-    /// Appends a copy of another store's row.
+    /// Appends a copy of another store's row, or refuses it as out of memory.
     pub fn push_row_of(&mut self, other: &Packed, row: usize) -> Result<()> {
-        self.push((0..other.width).map(|i| other.cell(row, i)))
+        if self.try_push_row_of(other, row) {
+            return Ok(());
+        }
+        let (ends, text) = other.row_raw(row);
+        Err(crate::alloc::refuse(
+            "a block of sorted rows",
+            self.bytes() + text.len() + ends.len() * 4 + 8,
+        ))
+    }
+
+    /// Appends a copy of another store's row of the same width, if the
+    /// allocator has room for it: `false`, with nothing appended, when it
+    /// has not. A row's text and its cell ends are already laid out as this
+    /// store keeps them (the ends count from the row's start), so the copy is
+    /// two slices, not a walk of its cells.
+    ///
+    /// No refusal is built here: a caller that can wait for room -- the
+    /// merge's read-ahead, while its reader frees blocks -- would otherwise
+    /// spend the reserve kept for the message of one that cannot
+    /// (see [`crate::alloc`]).
+    #[inline]
+    pub fn try_push_row_of(&mut self, other: &Packed, row: usize) -> bool {
+        debug_assert_eq!(self.width, other.width);
+        let from = other.starts[row];
+        let to = other
+            .starts
+            .get(row + 1)
+            .copied()
+            .unwrap_or(other.text.len());
+        let text = &other.text[from..to];
+        let ends = &other.ends[row * other.width..(row + 1) * other.width];
+        if !self.try_room(text.len()) {
+            return false;
+        }
+        self.starts.push(self.text.len());
+        self.text.push_str(text);
+        self.ends.extend_from_slice(ends);
+        true
     }
 
     /// A row as it is spilled: its per-cell ends (with [`ABSENT`] flags) and
@@ -738,4 +786,47 @@ fn reorder<T>(mut items: Vec<T>, idx: &[usize]) -> Vec<T> {
     idx.iter()
         .map(|&i| slots[i].take().expect("each index used once"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row copied as its two slices reads back as the same cells, absent
+    /// and empty ones included, as copying it cell by cell gives.
+    #[test]
+    fn a_row_copied_whole_is_the_row_copied_cell_by_cell() {
+        let rows: [&[Option<&str>]; 4] = [
+            &[Some("k1"), None, Some("été"), Some("x")],
+            &[None, None, None, None],
+            &[Some("k2"), Some("a,b"), None, Some("")],
+            &[Some(""), Some("longer text here"), Some("1"), None],
+        ];
+        let mut from = Packed::new(4);
+        for r in rows {
+            from.push(r.iter().copied()).unwrap();
+        }
+        let (mut whole, mut by_cell) = (Packed::new(4), Packed::new(4));
+        for row in [2, 0, 3, 1, 2] {
+            whole.push_row_of(&from, row).unwrap();
+            by_cell.push((0..4).map(|i| from.cell(row, i))).unwrap();
+        }
+        assert_eq!(whole.len(), by_cell.len());
+        assert_eq!(whole.bytes(), by_cell.bytes());
+        for row in 0..whole.len() {
+            assert_eq!(whole.row(row), by_cell.row(row));
+            assert_eq!(whole.row_raw(row), by_cell.row_raw(row));
+        }
+    }
+
+    /// Room that cannot be had is `false`, and the store is as it was.
+    #[test]
+    fn room_that_cannot_be_had_takes_nothing() {
+        let mut p = Packed::new(2);
+        p.push([Some("a"), Some("b")]).unwrap();
+        assert!(p.try_room(16));
+        assert!(!p.try_room(usize::MAX / 2));
+        assert_eq!(p.len(), 1);
+        assert_eq!(p.row(0), vec![Some("a".to_string()), Some("b".to_string())]);
+    }
 }
