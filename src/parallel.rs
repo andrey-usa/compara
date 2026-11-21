@@ -444,8 +444,13 @@ mod tests {
         assert_eq!(t.join().unwrap(), 7);
     }
 
-    /// The tests that move [`SETTING_UP`], one at a time.
-    static SETTING_UP_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The tests that move [`SETTING_UP`] hold the turn a start holds (see
+    /// [`one_start`]), one at a time and apart from every real start: when
+    /// the test process runs under a heap limit, the other tests' threads
+    /// are started through the gated path and move the count too.
+    fn setting_up_test() -> std::sync::MutexGuard<'static, ()> {
+        one_start()
+    }
 
     /// While a thread is being set up, another thread's allocation waits until
     /// it is, and the thread starting it does not wait for its own. The wait
@@ -454,7 +459,7 @@ mod tests {
     #[test]
     fn an_allocation_waits_for_a_thread_being_set_up() {
         use std::time::{Duration, Instant};
-        let _one = SETTING_UP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = setting_up_test();
         const NEVER: Duration = Duration::from_secs(60);
         let (counted, count) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
@@ -495,7 +500,7 @@ mod tests {
     #[test]
     fn an_allocation_waits_no_longer_than_its_bound() {
         use std::time::{Duration, Instant};
-        let _one = SETTING_UP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = setting_up_test();
         let starting = std::thread::spawn(Starting::begin).join();
         RUNNING.set(true);
         let at = Instant::now();
@@ -516,7 +521,7 @@ mod tests {
     #[test]
     fn a_start_given_up_leaves_nothing_counted() {
         use std::sync::atomic::Ordering::Acquire;
-        let _one = SETTING_UP_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = setting_up_test();
         let panicked = std::panic::catch_unwind(|| {
             let _starting = Starting::begin();
             assert_eq!(SETTING_UP.load(Acquire), 1);
