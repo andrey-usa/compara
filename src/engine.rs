@@ -234,24 +234,6 @@ handles more of the format, could not read them either: {turbo_err}"
                 .map(|r| (r, Engine::SortMerge.label().to_string()))
                 .map_err(|e| e.context_unless_input("the sortmerge engine failed: "))
         }
-        // A pair that didn't fit `turbo`, in a heap too small to hand it to
-        // `sortmerge` with room to spare: say that the engine can be named.
-        Err(e)
-            if requested == Engine::Auto
-                && engine == Engine::Turbo
-                && e.is_out_of_memory()
-                && crate::memory::heap_limit()
-                    .is_some_and(|h| (SORTMERGE_MIN..SORTMERGE_FLOOR).contains(&h))
-                && sortmerge::available() =>
-        {
-            Err(e
-                .context(format!("the {engine} engine failed: "))
-                .context_after(format!(
-                    "; below {} of heap the sortmerge engine isn't tried on its own (it may not \
-                 fit): `--engine sortmerge` tries it",
-                    crate::source::human(SORTMERGE_FLOOR)
-                )))
-        }
         result => result
             .map(|r| (r, engine.label().to_string()))
             .map_err(|e| e.context_unless_input(format!("the {engine} engine failed: "))),
@@ -281,15 +263,17 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
     }
 }
 
-/// The least heap a named sortmerge is started with; see [`SORTMERGE_FLOOR`]
-/// for the fallback's, which leaves room for larger inputs.
+/// The least heap a named sortmerge is started with: below it the engine's
+/// threads, batches and read-ahead do not fit, and runs ended on signal 6
+/// (measured: 2M-row pair, up to 18.5 MB).
 const SORTMERGE_MIN: u64 = 24 << 20;
 
 /// The heap below which a CSV pair that does not fit `turbo` is refused
-/// rather than handed to `sortmerge`: about what that engine needs for its
-/// batches, run buffers and merge on a 2M-row pair (measured: 44 MB runs,
-/// 30 MB aborts), with room. An 80 MB container's heap is above it.
-pub(crate) const SORTMERGE_FLOOR: u64 = 48 << 20;
+/// rather than handed to `sortmerge`. It was twice the named engine's least,
+/// to leave room for the merge's read buffers, one per run and so growing
+/// with the input; they are sized from the heap now, and the 2M- and 10M-row
+/// pairs fall back and answer from 24 MB up.
+pub(crate) const SORTMERGE_FLOOR: u64 = SORTMERGE_MIN;
 
 /// Turns [`Engine::Auto`] into a concrete backend.
 ///
