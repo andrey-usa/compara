@@ -12,9 +12,10 @@
 //! the report into an overwrite of whatever the link points to. A FIFO or a
 //! device named directly (`/dev/null`) is written as it is, since it cannot be
 //! replaced and writing into it is what was asked. A file the user may write
-//! in a directory they may not add to is written in place too, as it was
-//! before outputs landed in one step: there a failed run can leave it half
-//! written.
+//! at a name that takes no new file is written in place too, as it was
+//! before outputs landed in one step: in a directory they may not add to, in
+//! a sticky one where the file is another user's, or where the file is
+//! mounted at the name. There a failed run can leave it half written.
 
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
@@ -29,6 +30,9 @@ pub struct Output {
     /// The temporary file `commit` moves onto `dest`, and the mode of the file
     /// it replaces; `None` when `dest` is written in place (a FIFO, a device).
     temp: Option<(PathBuf, Option<Permissions>)>,
+    /// The file the check found at `dest`, if one was there: written in
+    /// place when the name takes no rename.
+    checked: Option<fs::Metadata>,
     /// Taken and closed by `commit` before the rename: Windows renames an
     /// open file only when every handle on it allows it.
     file: Option<File>,
@@ -80,6 +84,7 @@ impl Output {
                 return Ok(Output {
                     dest: dest.to_path_buf(),
                     temp: None,
+                    checked: None,
                     file: Some(file),
                 });
             }
@@ -134,6 +139,7 @@ impl Output {
                     return Ok(Output {
                         dest: dest.to_path_buf(),
                         temp: Some((temp, replaced)),
+                        checked,
                         file: Some(file),
                     });
                 }
@@ -153,6 +159,7 @@ impl Output {
                     return Ok(Output {
                         dest: dest.to_path_buf(),
                         temp: None,
+                        checked: None,
                         file: Some(file),
                     });
                 }
@@ -179,7 +186,8 @@ impl Output {
         )))
     }
 
-    /// Puts the written file at its name, in one step.
+    /// Puts the written file at its name, in one step where the name takes a
+    /// rename.
     pub fn commit(mut self) -> Result<()> {
         if let Some(mut file) = self.file.take() {
             file.flush().map_err(|e| cannot(&self.dest, &e))?;
@@ -188,10 +196,24 @@ impl Output {
             let moved = mode
                 .map_or(Ok(()), |m| fs::set_permissions(&temp, m))
                 .and_then(|()| fs::rename(&temp, &self.dest));
-            if let Err(e) = moved {
-                let _ = fs::remove_file(&temp);
-                return Err(cannot(&self.dest, &e));
-            }
+            let landed = match (moved, &self.checked) {
+                (Ok(()), _) => return Ok(()),
+                // The name takes no rename though the file at it may be
+                // written: another user's file in a sticky directory (EPERM),
+                // or a file mounted at the name (EBUSY). Written in place, as
+                // before outputs landed in one step.
+                (Err(e), Some(meta))
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::ResourceBusy
+                    ) =>
+                {
+                    copy_in_place(&temp, &self.dest, meta)
+                }
+                (Err(e), _) => Err(e),
+            };
+            let _ = fs::remove_file(&temp);
+            landed.map_err(|e| cannot(&self.dest, &e))?;
         }
         Ok(())
     }
@@ -241,6 +263,19 @@ fn is_the_checked_file(file: &File, checked: &fs::Metadata) -> io::Result<()> {
     } else {
         Err(io::Error::other("it changed while it was being opened"))
     }
+}
+
+/// Writes the finished `temp` into the file at `dest`, the one the check
+/// found, in place: for a name that takes no rename.
+fn copy_in_place(temp: &Path, dest: &Path, checked: &fs::Metadata) -> io::Result<()> {
+    let mut to = OpenOptions::new().write(true).open(dest)?;
+    #[cfg(unix)]
+    is_the_checked_file(&to, checked)?;
+    #[cfg(not(unix))]
+    let _ = checked;
+    to.set_len(0)?;
+    io::copy(&mut File::open(temp)?, &mut to)?;
+    to.flush()
 }
 
 /// Writes `bytes` to `dest` through an [`Output`].

@@ -381,3 +381,55 @@ fn an_output_inside_an_input_directory_or_glob_is_refused() {
     let (code, _, err) = run(&fx.0, &args);
     assert_eq!(code, 1, "{err}");
 }
+
+/// A file the user may write at a name that takes no replacement is written
+/// in place, as before outputs landed in one step: in a sticky shared
+/// directory (`/tmp`, a group's project directory) another user's file can
+/// be written but not replaced, and a file mounted at the name (`docker -v
+/// ./report.html:/out/report.html`) cannot be renamed over. Setting up a file
+/// of another user needs root; the run is then made as another user, whom the
+/// sticky bit binds. Elsewhere there is nothing to show.
+#[cfg(unix)]
+#[test]
+fn a_file_the_directory_will_not_let_be_replaced_is_written_in_place() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::process::CommandExt;
+    const NOBODY: u32 = 65534;
+    let fx = Fixture::new();
+    let shared = fx.path("shared");
+    fs::create_dir(&shared).unwrap();
+    let theirs = [shared.join("r.html"), shared.join("r.json")];
+    for file in &theirs {
+        fs::write(file, b"another user's file").unwrap();
+        fs::set_permissions(file, fs::Permissions::from_mode(0o666)).unwrap();
+    }
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+    if std::os::unix::fs::chown(&theirs[0], Some(0), Some(0)).is_err() {
+        return;
+    }
+    let inodes: Vec<u64> = theirs
+        .iter()
+        .map(|f| fs::metadata(f).unwrap().ino())
+        .collect();
+    let out = Command::new(BIN)
+        .current_dir(&fx.0)
+        .gid(NOBODY)
+        .uid(NOBODY)
+        .args(["compare", "a.csv", "b.csv", "-k", "account_id,txn_id"])
+        .args(["-o", "shared/r.html", "--json", "shared/r.json"])
+        .output()
+        .expect("the binary");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    for (file, ino) in theirs.iter().zip(inodes) {
+        let meta = fs::metadata(file).unwrap();
+        assert_eq!(
+            (meta.ino(), meta.uid()),
+            (ino, 0),
+            "{} was replaced",
+            file.display()
+        );
+        assert_ne!(fs::read(file).unwrap(), b"another user's file");
+    }
+    assert_eq!(files(&shared), ["r.html", "r.json"]);
+}
