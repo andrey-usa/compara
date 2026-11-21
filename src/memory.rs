@@ -157,6 +157,12 @@ pub fn heap_limit() -> Option<u64> {
     rlimit::data()
 }
 
+/// How many files this process may hold open at once (`ulimit -n`), if the
+/// platform says.
+pub fn open_files_limit() -> Option<u64> {
+    rlimit::open_files()
+}
+
 /// What [`heap_limit`] is measured against: this process's private writable
 /// mappings -- heap, buffers, thread stacks -- in bytes, as the kernel counts
 /// them (`VmData`). `None` where that cannot be read.
@@ -180,6 +186,9 @@ mod rlimit {
     }
 
     const RLIMIT_DATA: c_int = 2;
+    /// The generic value; MIPS, SPARC and Alpha number it otherwise.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    const RLIMIT_NOFILE: c_int = 7;
 
     /// The soft data limit, if there is one.
     pub fn data() -> Option<u64> {
@@ -190,6 +199,21 @@ mod rlimit {
         }
         // RLIM_INFINITY is all ones.
         (now.cur != u64::MAX).then_some(now.cur)
+    }
+
+    /// The soft limit on open files, if there is one.
+    pub fn open_files() -> Option<u64> {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            let mut now = RLimit { cur: 0, max: 0 };
+            // SAFETY: `now` is a valid, writable rlimit for the call to fill.
+            if unsafe { getrlimit(RLIMIT_NOFILE, &mut now) } != 0 {
+                return None;
+            }
+            (now.cur != u64::MAX).then_some(now.cur)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        None
     }
 
     /// Lowers the soft data limit to `cap`, never raising it; the limit in
@@ -256,6 +280,10 @@ mod rlimit {
     }
 
     pub fn data() -> Option<u64> {
+        None
+    }
+
+    pub fn open_files() -> Option<u64> {
         None
     }
 

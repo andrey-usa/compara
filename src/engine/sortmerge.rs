@@ -46,6 +46,15 @@ const DEFAULT_BATCH_BYTES: usize = 32 << 20;
 /// spills at all, which would leave the interesting half of this module untested.
 pub const BATCH_BYTES_ENV: &str = "COMPARA_SORTMERGE_BATCH_BYTES";
 
+/// A spilled run's read buffer when the merge has the room: the size every
+/// run was read through before the budget sized them.
+const RUN_BUFFER_MAX: usize = 64 << 10;
+
+/// The least a spilled run is read through, a page. The merge reads at most
+/// as many runs at once as its memory holds buffers of this size; more are
+/// merged a group at a time first.
+const RUN_BUFFER_MIN: usize = 4 << 10;
+
 /// The batch size: the override, or the default -- unless the process has a
 /// heap limit (`ulimit -d`, or a container's, see `memory::contain`) or a stated budget
 /// (`--memory`), when it is a sixteenth of that, so a comparison handed to
@@ -351,6 +360,10 @@ fn stream_into(
             Err(_) => here.map(|(spilled, _)| spilled).unwrap_or_default(),
         };
         let (last, rows) = got?;
+        // Here rather than when the merge starts, so the two files' passes,
+        // if they need any, run at once as their sorts did.
+        let merge_budget = budget;
+        let spilled = merge_down(dir, spilled, width, key_size, merge_budget)?;
         let order = if spilled.is_empty() {
             sorted_order(&last, key_size)
         } else {
@@ -363,6 +376,7 @@ fn stream_into(
             last,
             order,
             rows,
+            merge_budget,
         })
     })
 }
@@ -435,6 +449,10 @@ struct Runs {
     last: Packed,
     order: Vec<u32>,
     rows: i64,
+    /// What the merge may spend on its read buffers: a batch's worth. The
+    /// sort holds none once it is done, but the other file may still be
+    /// sorting, with two of its own, while this one merges in passes.
+    merge_budget: usize,
 }
 
 impl Runs {
@@ -453,7 +471,230 @@ impl Runs {
             &self.spilled,
             self.width,
             self.key_size,
+            run_buffer(self.merge_budget, self.spilled.len()),
         )?))
+    }
+}
+
+/// What a run costs the merge besides its buffer: its reader, its head row
+/// and that row's text, and its place in the heap, with room to spare.
+const RUN_OVERHEAD: usize = 512;
+
+/// How many runs one merge reads at once: as many as its budget holds
+/// buffers of [`RUN_BUFFER_MIN`] for (one more is written, in a pass), and as
+/// many as can be open while the other file merges too.
+fn fan_in(budget: usize) -> usize {
+    let by_memory = (budget / (RUN_BUFFER_MIN + RUN_OVERHEAD)).saturating_sub(1);
+    // `ulimit -n`, less some for the inputs, the report and the export; where
+    // it cannot be asked, macOS's default of 256.
+    let files = crate::memory::open_files_limit().unwrap_or(256);
+    let by_files = usize::try_from(files.saturating_sub(64) / 2)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(1);
+    by_memory.min(by_files).max(2)
+}
+
+/// Each run's read buffer when `files` share `budget`: whole pages, from
+/// [`RUN_BUFFER_MIN`] to [`RUN_BUFFER_MAX`].
+fn run_buffer(budget: usize, files: usize) -> usize {
+    (budget / files.max(1)).clamp(RUN_BUFFER_MIN, RUN_BUFFER_MAX) & !(RUN_BUFFER_MIN - 1)
+}
+
+/// Merges runs into one, in order, until no more are left than [`fan_in`]
+/// lets the merge read at once.
+///
+/// A file spills about sixteen runs per heap it is larger than, so under a
+/// heap limit the count grows with the file, not with the limit, and a buffer
+/// per run outgrew the limit it was started under: the 2M-row pair at 30 MB
+/// aborted opening its runs. Only the first runs are merged, and only as many
+/// as bring the count down, so a file a little over the line rewrites a
+/// little of itself, not all of it. The groups are consecutive and the merge
+/// breaks equal keys by run, so a key's rows keep their order in the file.
+fn merge_down(
+    dir: &Path,
+    mut runs: Vec<PathBuf>,
+    width: usize,
+    key_size: usize,
+    budget: usize,
+) -> Result<Vec<PathBuf>> {
+    let fan_in = fan_in(budget);
+    let mut pass = 0;
+    while runs.len() > fan_in {
+        let excess = runs.len() - fan_in;
+        let mut merged = Vec::new();
+        let (mut at, mut gone) = (0, 0);
+        while gone < excess {
+            // Merging k runs into one takes away k - 1.
+            let k = (excess - gone + 1).min(fan_in).min(runs.len() - at);
+            if k < 2 {
+                break;
+            }
+            let path = dir.join(format!("merge-{pass}-{}.bin", merged.len()));
+            merge_runs(&runs[at..at + k], &path, width, key_size, budget)?;
+            for done in &runs[at..at + k] {
+                let _ = std::fs::remove_file(done);
+            }
+            merged.push(path);
+            at += k;
+            gone += k - 1;
+        }
+        merged.extend_from_slice(&runs[at..]);
+        runs = merged;
+        pass += 1;
+    }
+    Ok(runs)
+}
+
+/// Merges `runs` into one run at `path`.
+fn merge_runs(
+    runs: &[PathBuf],
+    path: &Path,
+    width: usize,
+    key_size: usize,
+    budget: usize,
+) -> Result<()> {
+    let buffer = run_buffer(budget, runs.len() + 1);
+    let mut from = MergeCursor::open(runs, width, key_size, buffer)?;
+    let mut to = RunWriter::create(path, buffer)?;
+    let mut rowbuf = Vec::new();
+    while let Some((rows, row)) = from.peek() {
+        write_row(&mut to, rows, row, &mut rowbuf)?;
+        from.next()?;
+    }
+    let file = to.finish()?;
+    crate::memory::write_out(&file);
+    Ok(())
+}
+
+/// The refusal of a run's buffer: the merge reads its runs through buffers
+/// sized to fit, so only a heap that is full already gets here.
+fn no_room_to_merge(bytes: usize) -> Error {
+    crate::alloc::refuse("a sorted run's buffer for the merge", bytes).context_after(what_to_do(""))
+}
+
+/// A buffer for a run, from the allocator, or the refusal.
+fn run_buffer_of(size: usize) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(size)
+        .map_err(|_| no_room_to_merge(size))?;
+    Ok(buf)
+}
+
+/// A spilled run read through a buffer of the size the merge chose, taken
+/// from the allocator with a refusal rather than the abort a `BufReader`'s
+/// would end in.
+struct RunReader {
+    file: File,
+    buf: Box<[u8]>,
+    at: usize,
+    end: usize,
+}
+
+impl RunReader {
+    fn open(path: &Path, size: usize) -> Result<Self> {
+        let mut buf = run_buffer_of(size)?;
+        buf.resize(size, 0);
+        Ok(RunReader {
+            file: File::open(path)?,
+            buf: buf.into_boxed_slice(),
+            at: 0,
+            end: 0,
+        })
+    }
+}
+
+impl Read for RunReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.at == self.end && out.len() >= self.buf.len() {
+            return self.file.read(out);
+        }
+        let have = self.fill_buf()?;
+        let n = have.len().min(out.len());
+        out[..n].copy_from_slice(&have[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+
+    /// What the buffer holds already is copied without a call per piece:
+    /// a row is read as two of these.
+    #[inline]
+    fn read_exact(&mut self, mut out: &mut [u8]) -> std::io::Result<()> {
+        if self.end - self.at >= out.len() {
+            out.copy_from_slice(&self.buf[self.at..self.at + out.len()]);
+            self.at += out.len();
+            return Ok(());
+        }
+        while !out.is_empty() {
+            match self.read(out) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => out = &mut out[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BufRead for RunReader {
+    #[inline]
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.at >= self.end {
+            self.end = loop {
+                match self.file.read(&mut self.buf) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            };
+            self.at = 0;
+        }
+        Ok(&self.buf[self.at..self.end])
+    }
+
+    #[inline]
+    fn consume(&mut self, n: usize) {
+        self.at = (self.at + n).min(self.end);
+    }
+}
+
+/// A run written by a merge pass, through a buffer taken as [`RunReader`]'s is.
+struct RunWriter {
+    file: File,
+    buf: Vec<u8>,
+}
+
+impl RunWriter {
+    fn create(path: &Path, size: usize) -> Result<Self> {
+        let buf = run_buffer_of(size)?;
+        Ok(RunWriter {
+            file: File::create(path)?,
+            buf,
+        })
+    }
+
+    fn finish(mut self) -> Result<File> {
+        self.flush()?;
+        Ok(self.file)
+    }
+}
+
+impl Write for RunWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() + data.len() > self.buf.capacity() {
+            self.flush()?;
+        }
+        if data.len() >= self.buf.capacity() {
+            return self.file.write(data);
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.write_all(&self.buf)?;
+        self.buf.clear();
+        Ok(())
     }
 }
 
@@ -652,7 +893,7 @@ impl Cursor for BatchCursor {
 
 /// A k-way merge over the spilled runs, holding one row from each.
 struct MergeCursor {
-    readers: Vec<BufReader<File>>,
+    readers: Vec<RunReader>,
     /// Each run's current row, or an empty store once the run is done.
     heads: Vec<Packed>,
     /// The runs that still have rows, as a binary heap ordered by their heads:
@@ -666,7 +907,8 @@ struct MergeCursor {
 }
 
 impl MergeCursor {
-    fn open(paths: &[PathBuf], width: usize, key_size: usize) -> Result<Self> {
+    /// The runs at `paths`, each read through `buffer` bytes.
+    fn open(paths: &[PathBuf], width: usize, key_size: usize, buffer: usize) -> Result<Self> {
         let mut c = Self {
             readers: Vec::new(),
             heads: Vec::new(),
@@ -675,9 +917,19 @@ impl MergeCursor {
             scratch: Vec::new(),
             ends: Vec::new(),
         };
+        // Taken whole and checked: a thousand runs' heads are 80 KB, and
+        // grown by doubling they were the allocation a heap near its limit
+        // aborted on.
+        let n = paths.len();
+        let each = std::mem::size_of::<RunReader>() + std::mem::size_of::<Packed>() + 8;
+        if c.readers.try_reserve_exact(n).is_err()
+            || c.heads.try_reserve_exact(n).is_err()
+            || c.heap.try_reserve_exact(n).is_err()
+        {
+            return Err(no_room_to_merge(n * each));
+        }
         for p in paths {
-            c.readers
-                .push(BufReader::with_capacity(1 << 16, File::open(p)?));
+            c.readers.push(RunReader::open(p, buffer)?);
             c.heads.push(Packed::new(width));
         }
         for run in 0..c.readers.len() {
