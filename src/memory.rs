@@ -170,6 +170,65 @@ pub fn data_in_use() -> Option<u64> {
     rlimit::data_in_use()
 }
 
+/// Heap promised under [`heap_limit`] to work under way that may not have
+/// taken it yet: a ranged request's buffers grow as its answer comes in. A new
+/// thread leaves it ([`crate::parallel`]), and so does a later promise.
+static PROMISED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What is promised now ([`promise`]).
+pub fn promised() -> u64 {
+    PROMISED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// What is left under [`heap_limit`] besides what is in use and promised;
+/// `None` without a limit, or where what is in use cannot be read.
+pub fn headroom() -> Option<u64> {
+    let (limit, used) = (heap_limit()?, data_in_use()?);
+    Some(limit.saturating_sub(used).saturating_sub(promised()))
+}
+
+/// Room promised by [`promise`], given back when dropped.
+pub struct Promise(u64);
+
+impl Drop for Promise {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            PROMISED.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+/// Why [`promise`] could not: what is in use and promised, and the limit.
+pub struct Short {
+    pub used: u64,
+    pub promised: u64,
+    pub limit: u64,
+}
+
+/// Promises `bytes` of heap if what is in use and promised already leaves
+/// them under [`heap_limit`]. Without a limit, or where what is in use cannot
+/// be read, nothing is counted and the promise is kept regardless.
+pub fn promise(bytes: u64) -> std::result::Result<Promise, Short> {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let (Some(limit), Some(used)) = (heap_limit(), data_in_use()) else {
+        return Ok(Promise(0));
+    };
+    let mut promised = PROMISED.load(Acquire);
+    loop {
+        if used.saturating_add(promised).saturating_add(bytes) > limit {
+            return Err(Short {
+                used,
+                promised,
+                limit,
+            });
+        }
+        match PROMISED.compare_exchange_weak(promised, promised + bytes, AcqRel, Acquire) {
+            Ok(_) => return Ok(Promise(bytes)),
+            Err(now) => promised = now,
+        }
+    }
+}
+
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod rlimit {
     use std::ffi::c_int;

@@ -30,6 +30,13 @@ All notable changes to this project are documented here. The format follows
   (no lock, and its run may be going on in another pid namespace that
   shares the directory) waits until nothing in it has changed for a day.
   Anything else is left, and nothing is followed through a link. Unix only.
+- A URL read near a heap limit (`ulimit -d`, or a container's) no longer
+  ends the process on signal 6, "memory allocation of ... bytes failed":
+  the HTTP client grows each connection's read buffer with no way to refuse,
+  and sixteen requests in flight on each side took the last of the heap.
+  A read now keeps no more requests in flight than the heap has room for,
+  and a thread started meanwhile leaves that room; with none for one
+  request it is refused, exit 2, with the limit and what to do.
 
 ## [0.8.0] - 2026-11-21
 

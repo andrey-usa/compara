@@ -575,6 +575,69 @@ fn urls_read_to_the_local_answer_under_a_partial_thread_budget() {
     }
 }
 
+/// Two URLs read a few megabytes above the heap they are started with
+/// (`ulimit -d`, or a container's) answer as the local files do, or refuse
+/// with what ran out: never signal 6. hyper grows each connection's read
+/// buffer with the allocator's abort on failure, and with sixteen requests in
+/// flight on each side every limit from 9 to 24 MB ended on "memory
+/// allocation of 131072 bytes failed" or the like. One file is both sides, so
+/// that the comparison after the reads has no rows to report: what is tested
+/// is the reads.
+#[test]
+fn urls_near_the_heap_limit_answer_or_refuse_rather_than_aborting() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: `ulimit -d` bounds the heap on Linux");
+        return;
+    }
+    let f = fixture("20k", &[]);
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let want = compare(&local("t_a.csv"), &local("t_a.csv"), &KEY, &[], None);
+    assert_eq!(want.0, 0, "{}", want.1);
+    let Some(server) = Server::start(&f.0, &[]) else {
+        eprintln!("skipping: no python to run the object server");
+        return;
+    };
+    let a = format!("{}/bkt/t_a.csv", server.url);
+    // Parts of 64 KB: many requests in flight, each growing its buffer.
+    let env = [("COMPARA_FETCH_PART", "65536")];
+    let (mut failed, mut answered) = (Vec::new(), 0);
+    for mb in 9..=24 {
+        let kb = mb * 1024 + 512;
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", &format!("ulimit -d {kb}; exec \"$0\" \"$@\"")])
+            .arg(env!("CARGO_BIN_EXE_compara"))
+            .env_remove("COMPARA_MEMORY");
+        let got = compare_within(
+            cmd,
+            &a,
+            &a,
+            &KEY,
+            &env,
+            None,
+            Some(std::time::Duration::from_secs(60)),
+        );
+        match got.0 {
+            c if c == want.0 && got.2 == want.2 && got.3 == want.3 => answered += 1,
+            2 if got.1.contains("out of memory") => {}
+            c => failed.push(format!(
+                "{kb} KB: exit {c}: {}",
+                got.1
+                    .lines()
+                    .find(|l| !l.contains(" downloaded "))
+                    .unwrap_or("")
+            )),
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} of 16 runs neither answered as the local files do nor refused:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+    assert!(answered > 0, "no limit in the band was enough to answer");
+}
+
 /// What goes wrong says what it is: a missing object, a refused one, a
 /// compression this does not read.
 #[test]

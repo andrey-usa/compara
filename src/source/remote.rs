@@ -15,7 +15,8 @@
 //! Everything is read in ranges of [`PART`] bytes, [`CONCURRENCY`] at a time
 //! (`COMPARA_FETCH_CONCURRENCY`), and written where it belongs in a temporary
 //! file as it arrives, so memory holds a few buffers whatever the object's
-//! size. A Parquet object is read as far as the comparison reads it: the
+//! size, and under a heap limit no more requests are in flight than it has
+//! room for. A Parquet object is read as far as the comparison reads it: the
 //! first request is for its last 64 KB, which holds the footer of any file
 //! not unusually wide; the footer names the column chunks; and only the
 //! chunks of the columns compared are fetched. The rest of the local file is
@@ -1842,6 +1843,72 @@ fn concurrency() -> usize {
 /// runtime with four workers.
 const LANES: usize = 4;
 
+/// The most hyper grows a connection's read buffer to: its default
+/// `max_buf_size`, 8 KB + 400 KB, which reqwest does not change.
+const READ_BUFFER_MAX: u64 = 8192 + 4096 * 100;
+
+/// A connection's own state besides its read buffer: over TLS, the session's
+/// records in and out.
+const CONNECTION_ROOM: u64 = 128 << 10;
+
+/// What a ranged request for `len` bytes may come to hold, as a heap limit
+/// counts it (`VmData`), beyond what its connection held before. hyper reads
+/// into a buffer whose next growth doubles whenever a read fills it, up to
+/// [`READ_BUFFER_MAX`], and grows it by allocating anew while a piece of the
+/// last answer is still being written: up to three times the largest read,
+/// which is no more than the part.
+fn request_room(len: u64) -> u64 {
+    3 * len.min(READ_BUFFER_MAX) + CONNECTION_ROOM
+}
+
+/// How many of `width` ranged requests of up to `len` bytes fit under the
+/// heap limit at once, and the room for them, promised
+/// ([`crate::memory::promise`]) until the transfer ends.
+///
+/// hyper grows a connection's read buffer with the allocator's abort on
+/// failure, so under a heap limit (`ulimit -d`, or a container's) sixteen
+/// requests in flight on each side took the last of it and ended the process
+/// on signal 6, "memory allocation of 131072 bytes failed" or the like, at
+/// every limit from 9 to 24 MB (a 20,000-row pair in 64 KB parts). So a
+/// transfer keeps no more in flight than have [`request_room`] each besides
+/// what is in use and what is promised to others: another transfer, and a
+/// thread started meanwhile ([`crate::parallel`]) leaves it too. The room is
+/// held for the whole transfer, not a request: a connection keeps its grown
+/// buffer for the next request it carries, and what a request gives back the
+/// allocator keeps, so what is in use does not come down between them. With
+/// no room for one request, it waits for what others have promised, or with
+/// nothing promised, is refused. Without a heap limit nothing is counted.
+async fn room_for_requests(
+    width: usize,
+    len: u64,
+) -> std::result::Result<(usize, crate::memory::Promise), String> {
+    let room = request_room(len);
+    loop {
+        let fit = crate::memory::headroom().map_or(width as u64, |free| free / room);
+        let n = fit.min(width as u64);
+        if n > 0 {
+            if let Ok(promise) = crate::memory::promise(n * room) {
+                return Ok((n as usize, promise));
+            }
+            // Another promise came first: count again.
+            continue;
+        }
+        match crate::memory::promise(room) {
+            Ok(promise) => return Ok((1, promise)),
+            Err(short) if short.promised == 0 => {
+                return Err(format!(
+                    "out of memory: a request needs about {} and {} of the {} this process \
+                     may use is taken (a container limit or `ulimit -d`): raise it",
+                    human(room),
+                    human(short.used),
+                    human(short.limit)
+                ));
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(2)).await,
+        }
+    }
+}
+
 /// A part of a job, owned, for whichever lane takes it.
 struct Piece {
     reader: Reader,
@@ -2015,7 +2082,14 @@ async fn fetch_jobs(jobs: Vec<Job<'_>>, file: &File, label: &str) -> Result<()> 
         })
         .collect();
     let total: u64 = pieces.iter().map(|p| p.part.end - p.part.start).sum();
-    let width = concurrency();
+    let longest = pieces
+        .iter()
+        .map(|p| p.part.end - p.part.start)
+        .max()
+        .unwrap_or(0);
+    let (width, _room) = room_for_requests(concurrency().min(pieces.len().max(1)), longest)
+        .await
+        .map_err(|e| Error::new(format!("{label}: {e}")))?;
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let lanes = LANES.min(cores).min(pieces.len()).min(width);
     let (stop_tx, stop_rx) = futures::channel::oneshot::channel::<()>();

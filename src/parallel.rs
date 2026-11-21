@@ -69,11 +69,17 @@ fn stack_size() -> u64 {
 /// [`SET_UP`]; `None` without a limit (or where what is in use cannot be
 /// read). Whether the C library has a stack cached is not knowable from here,
 /// so one is always counted; near the limit that refuses a thread a little
-/// early, which costs a core and not an answer.
+/// early, which costs a core and not an answer. Nor does a thread take room
+/// promised to work under way ([`crate::memory::promise`]).
 fn fits() -> Option<bool> {
     let limit = crate::memory::heap_limit()?;
     let used = crate::memory::data_in_use()?;
-    Some(used.saturating_add(stack_size()).saturating_add(SET_UP) <= limit)
+    Some(
+        used.saturating_add(crate::memory::promised())
+            .saturating_add(stack_size())
+            .saturating_add(SET_UP)
+            <= limit,
+    )
 }
 
 /// Threads started under a heap limit and not yet set up; while there are
