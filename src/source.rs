@@ -16,7 +16,8 @@
 //!   compares (see [`remote`]).
 //!
 //! Temporary files live in the system's temporary directory (`TMPDIR`) and go
-//! when the [`Source`] does. In a container that is the writable scratch
+//! when the [`Source`] does; a temporary directory that a killed run left
+//! there goes with the next run that makes one. In a container that is the writable scratch
 //! space -- an `emptyDir` under a read-only root -- and a page cache the
 //! kernel can reclaim, where holding the bytes in memory would count against
 //! the container's limit until the end. A decompressed input is the exception
@@ -38,6 +39,8 @@ mod delta;
 mod many;
 #[cfg(feature = "cloud")]
 mod remote;
+#[cfg(unix)]
+mod sweep;
 
 /// One side of a comparison, as a local file the engines can map.
 pub struct Source {
@@ -670,21 +673,61 @@ pub fn upload(_from: &Path, dest: &str) -> Result<u64> {
 /// A directory of this user's alone for what is written on the way to
 /// somewhere else -- an export bound for object storage, the runs an
 /// external sort spills -- removed with what is in it when dropped.
-pub struct TempDir(PathBuf);
+///
+/// A run killed before then leaves it behind; the first directory a later
+/// run makes removes those first. The directory is locked for as long as it
+/// is used, which is what tells that later run, in any pid namespace, that
+/// this one is not over, and its name ends `-locked` to say it is.
+pub struct TempDir {
+    path: PathBuf,
+    _lock: Option<File>,
+}
 
 impl TempDir {
     pub fn new(tag: &str) -> Result<TempDir> {
-        temp_dir(tag).map(TempDir)
+        sweep_once();
+        #[cfg(unix)]
+        {
+            let path = temp_dir(&format!("{tag}-{}", sweep::LOCKED))?;
+            if let Some(lock) = File::open(&path).ok().filter(|f| f.try_lock().is_ok()) {
+                return Ok(TempDir {
+                    path,
+                    _lock: Some(lock),
+                });
+            }
+            // A name that says "locked" on a directory nothing locks would
+            // let a later run take it for over a minute after it last
+            // changed: where the lock cannot be taken (a filesystem without
+            // locks) the directory is one of an unlocked run's instead.
+            let _ = std::fs::remove_dir(&path);
+        }
+        Ok(TempDir {
+            path: temp_dir(tag)?,
+            _lock: None,
+        })
     }
 
     pub fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 }
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // Before the lock goes with the fields.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Removes, once a process, the temporary directories runs that were killed
+/// left behind.
+fn sweep_once() {
+    #[cfg(unix)]
+    {
+        static SWEPT: std::sync::Once = std::sync::Once::new();
+        SWEPT.call_once(|| {
+            sweep::sweep(&std::env::temp_dir());
+        });
     }
 }
 
