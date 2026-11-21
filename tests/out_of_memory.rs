@@ -607,3 +607,85 @@ fn a_named_sortmerge_near_its_floor_answers_rather_than_aborting() {
     );
     assert!(answered > 0, "no limit in the band was enough to answer");
 }
+
+/// A named sortmerge whose file spills more runs than its heap holds read
+/// buffers for answers as the unlimited run does. The merge read every run
+/// through a 64 KB buffer of its own, and a file spills about sixteen runs per
+/// heap it is larger than, so the buffers grew with the file and not with the
+/// limit: the 2M-row pair (368 MB a side) at 24 to 33 MB ended on signal 6
+/// ("memory allocation of 65536 bytes failed") opening its runs. Small batches
+/// give the 200,000-row pair as many runs as that pair has under such a
+/// limit; now the runs are read through buffers sized to fit, and merged a
+/// group at a time first when even a page each does not.
+#[test]
+fn a_sortmerge_with_more_runs_than_buffers_answers_rather_than_aborting() {
+    let dir = std::env::temp_dir().join(format!("compara-oom-fanin-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let made = Command::new(env!("CARGO_BIN_EXE_compara-gen-data"))
+        .args(["--rows", "200k", "--prefix", "f", "--out-dir"])
+        .arg(&dir)
+        .output()
+        .expect("gen-data");
+    assert!(made.status.success(), "{made:?}");
+    let (a, b) = (dir.join("f_a.csv"), dir.join("f_b.csv"));
+    // Exit code (128 + the signal for one that killed it), the counts
+    // (without the engine and its time) and stderr.
+    let run = |limit_kb: Option<usize>, batch: Option<&str>| {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(format!(
+            "{} exec {} compare {} {} -k account_id,txn_id -i updated_at,note \
+             --engine sortmerge --threads 4",
+            limit_kb
+                .map(|kb| format!("ulimit -d {kb};"))
+                .unwrap_or_default(),
+            env!("CARGO_BIN_EXE_compara"),
+            a.display(),
+            b.display(),
+        ));
+        cmd.env("RUST_BACKTRACE", "1")
+            .env_remove("COMPARA_BACKTRACE")
+            .env_remove("COMPARA_MEMORY")
+            .env_remove("COMPARA_SORTMERGE_BATCH_BYTES");
+        if let Some(batch) = batch {
+            cmd.env("COMPARA_SORTMERGE_BATCH_BYTES", batch);
+        }
+        let out = cmd.output().expect("bash");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let counts = stdout
+            .rsplit_once(" | ")
+            .map(|(c, _)| c.to_string())
+            .unwrap_or(stdout);
+        use std::os::unix::process::ExitStatusExt;
+        (
+            out.status
+                .code()
+                .or_else(|| out.status.signal().map(|s| 128 + s)),
+            counts,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, free, err) = run(None, None);
+    assert_eq!(code, Some(1), "{err}");
+    let (mut failed, mut answered) = (Vec::new(), 0);
+    for mb in [32, 36, 40] {
+        let kb = mb * 1024;
+        let (code, counts, err) = run(Some(kb), Some("131072"));
+        match code {
+            Some(1) if counts == free => answered += 1,
+            // A refusal is allowed, if it says what ran out and the limit.
+            Some(2) if err.contains("out of memory") && err.contains("ulimit -d") => {}
+            _ => failed.push(format!(
+                "{kb} KB: exit {code:?}, {counts:?}: {}",
+                err.lines().next().unwrap_or("")
+            )),
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        failed.is_empty(),
+        "{} of 3 runs neither answered as the unlimited run ({free:?}) nor refused:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+    assert!(answered > 0, "no limit was enough to answer");
+}
