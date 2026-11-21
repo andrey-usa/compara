@@ -201,12 +201,14 @@ impl Output {
                 // The name takes no rename though the file at it may be
                 // written: another user's file in a sticky directory (EPERM),
                 // or a file mounted at the name (EBUSY). Written in place, as
-                // before outputs landed in one step.
+                // before outputs landed in one step; only where the file opened
+                // can be checked to be the one found (not on Windows).
                 (Err(e), Some(meta))
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::PermissionDenied | io::ErrorKind::ResourceBusy
-                    ) =>
+                    if cfg!(unix)
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::PermissionDenied | io::ErrorKind::ResourceBusy
+                        ) =>
                 {
                     copy_in_place(&temp, &self.dest, meta)
                 }
