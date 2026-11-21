@@ -626,7 +626,8 @@ fn columns_of_a_remote_parquet_file_read_only_the_footer() {
 /// with no size. They had been an error (501, after three more tries) and an
 /// empty file (416). Parquet still fetches its footer and the columns asked
 /// for, not the file. One that sends the whole object is a download, as
-/// before. A server that refuses every range says so, and what to do.
+/// before. A server that refuses every range says so, and what to do; one
+/// that claims to send more than was asked is not read on.
 #[test]
 fn a_server_that_takes_no_suffix_range_is_read_in_ranges() {
     let f = fixture("20k", &["--format", "parquet"]);
@@ -700,6 +701,18 @@ fn a_server_that_takes_no_suffix_range_is_read_in_ranges() {
     );
     // Not asked again: 501 says the server does not do it.
     assert!(server.requests().len() <= 4, "{:?}", server.requests());
+    drop(server);
+    let Some(server) = Server::start(&f.0, &["--fault", "wide"]) else {
+        return;
+    };
+    let u = &server.url;
+    let (code, err, ..) = compare_urls(
+        &format!("{u}/bkt/t_a.csv"),
+        &format!("{u}/bkt/t_b.csv"),
+        &[],
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("more than the 65536 bytes asked for"), "{err}");
 }
 
 /// Outputs to object storage: the report, the summary and the export land in

@@ -1501,6 +1501,16 @@ async fn ask(
             "a partial response without a total size".into(),
         ));
     };
+    // At most what was asked for is held: a server that says it sends more
+    // is not read on (a 64 KB request answered with a 3 GB span was all
+    // held in memory).
+    if span.end.saturating_sub(span.start) > TAIL {
+        return Err(FetchError::Other(format!(
+            "the server answered `Range: {range}` with bytes {}-{} of {size}, more than the {TAIL} bytes asked for",
+            span.start,
+            span.end.saturating_sub(1)
+        )));
+    }
     // An answer cut off is asked for again, as a part's is.
     let mut bytes = Vec::with_capacity((span.end - span.start).min(TAIL) as usize);
     let mut response = response;

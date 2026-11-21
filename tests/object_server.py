@@ -32,7 +32,8 @@ Unsupported client range, as Fastly does (GitHub release assets);
 `suffix-416` answers 416 with no Content-Range, as a server that takes no
 such form may; `suffix-200` sends the whole object, as a server that ignores
 a Range it does not parse must. `ranges-501` answers every GET with a Range
-501. With
+501; `wide` answers it 206 with a span of 64 MiB from byte 0, whatever was
+asked, and sends zeros to fill it. With
 --fault-puts the fault hits PUTs instead, counted the same way: `silent`
 reads nothing and never answers; `stall` reads the body and never answers;
 `dribble` reads it 1 KB at a time, --rate bytes a second (1024), then
@@ -70,7 +71,7 @@ def main() -> None:
     ap.add_argument("--no-etag", action="store_true")
     ap.add_argument("--grow", action="store_true")
     ap.add_argument("--fault", choices=["silent", "stall", "drop", "reset", "overlong", "dribble",
-                                        "suffix-501", "suffix-416", "suffix-200", "ranges-501"])
+                                        "suffix-501", "suffix-416", "suffix-200", "ranges-501", "wide"])
     ap.add_argument("--fault-at", type=int, default=0)
     ap.add_argument("--fault-every", type=int, default=0)
     ap.add_argument("--fault-max", type=int, default=0)
@@ -222,6 +223,20 @@ def main() -> None:
                 return self.refuse(501, "Unsupported client range")
             if suffix and args.fault == "suffix-416":
                 return self.refuse(416)
+            if asked and not head and args.fault == "wide":
+                wide = 64 << 20
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes 0-{wide - 1}/{wide}")
+                self.send_header("Content-Length", str(wide))
+                self.end_headers()
+                sent = 0
+                try:
+                    for _ in range(wide >> 16):
+                        self.wfile.write(bytes(1 << 16))
+                        sent += 1 << 16
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return self.record(asked, sent)
             start, end, partial = 0, size, False
             if asked and not args.no_ranges and not head and not (suffix and args.fault == "suffix-200"):
                 m = re.fullmatch(r"bytes=(\d*)-(\d*)", asked.strip())

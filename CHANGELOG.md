@@ -60,6 +60,9 @@ All notable changes to this project are documented here. The format follows
   name their first byte, as before in parallel and, for Parquet, only the
   footer and the columns compared. One that refuses every range is an
   error naming both requests and what to do.
+- A server that answered the request for an `https://` file's last 64 KB
+  with a longer span had all of it held in memory, however long: an
+  answer longer than asked is now refused, naming it.
 - A JSON file framed by its braces (one top-level array, or objects one
   after another as `jq .` writes them) with anything but space and a
   comma between two rows was read as some other rows. A stray `]` in a
