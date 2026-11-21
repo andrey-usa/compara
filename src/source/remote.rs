@@ -1328,6 +1328,10 @@ fn brief(e: &str) -> String {
 /// sends nothing for the silence budget ([`Heard::silence`]), however many
 /// tries that is, has stalled.
 async fn tail(reader: &Reader, spec: &str) -> std::result::Result<Got, FetchError> {
+    // Its connection's buffer grows as a part's does ([`room_for_requests`]).
+    let (_, _room) = room_for_requests(1, TAIL)
+        .await
+        .map_err(FetchError::Other)?;
     let heard = Heard::new();
     let tries = async {
         let mut attempt = 0u32;
