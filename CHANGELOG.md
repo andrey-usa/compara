@@ -120,23 +120,20 @@ All notable changes to this project are documented here. The format follows
   a line, the first alone. A row's own object gets them now, after its
   members.
 - A URL whose server stopped sending (an answer's headers and then
-  nothing, or no answer at all) held the compare for good, its progress
-  line counting on. A read now waits 30 s for the answer and for each piece
-  of it, what AWS's Java SDK waits and `curl --speed-time`'s default
-  (`COMPARA_READ_TIMEOUT=<seconds>` waits longer), then asks again as for a
-  dropped connection; a server that sends nothing at all is given up on as
-  the next entry says. Object stores wait the same and ask again as
-  they do after any failure, and their reads no longer stop at five minutes
-  a request, which cut off an 8 MB part on a link under 28 KB/s. A server
-  sending 1 KB a second is waited for.
-- A URL whose server stalled every request held the compare for good,
-  over HTTP and from an object store alike. A transfer now ends once its
-  server has sent nothing on any request for twice the read timeout, and
-  says so; one request stalled while others are answered, or every request
-  in flight stalled once, still reads through. Every request stalled, at
-  the default timeout: no end in 150 s to an error at CC.C s over HTTP and
-  DD.D s as S3 ([run RUN](https://github.com/andrey-usa/compara/actions/runs/RUN), over
-  loopback, median of three, against 0.7.0).
+  nothing, or no answer at all) held the compare for good, over HTTP and
+  from an object store alike, its progress line counting on. A read now
+  waits 30 s for the answer and for each piece of it, what AWS's Java SDK
+  waits and `curl --speed-time`'s default (`COMPARA_READ_TIMEOUT=<seconds>`
+  waits longer), then asks again as for a dropped connection; a transfer
+  ends, and says so, once its server has sent nothing on any request for
+  twice that. One request stalled while others are answered, or every
+  request in flight stalled once, still reads through. Object stores wait
+  the same and ask again as they do after any failure, and their reads no
+  longer stop at five minutes a request, which cut off an 8 MB part on a
+  link under 28 KB/s. A server sending 1 KB a second is waited for. Every
+  request stalled, at the default timeout: no end in 150 s to an error at
+  CC.C s over HTTP and DD.D s as S3 ([run RUN](https://github.com/andrey-usa/compara/actions/runs/RUN),
+  over loopback, median of three, against 0.7.0).
 - A plain `http(s)://` PUT -- an output to a presigned URL -- had no time
   limit: a server that took the connection and then stopped, reading
   nothing, or reading it all and never answering, held compara for good;
