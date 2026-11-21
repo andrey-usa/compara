@@ -19,6 +19,17 @@ All notable changes to this project are documented here. The format follows
 - Under `--engine auto`, a CSV pair that does not fit `turbo` falls back to
   `sortmerge` from 24 MB of heap, the least a named `sortmerge` starts with,
   where it was refused below 48 MB.
+- A run killed while `sortmerge` spilled (SIGKILL, the OOM killer, an
+  abort) left its runs in the temporary directory for good, and enough such
+  runs filled the disk. The next run that makes a temporary directory now
+  removes what killed runs left there: only directories by compara's own
+  names, this user's and closed to others, holding only the files compara
+  writes in them, whose process is gone and whose run is over: each run now
+  locks its directory and names it `...-locked`, and such a directory goes
+  once nothing in it has changed for a minute. One an earlier version left
+  (no lock, and its run may be going on in another pid namespace that
+  shares the directory) waits until nothing in it has changed for a day.
+  Anything else is left, and nothing is followed through a link. Unix only.
 
 ## [0.8.0] - 2026-11-21
 
