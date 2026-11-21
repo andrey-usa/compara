@@ -512,3 +512,98 @@ fn a_parquet_pair_too_big_for_the_heap_is_refused_not_aborted() {
     assert!(refused > 0, "no cap in the range was too small to serve");
     assert!(answered > 0, "no cap in the range was enough to answer");
 }
+
+/// A named sortmerge a few megabytes above the heap it is started with
+/// (`ulimit -d`, or a container's) answers as the unlimited run does. The
+/// merge's read-ahead grew each block of rows with the allocator's abort on
+/// failure, and its sort grew each batch the same way, so on 200,000 rows a
+/// side most limits from 24 to 30 MB ended on signal 6 ("memory allocation of
+/// 884736 bytes failed"), at 4 threads and at 16. Now a block or a batch that
+/// cannot grow is handed on as it is, and an empty one waits for one to come
+/// back.
+#[test]
+fn a_named_sortmerge_near_its_floor_answers_rather_than_aborting() {
+    let dir = std::env::temp_dir().join(format!("compara-oom-sm-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let made = Command::new(env!("CARGO_BIN_EXE_compara-gen-data"))
+        .args(["--rows", "200k", "--prefix", "s", "--out-dir"])
+        .arg(&dir)
+        .output()
+        .expect("gen-data");
+    assert!(made.status.success(), "{made:?}");
+    let (a, b) = (dir.join("s_a.csv"), dir.join("s_b.csv"));
+    // Exit code (128 + the signal for one that killed it, as a shell says),
+    // the counts (without the engine and its time) and stderr.
+    let run = |limit_kb: Option<usize>, threads: usize| -> (Option<i32>, String, String) {
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "{} exec {} compare {} {} -k account_id,txn_id -i updated_at,note \
+                 --engine sortmerge --threads {threads}",
+                limit_kb
+                    .map(|kb| format!("ulimit -d {kb};"))
+                    .unwrap_or_default(),
+                env!("CARGO_BIN_EXE_compara"),
+                a.display(),
+                b.display(),
+            ))
+            .env("RUST_BACKTRACE", "1")
+            .env_remove("COMPARA_BACKTRACE")
+            .env_remove("COMPARA_MEMORY")
+            .env_remove("COMPARA_SORTMERGE_BATCH_BYTES")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("bash");
+        // A wait for room that never ends is a failure too, not a hung suite.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while child.try_wait().expect("wait").is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{limit_kb:?} KB, {threads} threads: the run did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = child.wait_with_output().expect("output");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let counts = stdout
+            .rsplit_once(" | ")
+            .map(|(c, _)| c.to_string())
+            .unwrap_or(stdout);
+        use std::os::unix::process::ExitStatusExt;
+        (
+            out.status
+                .code()
+                .or_else(|| out.status.signal().map(|s| 128 + s)),
+            counts,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, free, err) = run(None, 4);
+    assert_eq!(code, Some(1), "{err}");
+    let (mut failed, mut answered) = (Vec::new(), 0);
+    for threads in [4, 16] {
+        for mb in 24..=31 {
+            let kb = mb * 1024 + 512;
+            let (code, counts, err) = run(Some(kb), threads);
+            match code {
+                Some(1) if counts == free => answered += 1,
+                // A refusal is allowed, if it says what ran out and the limit.
+                Some(2) if err.contains("out of memory") && err.contains("ulimit -d") => {}
+                _ => failed.push(format!(
+                    "{kb} KB, {threads} threads: exit {code:?}, {counts:?}: {}",
+                    err.lines().next().unwrap_or("")
+                )),
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        failed.is_empty(),
+        "{} of 16 runs neither answered as the unlimited run ({free:?}) nor refused:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+    assert!(answered > 0, "no limit in the band was enough to answer");
+}
