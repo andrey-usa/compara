@@ -186,6 +186,14 @@ All notable changes to this project are documented here. The format follows
   is refused with exit 2 and what did not fit. Two Parquet files
   compared by columns did the same where their dictionaries are
   interned and the report's changed cells are held.
+- `--engine sortmerge` (and `auto`, where it falls back to it) near its
+  heap limit (a container's, or `ulimit -d`) stopped with exit 134
+  ("memory allocation of ... failed") at many limits just above the
+  smallest it starts at, as its merge read ahead or its sort filled a
+  batch. A block or batch that cannot grow is now handed on as it is and
+  reused once read, so the run answers as without a limit, or is refused
+  with exit 2 and what to raise. The merge's read buffers, one per
+  spilled run, can still abort below that on files many times the limit.
 - Where the system refuses a thread (a container's process limit, or a
   memory limit its stack counts against), the sortmerge and native engines
   and turbo's streaming join stopped with exit 101 ("failed to spawn
