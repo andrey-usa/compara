@@ -42,6 +42,12 @@ fn cannot(dest: &Path, e: &io::Error) -> Error {
     Error::new(format!("cannot write {}: {e}", dest.display()))
 }
 
+/// Windows' errors for a file another program holds open without sharing it
+/// the way compara asks: a sharing or a lock violation.
+fn held_open(e: &io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33))
+}
+
 /// A name Windows takes as a device, not a file (`NUL`, `CON`, `COM1`, in any
 /// directory and any case): the system's own reading of the name, so every
 /// spelling it treats as one is one here. Writing there is what was asked,
@@ -132,6 +138,11 @@ impl Output {
                         io::ErrorKind::PermissionDenied => Error::new(format!(
                             "cannot write {}: {e}; the file is write-protected, and compara \
                              replaces what is at the name: make it writable or name another file",
+                            dest.display()
+                        )),
+                        _ if held_open(&e) => Error::new(format!(
+                            "cannot write {}: {e}; another program has it open: close it there \
+                             and run again, or name another file",
                             dest.display()
                         )),
                         _ => cannot(dest, &e),
@@ -248,7 +259,21 @@ impl Output {
                 (Err(e), _) => Err(e),
             };
             let _ = fs::remove_file(&temp);
-            landed.map_err(|e| cannot(&self.dest, &e))?;
+            landed.map_err(|e| {
+                if self.checked.is_some()
+                    && (held_open(&e)
+                        || cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied)
+                {
+                    Error::new(format!(
+                        "cannot write {}: {e}; another program may have it open, so it cannot \
+                         be replaced: close it there and run again, or name another file; the \
+                         file there is as it was",
+                        self.dest.display()
+                    ))
+                } else {
+                    cannot(&self.dest, &e)
+                }
+            })?;
         }
         Ok(())
     }

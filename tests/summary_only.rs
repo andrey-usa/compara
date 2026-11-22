@@ -455,3 +455,87 @@ fn outputs_sent_to_nul_are_discarded() {
         assert_eq!(files(&fx.path("sub")), Vec::<String>::new(), "{flags:?}");
     }
 }
+
+/// An output another program has open: replaced when that program lets it be
+/// (as Rust's and most programs' handles do, sharing delete), and otherwise
+/// left as it was, with an error that says why and what to do.
+#[cfg(windows)]
+#[test]
+fn an_output_another_program_holds_open() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const READ: u32 = 1; // FILE_SHARE_READ
+    const WRITE: u32 = 2; // FILE_SHARE_WRITE
+    const DELETE: u32 = 4; // FILE_SHARE_DELETE
+    let fx = Fixture::new();
+    let args = [
+        "compare",
+        "a.csv",
+        "b.csv",
+        "-k",
+        "account_id,txn_id",
+        "-o",
+        "r.html",
+    ];
+    // (what the holder shares, whether the run can replace the file, what
+    // the error says when it cannot)
+    for (share, replaced, says) in [
+        (READ | WRITE | DELETE, true, ""),
+        (READ, false, "another program has it open"),
+        (READ | WRITE, false, "another program may have it open"),
+    ] {
+        fs::write(fx.path("r.html"), b"the old report").unwrap();
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(share)
+            .open(fx.path("r.html"))
+            .unwrap();
+        let (code, _, err) = run(&fx.0, &args);
+        drop(holder);
+        let now = fs::read(fx.path("r.html")).unwrap();
+        if replaced {
+            assert_eq!(code, 1, "share {share}: {err}");
+            assert!(now.starts_with(b"<!doctype html>"), "share {share}");
+        } else {
+            assert_eq!(code, 2, "share {share}: {err}");
+            assert!(err.contains(says), "share {share}: {err}");
+            assert!(err.contains("r.html"), "share {share}: {err}");
+            assert_eq!(now, b"the old report", "share {share}");
+        }
+        assert_eq!(files(&fx.0), ["r.html"], "share {share}: left beside it");
+    }
+}
+
+/// The read-only attribute is Windows' write protection: the file is not
+/// replaced, though a rename could, and the error says how to go on.
+#[cfg(windows)]
+#[test]
+fn a_read_only_output_is_not_replaced() {
+    let fx = Fixture::new();
+    let dest = fx.path("r.json");
+    fs::write(&dest, b"{}").unwrap();
+    let mut perm = fs::metadata(&dest).unwrap().permissions();
+    perm.set_readonly(true);
+    fs::set_permissions(&dest, perm.clone()).unwrap();
+    let args = [
+        "compare",
+        "a.csv",
+        "b.csv",
+        "-k",
+        "account_id,txn_id",
+        "--json",
+        "r.json",
+    ];
+    let (code, _, err) = run(&fx.0, &args);
+    let (kept, still_read_only) = (
+        fs::read(&dest).unwrap(),
+        fs::metadata(&dest).unwrap().permissions().readonly(),
+    );
+    #[allow(clippy::permissions_set_readonly_false)]
+    perm.set_readonly(false);
+    fs::set_permissions(&dest, perm).unwrap();
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("write-protected"), "{err}");
+    assert_eq!(kept, b"{}");
+    assert!(still_read_only);
+    assert_eq!(files(&fx.0), ["r.json"]);
+}
