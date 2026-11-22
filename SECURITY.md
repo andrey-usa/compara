@@ -38,7 +38,12 @@ or report a wrong count is a bug we want to hear about.
   written only at the names given: a symbolic link at one (or at the
   export directory) is refused, not followed, a name that is one of the
   inputs is refused before anything is read, and each file is written
-  beside its name and moved onto it once complete.
+  beside its name and moved onto it once complete. A device (`/dev/null`,
+  `NUL`) and a file at a name that takes no new file or no rename (a
+  directory the user may not add to, another user's file in a sticky
+  directory, a file mounted at the name) are written in place instead: a
+  run that fails there can leave the file half written, and its error
+  names it.
 - The HTML report shows cell values as text. It loads nothing from the
   network and runs no code from the data, and its Content-Security-Policy
   forbids it any connection, image or form, so a value that got past the

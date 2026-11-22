@@ -15,11 +15,13 @@
 //! the user may write at a name that takes no new file is written in place
 //! too, as it was before outputs landed in one step: in a directory they may
 //! not add to, in a sticky one where the file is another user's, or where the
-//! file is mounted at the name. There a failed run can leave it half written.
+//! file is mounted at the name. There a failed run can leave it half written,
+//! and the run's error names it ([`left_incomplete`]).
 
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::error::{Error, Result};
 
@@ -36,6 +38,37 @@ pub struct Output {
     /// Taken and closed by `commit` before the rename: Windows renames an
     /// open file only when every handle on it allows it.
     file: Option<File>,
+    /// The file at `dest` was emptied to be written in place: dropped before
+    /// `commit` finishes it, it is left incomplete.
+    emptied: bool,
+}
+
+/// Files written in place whose run failed before they were complete.
+static INCOMPLETE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// The files written in place that a failed run left incomplete, taken from
+/// the list, for its error to name: the old content is gone and what is there
+/// is a prefix of the new one, which can look whole.
+pub fn left_incomplete() -> Vec<PathBuf> {
+    INCOMPLETE
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
+}
+
+/// What a failed run's error adds for the files it left incomplete, or
+/// nothing.
+pub fn incomplete_note() -> String {
+    left_incomplete()
+        .iter()
+        .map(|p| {
+            format!(
+                "; {} is left incomplete (written in place, as its directory takes no new \
+                 file): fix the error and run again, or name a file in a writable directory",
+                p.display()
+            )
+        })
+        .collect()
 }
 
 fn cannot(dest: &Path, e: &io::Error) -> Error {
@@ -102,6 +135,7 @@ impl Output {
                 temp: None,
                 checked: None,
                 file: Some(file),
+                emptied: false,
             });
         }
         refuse_link(dest)?;
@@ -125,6 +159,7 @@ impl Output {
                     temp: None,
                     checked: None,
                     file: Some(file),
+                    emptied: false,
                 });
             }
             Ok(meta) => {
@@ -185,6 +220,7 @@ impl Output {
                         temp: Some((temp, replaced)),
                         checked,
                         file: Some(file),
+                        emptied: false,
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -205,6 +241,7 @@ impl Output {
                         temp: None,
                         checked: None,
                         file: Some(file),
+                        emptied: true,
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -236,6 +273,7 @@ impl Output {
         if let Some(mut file) = self.file.take() {
             file.flush().map_err(|e| cannot(&self.dest, &e))?;
         }
+        self.emptied = false;
         if let Some((temp, mode)) = self.temp.take() {
             let moved = mode
                 .map_or(Ok(()), |m| fs::set_permissions(&temp, m))
@@ -256,13 +294,14 @@ impl Output {
                 {
                     copy_in_place(&temp, &self.dest, meta)
                 }
-                (Err(e), _) => Err(e),
+                (Err(e), _) => Err(Landed::Untouched(e)),
             };
             let _ = fs::remove_file(&temp);
-            landed.map_err(|e| {
-                if self.checked.is_some()
-                    && (held_open(&e)
-                        || cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied)
+            landed.map_err(|e| match e {
+                Landed::Untouched(e)
+                    if self.checked.is_some()
+                        && (held_open(&e)
+                            || cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied) =>
                 {
                     Error::new(format!(
                         "cannot write {}: {e}; another program may have it open, so it cannot \
@@ -270,9 +309,14 @@ impl Output {
                          file there is as it was",
                         self.dest.display()
                     ))
-                } else {
-                    cannot(&self.dest, &e)
                 }
+                Landed::Untouched(e) => cannot(&self.dest, &e),
+                Landed::Incomplete(e) => Error::new(format!(
+                    "cannot write {}: {e}; it is left incomplete (written in place, as the name \
+                     takes no rename): fix the error and run again, or name a file in a directory \
+                     of your own",
+                    self.dest.display()
+                )),
             })?;
         }
         Ok(())
@@ -303,6 +347,11 @@ impl Write for Output {
 
 impl Drop for Output {
     fn drop(&mut self) {
+        if self.emptied
+            && let Ok(mut v) = INCOMPLETE.lock()
+        {
+            v.push(self.dest.clone());
+        }
         if let Some((temp, _)) = self.temp.take() {
             drop(self.file.take());
             let _ = fs::remove_file(temp);
@@ -325,17 +374,33 @@ fn is_the_checked_file(file: &File, checked: &fs::Metadata) -> io::Result<()> {
     }
 }
 
+/// Why a finished output did not land at its name: the file there is as it
+/// was, or it was emptied and is now part of the new one.
+enum Landed {
+    Untouched(io::Error),
+    Incomplete(io::Error),
+}
+
 /// Writes the finished `temp` into the file at `dest`, the one the check
 /// found, in place: for a name that takes no rename.
-fn copy_in_place(temp: &Path, dest: &Path, checked: &fs::Metadata) -> io::Result<()> {
-    let mut to = OpenOptions::new().write(true).open(dest)?;
+fn copy_in_place(
+    temp: &Path,
+    dest: &Path,
+    checked: &fs::Metadata,
+) -> std::result::Result<(), Landed> {
+    let mut from = File::open(temp).map_err(Landed::Untouched)?;
+    let mut to = OpenOptions::new()
+        .write(true)
+        .open(dest)
+        .map_err(Landed::Untouched)?;
     #[cfg(unix)]
-    is_the_checked_file(&to, checked)?;
+    is_the_checked_file(&to, checked).map_err(Landed::Untouched)?;
     #[cfg(not(unix))]
     let _ = checked;
-    to.set_len(0)?;
-    io::copy(&mut File::open(temp)?, &mut to)?;
-    to.flush()
+    to.set_len(0).map_err(Landed::Untouched)?;
+    io::copy(&mut from, &mut to)
+        .and_then(|_| to.flush())
+        .map_err(Landed::Incomplete)
 }
 
 /// Writes `bytes` to `dest` through an [`Output`].
@@ -516,6 +581,30 @@ mod tests {
             write(&dest, b"new").unwrap();
             assert_eq!(fs::read(&dest).unwrap(), b"new");
             assert_eq!(left_in(&dir), ["report.html"]);
+        }
+        fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_written_in_place_and_cut_short_is_named_as_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("cut");
+        let (cut, whole) = (dir.join("changed.csv"), dir.join("added.csv"));
+        fs::write(&cut, b"the old export").unwrap();
+        fs::write(&whole, b"the old export").unwrap();
+        fs::set_permissions(&dir, Permissions::from_mode(0o555)).unwrap();
+        // A user the modes do not bind (root) may add to it: nothing to show.
+        let binds = fs::write(dir.join("probe"), b"").is_err();
+        if binds {
+            let mut out = Output::create(&cut).unwrap();
+            out.write_all(b"key,a,b\n1,").unwrap();
+            drop(out);
+            write(&whole, b"key\n").unwrap();
+            let named = left_incomplete();
+            assert!(named.contains(&cut), "{named:?}");
+            assert!(!named.contains(&whole), "{named:?}");
         }
         fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(dir).unwrap();

@@ -205,7 +205,9 @@ fn run(args: &[String]) -> u8 {
         "compare" => match cmd_compare(&args[1..]) {
             Ok(status) => status,
             Err(e) => {
-                eprintln!("error: {e}");
+                // An output written in place that the failure cut short is
+                // named, since what is left there can look complete.
+                eprintln!("error: {e}{}", compara::output::incomplete_note());
                 2
             }
         },
