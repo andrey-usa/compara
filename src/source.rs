@@ -788,17 +788,27 @@ pub(crate) fn room_for(bytes: u64, what: &str) -> Result<()> {
 }
 
 pub fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u + 1 < UNITS.len() {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
+    Human(bytes).to_string()
+}
+
+/// [`human`] as a `Display`, for a message that is written where nothing
+/// may be allocated ([`crate::alloc::refuse`]).
+pub struct Human(pub u64);
+
+impl std::fmt::Display for Human {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+        let mut v = self.0 as f64;
+        let mut u = 0;
+        while v >= 1024.0 && u + 1 < UNITS.len() {
+            v /= 1024.0;
+            u += 1;
+        }
+        if u == 0 {
+            write!(f, "{} B", self.0)
+        } else {
+            write!(f, "{v:.1} {}", UNITS[u])
+        }
     }
 }
 

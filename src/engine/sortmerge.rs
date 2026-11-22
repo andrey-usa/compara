@@ -581,7 +581,9 @@ fn merge_runs(
 /// The refusal of a run's buffer: the merge reads its runs through buffers
 /// sized to fit, so only a heap that is full already gets here.
 fn no_room_to_merge(bytes: usize) -> Error {
-    crate::alloc::refuse("a sorted run's buffer for the merge", bytes).context_after(what_to_do(""))
+    crate::alloc::refuse("a sorted run's buffer for the merge", bytes)
+        .without_hint()
+        .context_after(what_to_do(""))
 }
 
 /// A buffer for a run, from the allocator, or the refusal.
@@ -848,12 +850,13 @@ impl Ahead {
 /// spill or wait for.
 fn no_room_to_sort(text: usize, width: usize) -> Error {
     crate::alloc::refuse("a batch of rows to sort", text + width * 4 + 8)
+        .without_hint()
         .context_after(what_to_do(""))
 }
 
 /// The refusal of a row the read-ahead has no room for with every block back.
 fn no_room(e: Error) -> Error {
-    e.context_after(format!(
+    e.without_hint().context_after(format!(
         " to read the sorted runs ahead of the merge{}",
         what_to_do(", or `--threads 2` merges without reading ahead")
     ))

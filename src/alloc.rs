@@ -34,6 +34,8 @@
 //! ceiling is the difference between a number and a diagnosis.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::fmt::{self, Write as _};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::{Error, Result};
@@ -55,7 +57,8 @@ use crate::{Error, Result};
 /// failed", from the other side's setup while its own sweep was refused. So
 /// the reserve is a few chunks, and [`crate::hugepages`]' allocator gives one
 /// back and tries again whenever a small allocation fails while any are left;
-/// [`refuse`] gives one back as well, for the message.
+/// [`refuse`] gives one back as well, for what follows its message: the
+/// context the callers add and the line on stderr.
 ///
 /// A chunk is larger than the C library's mmap threshold (128 KB in glibc and
 /// musl), so it is a mapping of its own, and giving it back returns it to the
@@ -73,6 +76,21 @@ fn chunk() -> Layout {
 
 /// Sets aside the room a refusal is written into. `main` calls it first.
 pub fn hold_reserve() {
+    {
+        let mut held = MESSAGE_BUFFERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let missing = MESSAGES.saturating_sub(held.len());
+        if held.try_reserve_exact(missing).is_ok() {
+            while held.len() < MESSAGES {
+                let mut s = String::new();
+                if s.try_reserve_exact(MESSAGE).is_err() {
+                    break;
+                }
+                held.push(s);
+            }
+        }
+    }
     for slot in &RESERVE {
         // SAFETY: a non-zero size; the block is freed in `release_reserve`
         // with the same layout.
@@ -112,23 +130,101 @@ pub fn reserve_covers(size: usize) -> bool {
     size <= RESERVE_CHUNK / 4
 }
 
-/// The refusal itself: what was being sized, and how big it was.
+/// The refusal itself: what was being sized, how big it was, and the heap
+/// limit it met, if there is one.
+///
+/// Written without allocating. When the allocation that failed was a few
+/// bytes, the process is at its ceiling to the byte, and the reserve may be
+/// spent already: [`crate::hugepages`]' allocator gives a chunk back for each
+/// small allocation that fails, and a run that keeps going near its limit
+/// takes them all. Then formatting the message was the next allocation, and
+/// the refusal aborted from inside itself ("memory allocation of 8 bytes
+/// failed", exit 134: 24 of 36 runs of the 20,000-row pair with `-i
+/// updated_at --json --export-dir` at `ulimit -d` 8-10.75 MB). So the message
+/// and its hint are written into buffers set aside by [`hold_reserve`], and
+/// once those are taken, into ones asked for with `try_reserve`; with neither,
+/// the refusal says what it can without its figures.
 pub(crate) fn refuse(what: &str, bytes: usize) -> Error {
     release_reserve();
-    Error::out_of_memory(format!(
+    let Some(mut message) = message_buffer() else {
+        return Error::out_of_memory_static(
+            "out of memory, with no room left to say what for: this process is at its heap \
+             limit (a container limit or `ulimit -d`), or the machine's: raise it, or free some",
+        );
+    };
+    let _ = write!(
+        Bounded(&mut message),
         "out of memory: {what} needs {}",
-        human_bytes(bytes)
-    ))
+        Size(bytes)
+    );
+    // Without a buffer for it, the limit goes unsaid rather than the refusal.
+    let mut hint = String::new();
+    if let Some(h) = crate::memory::heap_limit()
+        && let Some(room) = message_buffer()
+    {
+        hint = room;
+        let _ = write!(
+            Bounded(&mut hint),
+            ", and this process may use {} (a container limit or `ulimit -d`): raise it",
+            crate::source::Human(h)
+        );
+    }
+    Error::out_of_memory(message).with_hint(hint)
 }
 
-fn human_bytes(bytes: usize) -> String {
-    const MB: usize = 1024 * 1024;
-    if bytes >= MB {
-        format!("{} MB", bytes / MB)
-    } else if bytes >= 1024 {
-        format!("{} KB", bytes / 1024)
-    } else {
-        format!("{bytes} bytes")
+/// Room for one line of a refusal: a structure's name, two sizes and what to
+/// do. A longer one is cut short rather than grown.
+const MESSAGE: usize = 192;
+
+/// Message buffers set aside for [`refuse`], two a refusal under a limit. A
+/// run refuses once or twice (each side's sweep, then `auto`'s second
+/// engine), so room for eight is room to spare.
+const MESSAGES: usize = 16;
+static MESSAGE_BUFFERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// An empty string with room for [`MESSAGE`] bytes: one set aside, or a new
+/// one if the allocator has room; `None` with neither.
+fn message_buffer() -> Option<String> {
+    let held = MESSAGE_BUFFERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pop();
+    held.or_else(|| {
+        let mut s = String::new();
+        s.try_reserve_exact(MESSAGE).ok().map(|()| s)
+    })
+}
+
+/// A `fmt::Write` into a string's spare capacity that never reallocates: what
+/// does not fit is dropped, at a character boundary.
+struct Bounded<'a>(&'a mut String);
+
+impl fmt::Write for Bounded<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let room = self.0.capacity() - self.0.len();
+        let mut end = s.len().min(room);
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.0.push_str(&s[..end]);
+        Ok(())
+    }
+}
+
+/// A byte count at the unit that says something: `512 bytes`, `1 KB`, `32 MB`.
+struct Size(usize);
+
+impl fmt::Display for Size {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const MB: usize = 1024 * 1024;
+        let bytes = self.0;
+        if bytes >= MB {
+            write!(f, "{} MB", bytes / MB)
+        } else if bytes >= 1024 {
+            write!(f, "{} KB", bytes / 1024)
+        } else {
+            write!(f, "{bytes} bytes")
+        }
     }
 }
 
@@ -313,16 +409,40 @@ mod tests {
 
     #[test]
     fn sizes_are_rendered_at_the_unit_that_says_something() {
-        assert_eq!(human_bytes(512), "512 bytes");
-        assert_eq!(human_bytes(1024), "1 KB");
-        assert_eq!(human_bytes(1024 * 1024), "1 MB");
-        assert_eq!(human_bytes(33_554_432), "32 MB");
+        assert_eq!(Size(512).to_string(), "512 bytes");
+        assert_eq!(Size(1024).to_string(), "1 KB");
+        assert_eq!(Size(1024 * 1024).to_string(), "1 MB");
+        assert_eq!(Size(33_554_432).to_string(), "32 MB");
     }
 
     #[test]
     fn a_refusal_names_the_structure_and_its_size() {
         let e = refuse("the key index", 33_554_432);
         assert_eq!(e.to_string(), "out of memory: the key index needs 32 MB");
+    }
+
+    #[test]
+    fn a_message_is_cut_short_rather_than_grown() {
+        let mut s = String::with_capacity(8);
+        let cap = s.capacity();
+        // "é" is two bytes, so a cut at the capacity would split it.
+        let _ = Bounded(&mut s).write_str("abcdefgé and more");
+        assert_eq!(s.capacity(), cap);
+        assert!(s.len() <= cap, "{s:?}");
+        assert!("abcdefgé and more".starts_with(s.as_str()), "{s:?}");
+    }
+
+    #[test]
+    fn a_refusal_reads_the_same_with_the_set_aside_buffers_spent() {
+        hold_reserve();
+        for _ in 0..MESSAGES + 4 {
+            let e = refuse("the key index", 33_554_432);
+            assert!(
+                e.to_string()
+                    .starts_with("out of memory: the key index needs 32 MB"),
+                "{e}"
+            );
+        }
     }
 
     #[test]

@@ -225,8 +225,9 @@ handles more of the format, could not read them either: {turbo_err}"
                 && !turbo::only_this_engine_reads(b) =>
         {
             eprintln!(
-                "note: {e}, more than this process may use; comparing with the sortmerge \
+                "note: {}, more than this process may use; comparing with the sortmerge \
                  engine, which spills to disk ({})",
+                e.without_hint(),
                 std::env::temp_dir().display()
             );
             crate::memory::release_free();

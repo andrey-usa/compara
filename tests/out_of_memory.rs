@@ -689,3 +689,92 @@ fn a_sortmerge_with_more_runs_than_buffers_answers_rather_than_aborting() {
     );
     assert!(answered > 0, "no limit was enough to answer");
 }
+
+/// A refusal at the heap limit says what ran out and the limit, rather than
+/// aborting while it writes that. The 20,000-row pair with a JSON summary and
+/// an export runs out on a report row's or a changed cell's few dozen bytes,
+/// with the reserve already spent on the small allocations before it, and the
+/// refusal's own message was then the allocation that failed: from 8 to
+/// 10.75 MB most runs ended on signal 6 ("memory allocation of 8 bytes
+/// failed", 24 of 36).
+#[test]
+fn a_refusal_at_the_heap_limit_is_written_not_aborted() {
+    let dir = std::env::temp_dir().join(format!("compara-oom-msg-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let made = Command::new(env!("CARGO_BIN_EXE_compara-gen-data"))
+        .args(["--rows", "20k", "--prefix", "t", "--out-dir"])
+        .arg(&dir)
+        .output()
+        .expect("gen-data");
+    assert!(made.status.success(), "{made:?}");
+    let (a, b) = (dir.join("t_a.csv"), dir.join("t_b.csv"));
+    let run = |limit_kb: Option<usize>, n: usize| -> (Option<i32>, String, String) {
+        let out_dir = dir.join(format!("out-{n}"));
+        let _ = fs::remove_dir_all(&out_dir);
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "{} exec {} compare {} {} -k account_id,txn_id -i updated_at \
+                 --json {} --export-dir {}",
+                limit_kb
+                    .map(|kb| format!("ulimit -d {kb};"))
+                    .unwrap_or_default(),
+                env!("CARGO_BIN_EXE_compara"),
+                a.display(),
+                b.display(),
+                dir.join(format!("s-{n}.json")).display(),
+                out_dir.display(),
+            ))
+            .env("RUST_BACKTRACE", "1")
+            .env_remove("COMPARA_BACKTRACE")
+            .env_remove("COMPARA_MEMORY")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("bash");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while child.try_wait().expect("wait").is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{limit_kb:?} KB: the run did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = child.wait_with_output().expect("output");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let counts = stdout
+            .rsplit_once(" | ")
+            .map(|(c, _)| c.to_string())
+            .unwrap_or(stdout);
+        use std::os::unix::process::ExitStatusExt;
+        (
+            out.status
+                .code()
+                .or_else(|| out.status.signal().map(|s| 128 + s)),
+            counts,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, free, err) = run(None, 0);
+    assert_eq!(code, Some(1), "{err}");
+    let mut failed = Vec::new();
+    for (n, kb) in (8 * 1024..=11 * 1024 - 256).step_by(256).enumerate() {
+        let (code, counts, err) = run(Some(kb), n + 1);
+        match code {
+            Some(1) if counts == free => {}
+            Some(2) if err.contains("out of memory") && err.contains("ulimit -d") => {}
+            _ => failed.push(format!(
+                "{kb} KB: exit {code:?}, {counts:?}: {}",
+                err.lines().next().unwrap_or("")
+            )),
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        failed.is_empty(),
+        "{} of 12 runs neither answered as the unlimited run ({free:?}) nor refused naming the limit:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}

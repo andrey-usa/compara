@@ -1,12 +1,15 @@
 //! The one error type the library returns.
 
+use std::borrow::Cow;
 use std::fmt;
 
 /// Anything that stops a comparison: a missing file, a key that is not in both
 /// headers, an engine that cannot run.
 #[derive(Debug)]
 pub struct Error {
-    message: String,
+    /// Borrowed only for the refusal that had no room left to write its
+    /// own ([`crate::alloc::refuse`]).
+    message: Cow<'static, str>,
     /// Set when a reader is saying *not mine* -- a codec, a page version or a
     /// column type it does not handle -- rather than *this file is wrong*.
     ///
@@ -35,7 +38,7 @@ pub struct Error {
 impl Error {
     pub fn new(message: impl Into<String>) -> Self {
         Error {
-            message: message.into(),
+            message: Cow::Owned(message.into()),
             unsupported: false,
             out_of_memory: false,
             input: false,
@@ -95,6 +98,18 @@ impl Error {
         }
     }
 
+    /// [`Error::out_of_memory`] with a message that costs no allocation, for
+    /// a refusal made where none can be had.
+    pub(crate) fn out_of_memory_static(message: &'static str) -> Self {
+        Error {
+            message: Cow::Borrowed(message),
+            unsupported: false,
+            out_of_memory: true,
+            input: false,
+            hint: String::new(),
+        }
+    }
+
     /// Whether this is a reader declining rather than a file being wrong.
     pub fn is_unsupported(&self) -> bool {
         self.unsupported
@@ -124,7 +139,7 @@ impl Error {
     /// The same error with `prefix` before its message, and its kind kept.
     pub fn context(self, prefix: impl fmt::Display) -> Self {
         Error {
-            message: format!("{prefix}{}", self.message),
+            message: Cow::Owned(format!("{prefix}{}", self.message)),
             ..self
         }
     }
@@ -137,7 +152,7 @@ impl Error {
             return self;
         }
         Error {
-            message: self.message.replace(from, to),
+            message: Cow::Owned(self.message.replace(from, to)),
             hint: self.hint.replace(from, to),
             ..self
         }
@@ -146,7 +161,7 @@ impl Error {
     /// The same error with `suffix` after its message, and its kind kept.
     pub fn context_after(self, suffix: impl fmt::Display) -> Self {
         Error {
-            message: format!("{}{suffix}", self.message),
+            message: Cow::Owned(format!("{}{suffix}", self.message)),
             ..self
         }
     }

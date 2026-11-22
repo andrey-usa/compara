@@ -37,6 +37,11 @@ All notable changes to this project are documented here. The format follows
   A read now keeps no more requests in flight than the heap has room for,
   and a thread started meanwhile leaves that room; with none for one
   request it is refused, exit 2, with the limit and what to do.
+- A refusal at the heap limit (`ulimit -d`, or a container's) could end on
+  signal 6, "memory allocation of 8 bytes failed", while it wrote its own
+  message: with `--json` and `--export-dir`, most runs of a 20,000-row pair
+  at 8-11 MB did. The message is now written into room set aside at start,
+  and names the limit and what to do, as the other refusals do.
 
 ## [0.8.0] - 2026-11-21
 
