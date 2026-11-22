@@ -8,6 +8,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- On Windows, `-o NUL` and `--json NUL` failed (exit 2, after the whole
+  compare) since 0.8.0 wrote each output beside its name and moved it
+  there. `NUL` and the other names Windows takes as devices (`CON`, `AUX`,
+  in any directory and any case) are written as devices again, as
+  `/dev/null` is on Unix: the output is thrown away and the run succeeds.
+- On Windows, an output another program has open without letting it be
+  replaced is left as it was, and the error says so and what to do (close
+  it there, or name another file), where it said only "Access is denied" or
+  "being used by another process".
+- An output written in place (a directory that takes no new file, another
+  user's file in a sticky directory, a file mounted at the name) that a
+  failed run cut short is named in the error as left incomplete: what is
+  there is the start of the new file and can look whole.
 - `sortmerge` read every spilled run through a 64 KB buffer of its own, so
   under a heap limit (`ulimit -d`, a container's) a large file's buffers grew
   with the file, not the limit, and the merge aborted (exit 134) or ran out
