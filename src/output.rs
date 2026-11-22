@@ -10,12 +10,12 @@
 //! given is the one file it writes there: in a shared directory (`/tmp`, a CI
 //! workspace) a link someone else left at `report.html` would otherwise turn
 //! the report into an overwrite of whatever the link points to. A FIFO or a
-//! device named directly (`/dev/null`) is written as it is, since it cannot be
-//! replaced and writing into it is what was asked. A file the user may write
-//! at a name that takes no new file is written in place too, as it was
-//! before outputs landed in one step: in a directory they may not add to, in
-//! a sticky one where the file is another user's, or where the file is
-//! mounted at the name. There a failed run can leave it half written.
+//! device named directly (`/dev/null`, `NUL` on Windows) is written as it is,
+//! since it cannot be replaced and writing into it is what was asked. A file
+//! the user may write at a name that takes no new file is written in place
+//! too, as it was before outputs landed in one step: in a directory they may
+//! not add to, in a sticky one where the file is another user's, or where the
+//! file is mounted at the name. There a failed run can leave it half written.
 
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
@@ -42,6 +42,26 @@ fn cannot(dest: &Path, e: &io::Error) -> Error {
     Error::new(format!("cannot write {}: {e}", dest.display()))
 }
 
+/// A name Windows takes as a device, not a file (`NUL`, `CON`, `COM1`, in any
+/// directory and any case): the system's own reading of the name, so every
+/// spelling it treats as one is one here. Writing there is what was asked,
+/// and nothing can be made beside it or renamed onto it.
+#[cfg(windows)]
+fn names_a_device(dest: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    let Ok(full) = std::path::absolute(dest) else {
+        return false;
+    };
+    let mut parts = full
+        .components()
+        .filter(|c| !matches!(c, Component::RootDir));
+    // `\\.\NUL`, not `\\.\C:\dir\file`, which names a file the long way.
+    matches!(
+        parts.next(),
+        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::DeviceNS(_))
+    ) && parts.next().is_none()
+}
+
 /// Refuses a symbolic link at `path`, the name of a file or a directory a run
 /// was told to write; anything else, or nothing there, passes. The check a
 /// run makes before it reads its inputs, so a refusal costs no compare; the
@@ -65,6 +85,19 @@ pub fn refuse_link(path: &Path) -> Result<()> {
 impl Output {
     /// Opens `dest` for writing, as described in the module comment.
     pub fn create(dest: &Path) -> Result<Output> {
+        #[cfg(windows)]
+        if names_a_device(dest) {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(dest)
+                .map_err(|e| cannot(dest, &e))?;
+            return Ok(Output {
+                dest: dest.to_path_buf(),
+                temp: None,
+                checked: None,
+                file: Some(file),
+            });
+        }
         refuse_link(dest)?;
         let mut checked = None;
         let replaced = match fs::symlink_metadata(dest) {
@@ -461,6 +494,23 @@ mod tests {
         }
         fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_names_windows_takes_as_devices_are_written_as_devices() {
+        for name in ["NUL", "nul", "Con", "AUX", "sub\\NUL", "\\\\.\\NUL"] {
+            assert!(names_a_device(Path::new(name)), "{name}");
+        }
+        for name in [
+            "report.html",
+            "nul-report.html",
+            "NULL",
+            "\\\\.\\C:\\dir\\r.html",
+        ] {
+            assert!(!names_a_device(Path::new(name)), "{name}");
+        }
+        write(Path::new("NUL"), b"discarded").unwrap();
     }
 
     #[cfg(unix)]

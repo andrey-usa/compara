@@ -433,3 +433,25 @@ fn a_file_the_directory_will_not_let_be_replaced_is_written_in_place() {
     }
     assert_eq!(files(&shared), ["r.html", "r.json"]);
 }
+
+/// `NUL` is Windows' `/dev/null`: a device in every directory, in any case.
+/// Outputs sent there are thrown away and the run succeeds, as on Unix; no
+/// temporary is made beside it, nor a file by that name.
+#[cfg(windows)]
+#[test]
+fn outputs_sent_to_nul_are_discarded() {
+    let fx = Fixture::new();
+    fs::create_dir(fx.path("sub")).unwrap();
+    for flags in [
+        ["-o", "NUL", "--json", "NUL"],
+        ["-o", "nul", "--json", "sub\\NUL"],
+    ] {
+        let mut args = vec!["compare", "a.csv", "b.csv", "-k", "account_id,txn_id"];
+        args.extend(flags);
+        let (code, _, err) = run(&fx.0, &args);
+        assert_eq!(code, 1, "{flags:?}: {err}");
+        assert!(err.contains("Report:"), "{err}");
+        assert_eq!(files(&fx.0), ["sub"], "{flags:?}");
+        assert_eq!(files(&fx.path("sub")), Vec::<String>::new(), "{flags:?}");
+    }
+}
