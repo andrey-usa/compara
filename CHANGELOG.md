@@ -69,6 +69,13 @@ All notable changes to this project are documented here. The format follows
   message: with `--json` and `--export-dir`, most runs of a 20,000-row pair
   at 8-11 MB did. The message is now written into room set aside at start,
   and names the limit and what to do, as the other refusals do.
+- An `s3://`, `gs://` or `az://` object behind a server that does not
+  answer the request for its end (`Range: bytes=-n`) with a 501, as Fastly
+  does, was asked again ten times, for seconds to minutes, and then failed.
+  It is now read as such an `https://` file is: its start first (under a
+  prefix, its end by its first byte, the listing having given its size),
+  then ranges that name their first byte. A 501 to any store request is no
+  longer asked again: it says the server does not do what was asked.
 
 ## [0.8.0] - 2026-11-21
 

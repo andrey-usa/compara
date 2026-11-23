@@ -800,6 +800,116 @@ fn a_server_that_takes_no_suffix_range_is_read_in_ranges() {
     assert!(err.contains("more than the 65536 bytes asked for"), "{err}");
 }
 
+/// An object store that gives no end of an object by `bytes=-n` (a 501, as
+/// Fastly answers it: an S3-compatible endpoint behind it) is read as a
+/// plain HTTP server is, from its start and then in ranges by their first
+/// byte, to the local answer, CSV and Parquet, one object or the parts under
+/// a prefix. object_store had asked again after the 501 ten times, for
+/// seconds to minutes by its random backoff, and then the read was an error.
+/// A store that refuses every range says so at once, and what to do.
+#[test]
+fn a_store_that_takes_no_suffix_range_is_read_in_ranges() {
+    let f = fixture("20k", &["--format", "parquet"]);
+    let bucket = f.0.join("bkt");
+    for side in ["a", "b"] {
+        let csv = std::fs::read_to_string(bucket.join(format!("t_{side}.csv"))).unwrap();
+        let (header, rows) = csv.split_once('\n').unwrap();
+        let rows: Vec<&str> = rows.lines().collect();
+        let dir = bucket.join(format!("parts-{side}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, chunk) in rows.chunks(rows.len().div_ceil(4)).enumerate() {
+            let body = format!("{header}\n{}\n", chunk.join("\n"));
+            std::fs::write(dir.join(format!("p{i}.csv")), body).unwrap();
+        }
+    }
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let Some(server) = Server::start(&f.0, &["--fault", "suffix-501"]) else {
+        eprintln!("skipping: no python to run the object server");
+        return;
+    };
+    let env = s3_env(&server.url);
+    let env = borrowed(&env);
+    let limit = Some(std::time::Duration::from_secs(30));
+    for (a, b, extra) in [
+        ("t_a.csv", "t_b.csv", &[][..]),
+        ("t_a.parquet", "t_b.parquet", &["-c", "amount"][..]),
+        ("parts-a", "parts-b", &[][..]),
+    ] {
+        let args = [&KEY[..], extra].concat();
+        let want = compare(&local(a), &local(b), &args, &[], None);
+        let start = server.requests().len();
+        let started = std::time::Instant::now();
+        let slash = if a.starts_with("parts") { "/" } else { "" };
+        let got = compare_within(
+            Command::new(env!("CARGO_BIN_EXE_compara")),
+            &format!("s3://bkt/{a}{slash}"),
+            &format!("s3://bkt/{b}{slash}"),
+            &args,
+            &env,
+            None,
+            limit,
+        );
+        assert_eq!(
+            (want.0, &want.2, &want.3),
+            (got.0, &got.2, &got.3),
+            "{a}: {}",
+            got.1
+        );
+        // Each object's suffix asked once: the 501 is not asked again.
+        let objects = if slash.is_empty() { 2 } else { 8 };
+        let refused = server.requests()[start..]
+            .iter()
+            .filter(|(range, _)| range.starts_with("bytes=-"))
+            .count();
+        assert!(refused <= objects, "{a}: {refused} suffix ranges asked");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{a}: {:?}",
+            started.elapsed()
+        );
+    }
+    drop(server);
+    let Some(server) = Server::start(&f.0, &["--fault", "ranges-501"]) else {
+        return;
+    };
+    let env = s3_env(&server.url);
+    let (code, err, ..) = compare_within(
+        Command::new(env!("CARGO_BIN_EXE_compara")),
+        "s3://bkt/t_a.csv",
+        "s3://bkt/t_b.csv",
+        &KEY,
+        &borrowed(&env),
+        None,
+        limit,
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("s3://bkt/t_")
+            && err.contains("bytes=-65536")
+            && err.contains("bytes=0-65535")
+            && err.contains("HTTP 501")
+            && err.contains("download it first"),
+        "{err}"
+    );
+    // The end and the start of each file, each asked once.
+    assert!(server.requests().len() <= 4, "{:?}", server.requests());
+    // Under a prefix the listing gave the size: the end by its first byte.
+    let (code, err, ..) = compare_within(
+        Command::new(env!("CARGO_BIN_EXE_compara")),
+        "s3://bkt/parts-a/",
+        "s3://bkt/parts-b/",
+        &KEY,
+        &borrowed(&env),
+        None,
+        limit,
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("end by its first byte") && err.contains("download it first"),
+        "{err}"
+    );
+}
+
 /// Outputs to object storage: the report, the summary and the export land in
 /// the bucket as they would on disk, in one request or as a multipart upload;
 /// `--json -` is the summary on standard output.

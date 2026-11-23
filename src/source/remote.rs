@@ -136,7 +136,7 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
     // The end of the object first: its size comes with it, and for Parquet
     // the footer.
     let mut public = false;
-    let got = match tail(&reader, spec).await {
+    let got = match tail(&reader, spec, None).await {
         Ok(found) => found,
         Err(Refused(status)) if signable(&url) && matches!(reader, Reader::Http(..)) => {
             // A plain GET of a private object: sign it as its cloud would.
@@ -145,12 +145,14 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
                     "{spec}: HTTP {status} unsigned, and signing it failed: {e}"
                 ))
             })?;
-            tail(&reader, spec).await.map_err(|e| e.into_error(spec))?
+            tail(&reader, spec, None)
+                .await
+                .map_err(|e| e.into_error(spec))?
         }
         // No credentials anywhere: a public bucket reads unsigned.
         Err(FetchError::Other(message)) if store_scheme && no_credentials(&message) => {
             let unsigned = store_signed(spec, &url, false, true).await?;
-            match tail(&unsigned, spec).await {
+            match tail(&unsigned, spec, None).await {
                 Ok(found) => {
                     reader = unsigned;
                     public = true;
@@ -462,10 +464,10 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
     }
     let values_of =
         |i: usize| -> Vec<String> { partitions.as_ref().map_or(Vec::new(), |p| p.1[i].clone()) };
-    let whole: Vec<(String, ObjectPath, Vec<String>)> = objects
+    let whole: Vec<(String, ObjectPath, u64, Vec<String>)> = objects
         .iter()
         .enumerate()
-        .map(|(i, m)| (label(m), m.location.clone(), values_of(i)))
+        .map(|(i, m)| (label(m), m.location.clone(), m.size, values_of(i)))
         .collect();
 
     if compressed {
@@ -475,8 +477,9 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
         let parts: Vec<Part> = futures::stream::iter(objects.iter().map(|m| {
             let reader = Reader::Store(store.clone(), m.location.clone());
             let name = label(m);
+            let known = m.size;
             async move {
-                let (size, tail, etag) = tail(&reader, &name)
+                let (size, tail, etag) = tail(&reader, &name, Some(known))
                     .await
                     .map_err(|e| e.into_error(&name))?
                     .ranged(&name)?;
@@ -645,14 +648,14 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
 /// text -- each download deleted once it is in.
 async fn append_whole(
     store: &Arc<dyn ObjectStore>,
-    objects: &[(String, ObjectPath, Vec<String>)],
+    objects: &[(String, ObjectPath, u64, Vec<String>)],
     combined: &mut Combined,
 ) -> Result<()> {
     for group in objects.chunks(4) {
-        let done = futures::future::try_join_all(group.iter().map(|(name, location, values)| {
-            let reader = Reader::Store(store.clone(), location.clone());
+        let done = futures::future::try_join_all(group.iter().map(|(name, key, size, values)| {
+            let reader = Reader::Store(store.clone(), key.clone());
             async move {
-                let (size, tail, etag) = tail(&reader, name)
+                let (size, tail, etag) = tail(&reader, name, Some(*size))
                     .await
                     .map_err(|e| e.into_error(name))?
                     .ranged(name)?;
@@ -1252,6 +1255,7 @@ impl From<object_store::Error> for FetchError {
         match e {
             object_store::Error::NotFound { .. } => Refused(404),
             object_store::Error::Precondition { .. } => FetchError::Other(changed()),
+            e if not_implemented(&e) => Refused(501),
             e => {
                 let message = explain(&e.to_string());
                 match store_stalled(&e) {
@@ -1326,8 +1330,14 @@ fn brief(e: &str) -> String {
 /// is any server whose answer does not hold the bytes it says it does;
 /// object_store asks again itself after its own failures. A server that
 /// sends nothing for the silence budget ([`Heard::silence`]), however many
-/// tries that is, has stalled.
-async fn tail(reader: &Reader, spec: &str) -> std::result::Result<Got, FetchError> {
+/// tries that is, has stalled. `known` is the object's size where a listing
+/// gave it: a store that refuses `bytes=-n` is then asked for the end by its
+/// first byte at once ([`store_start`]).
+async fn tail(
+    reader: &Reader,
+    spec: &str,
+    known: Option<u64>,
+) -> std::result::Result<Got, FetchError> {
     // Its connection's buffer grows as a part's does ([`room_for_requests`]).
     let (_, _room) = room_for_requests(1, TAIL)
         .await
@@ -1336,7 +1346,7 @@ async fn tail(reader: &Reader, spec: &str) -> std::result::Result<Got, FetchErro
     let tries = async {
         let mut attempt = 0u32;
         loop {
-            let result = tail_once(reader, spec, &heard).await;
+            let result = tail_once(reader, spec, known, &heard).await;
             let retryable = match &result {
                 Err(FetchError::Transient(_) | FetchError::Stalled { .. }) => true,
                 // 501 says the server does not do what was asked.
@@ -1359,6 +1369,7 @@ async fn tail(reader: &Reader, spec: &str) -> std::result::Result<Got, FetchErro
 async fn tail_once(
     reader: &Reader,
     spec: &str,
+    known: Option<u64>,
     heard: &Heard,
 ) -> std::result::Result<Got, FetchError> {
     match reader {
@@ -1392,6 +1403,11 @@ async fn tail_once(
                         )
                         .await?
                 }
+                // No end by this form (Fastly: 501 Unsupported client
+                // range): by the first byte, as from a plain HTTP server.
+                Err(e) if not_implemented(&e) => {
+                    return store_start(store, path, known, heard).await;
+                }
                 // An empty object has no suffix to give.
                 Err(e) => {
                     let meta = store.head(path).await;
@@ -1401,20 +1417,7 @@ async fn tail_once(
                     }
                 }
             };
-            let size = got.meta.size;
-            let etag = got.meta.e_tag.clone();
-            let span = got.range.clone();
-            let mut bytes = Vec::with_capacity((span.end - span.start) as usize);
-            let mut stream = got.into_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                heard.now();
-                bytes.extend_from_slice(&chunk);
-                // No more is held than was asked for.
-                if bytes.len() as u64 > span.end - span.start {
-                    break;
-                }
-            }
+            let (span, size, bytes, etag) = held(got, heard).await?;
             the_end(&span, size, bytes.len())?;
             Ok(Got::Tail(size, bytes, etag))
         }
@@ -1439,6 +1442,104 @@ async fn tail_once(
             }
         }
     }
+}
+
+/// A store's answer to a range, read: the bytes it holds, the object's
+/// size, the bytes (no more than the span), the validator.
+async fn held(
+    got: object_store::GetResult,
+    heard: &Heard,
+) -> std::result::Result<(Range<u64>, u64, Vec<u8>, Option<String>), FetchError> {
+    let size = got.meta.size;
+    let etag = got.meta.e_tag.clone();
+    let span = got.range.clone();
+    let mut bytes = Vec::with_capacity((span.end - span.start) as usize);
+    let mut stream = got.into_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        heard.now();
+        bytes.extend_from_slice(&chunk);
+        // No more is held than was asked for.
+        if bytes.len() as u64 > span.end - span.start {
+            break;
+        }
+    }
+    Ok((span, size, bytes, etag))
+}
+
+/// The end of an object, or its start and its size, from a store that
+/// answered `bytes=-n` with 501, as [`start_of`] asks a plain HTTP server:
+/// the end by its first byte where the size is `known`, else the first
+/// [`TAIL`] bytes, and a Parquet file's end after them.
+async fn store_start(
+    store: &Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+    known: Option<u64>,
+    heard: &Heard,
+) -> std::result::Result<Got, FetchError> {
+    let bounded = |range: Range<u64>, if_match: Option<String>| GetOptions {
+        range: Some(GetRange::Bounded(range)),
+        if_match,
+        ..Default::default()
+    };
+    // Refused that way too: no range is read here.
+    let refused = |what: &str, range: &str| {
+        FetchError::Other(format!(
+            "the store refused the end of the object (Range: bytes=-{TAIL}, {}) and its {what} \
+             (Range: {range}, {}), so it cannot be read in ranges; download it first (aws s3 \
+             cp, gcloud storage cp or azcopy copy) and compare the local copy",
+            said_status(501),
+            said_status(501)
+        ))
+    };
+    let end = |size: u64, etag: Option<String>| async move {
+        let from = size.saturating_sub(TAIL);
+        let got = match store.get_opts(path, bounded(from..size, etag)).await {
+            Ok(got) => got,
+            Err(e) if not_implemented(&e) => {
+                let range = format!("bytes={from}-{}", size - 1);
+                return Err(refused("end by its first byte", &range));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let (span, size, bytes, etag) = held(got, heard).await?;
+        the_end(&span, size, bytes.len())?;
+        Ok(Got::Tail(size, bytes, etag))
+    };
+    match known {
+        Some(0) => return Ok(Got::Tail(0, Vec::new(), None)),
+        Some(size) => return end(size, None).await,
+        None => {}
+    }
+    let got = match store.get_opts(path, bounded(0..TAIL, None)).await {
+        Ok(got) => got,
+        Err(e) if not_implemented(&e) => {
+            return Err(refused("start", &format!("bytes=0-{}", TAIL - 1)));
+        }
+        // An empty object has no first byte either.
+        Err(e) => {
+            return match store.head(path).await {
+                Ok(m) if m.size == 0 => Ok(Got::Tail(0, Vec::new(), m.e_tag)),
+                _ => Err(e.into()),
+            };
+        }
+    };
+    let (span, size, bytes, etag) = held(got, heard).await?;
+    if span.start != 0 || span.end - span.start != bytes.len() as u64 {
+        return Err(FetchError::Transient(format!(
+            "the start of the object came as {} bytes for bytes {}-{} of {size}",
+            bytes.len(),
+            span.start,
+            span.end.saturating_sub(1)
+        )));
+    }
+    if span.end == size {
+        return Ok(Got::Tail(size, bytes, etag));
+    }
+    if bytes.starts_with(b"PAR1") {
+        return end(size, etag).await;
+    }
+    Ok(Got::Head(size, bytes, etag))
 }
 
 /// What a ranged GET got.
@@ -2759,6 +2860,77 @@ fn client_options(reading: bool) -> object_store::ClientOptions {
     options.with_dns_resolver(Arc::new(StoreLookUp))
 }
 
+/// A store's HTTP client: object_store's own, except that a 501 is final.
+/// The store asks again after any 5xx, up to ten times over three minutes,
+/// and a 501 says the server does not do what was asked -- Fastly answers a
+/// suffix range (`bytes=-n`) so -- which no later try changes. The 501 comes
+/// back as an error the store does not retry, [`NotImplemented`], which
+/// [`not_implemented`] finds.
+#[derive(Debug)]
+struct FinalNotImplemented;
+
+impl object_store::client::HttpConnector for FinalNotImplemented {
+    fn connect(
+        &self,
+        options: &object_store::ClientOptions,
+    ) -> object_store::Result<object_store::client::HttpClient> {
+        let inner = object_store::client::ReqwestConnector::default().connect(options)?;
+        Ok(object_store::client::HttpClient::new(NotAskedAgain(inner)))
+    }
+}
+
+#[derive(Debug)]
+struct NotAskedAgain(object_store::client::HttpClient);
+
+type Answered =
+    std::result::Result<object_store::client::HttpResponse, object_store::client::HttpError>;
+
+impl object_store::client::HttpService for NotAskedAgain {
+    fn call<'a, 'b>(
+        &'a self,
+        request: object_store::client::HttpRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Answered> + Send + 'b>>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        Box::pin(async move {
+            let response = self.0.execute(request).await?;
+            if response.status() == reqwest::StatusCode::NOT_IMPLEMENTED {
+                return Err(object_store::client::HttpError::new(
+                    object_store::client::HttpErrorKind::Unknown,
+                    NotImplemented,
+                ));
+            }
+            Ok(response)
+        })
+    }
+}
+
+/// A store's request answered 501 ([`FinalNotImplemented`]).
+#[derive(Debug)]
+struct NotImplemented;
+
+impl std::fmt::Display for NotImplemented {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&said_status(501))
+    }
+}
+
+impl std::error::Error for NotImplemented {}
+
+/// Whether a store's request was answered 501 ([`FinalNotImplemented`]).
+fn not_implemented(e: &object_store::Error) -> bool {
+    let mut source = std::error::Error::source(e);
+    while let Some(s) = source {
+        if s.is::<NotImplemented>() {
+            return true;
+        }
+        source = s.source();
+    }
+    false
+}
+
 /// A store's name resolution: [`look_up`], with the addresses shuffled as the
 /// store's own resolver shuffles them, so that parts spread over a service's
 /// addresses rather than all going to the first.
@@ -2852,7 +3024,11 @@ async fn store_signed(spec: &str, url: &url::Url, signed: bool, reading: bool) -
             if !signed {
                 b = b.with_skip_signature(true);
             }
-            Arc::new(b.build().map_err(fail)?)
+            Arc::new(
+                b.with_http_connector(FinalNotImplemented)
+                    .build()
+                    .map_err(fail)?,
+            )
         }
         object_store::ObjectStoreScheme::GoogleCloudStorage => {
             let mut b = object_store::gcp::GoogleCloudStorageBuilder::from_env()
@@ -2864,7 +3040,11 @@ async fn store_signed(spec: &str, url: &url::Url, signed: bool, reading: bool) -
             if !signed {
                 b = b.with_skip_signature(true);
             }
-            Arc::new(b.build().map_err(fail)?)
+            Arc::new(
+                b.with_http_connector(FinalNotImplemented)
+                    .build()
+                    .map_err(fail)?,
+            )
         }
         object_store::ObjectStoreScheme::MicrosoftAzure => {
             let mut b = object_store::azure::MicrosoftAzureBuilder::from_env()
@@ -2885,7 +3065,11 @@ async fn store_signed(spec: &str, url: &url::Url, signed: bool, reading: bool) -
                 // this machine does not have.
                 b = b.with_use_azure_cli(true);
             }
-            Arc::new(b.build().map_err(fail)?)
+            Arc::new(
+                b.with_http_connector(FinalNotImplemented)
+                    .build()
+                    .map_err(fail)?,
+            )
         }
         other => {
             return Err(Error::new(format!(
