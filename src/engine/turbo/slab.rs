@@ -53,6 +53,8 @@ const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// The unit [`Slab::release`] rounds to. Where the kernel's pages are larger
 /// it rounds the start down to one of its own, which can release a few bytes
 /// before `from`: they are faulted back in by whatever reads them next.
+/// Linux only, as the release is.
+#[cfg(target_os = "linux")]
 const PAGE: usize = 4096;
 
 impl Slab {
