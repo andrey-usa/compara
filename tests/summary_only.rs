@@ -448,9 +448,9 @@ fn outputs_sent_to_nul_are_discarded() {
     ] {
         let mut args = vec!["compare", "a.csv", "b.csv", "-k", "account_id,txn_id"];
         args.extend(flags);
-        let (code, _, err) = run(&fx.0, &args);
+        let (code, out, err) = run(&fx.0, &args);
         assert_eq!(code, 1, "{flags:?}: {err}");
-        assert!(err.contains("Report:"), "{err}");
+        assert!(out.contains("Report:"), "{out}");
         assert_eq!(files(&fx.0), ["sub"], "{flags:?}");
         assert_eq!(files(&fx.path("sub")), Vec::<String>::new(), "{flags:?}");
     }
