@@ -29,6 +29,10 @@ struct Fixture(PathBuf);
 
 impl Fixture {
     fn new() -> Fixture {
+        Fixture::rows(20_000)
+    }
+
+    fn rows(rows: i64) -> Fixture {
         let dir = std::env::temp_dir().join(format!(
             "compara-fused-{}-{}",
             std::process::id(),
@@ -36,7 +40,7 @@ impl Fixture {
         ));
         fs::create_dir_all(&dir).expect("a temp directory");
         generate_as(
-            20_000,
+            rows,
             &dir.join("a.csv"),
             &dir.join("b.csv"),
             7,
@@ -353,6 +357,59 @@ fn fused_report_runs_the_agreement_check_and_matches() {
         serde_json::from_str(&fs::read_to_string(fx.path("fused.json")).expect("fused.json"))
             .expect("json");
     let _ = (err, plain);
+}
+
+/// The fused join lets go of each file's pages once read (on Linux), and
+/// reads some of them back: B's rows for the join, the insertion's proofs,
+/// the report's rows, and the ordinary join the forced path checks itself
+/// against. 100,000 rows is about 18 MB a file, so one sweep thread releases
+/// what it has read twice before its end, and B's counts release blocks.
+#[test]
+fn a_pair_released_as_it_is_read_gives_the_ordinary_answer() {
+    let fx = Fixture::rows(100_000);
+    let json = |name: &str| -> serde_json::Value {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(fx.path(name)).expect("the json"))
+                .expect("json");
+        let meta = v["meta"].as_object_mut().expect("meta");
+        meta.remove("seconds");
+        meta.remove("generated");
+        v
+    };
+    for threads in ["1", "4"] {
+        let args = |out: &'static str, report: &'static str| {
+            [
+                "compare",
+                "a.csv",
+                "b.csv",
+                "-k",
+                "account_id,txn_id",
+                "-i",
+                "updated_at",
+                "--threads",
+                threads,
+                "--json",
+                out,
+                "-o",
+                report,
+                "--no-compress",
+            ]
+        };
+        let (code, _, err) = run(&fx.0, &args("plain.json", "plain.html"), false);
+        assert!(code <= 1, "ordinary run failed: {err}");
+        let (fcode, _, ferr) = run(&fx.0, &args("fused.json", "fused.html"), true);
+        assert_eq!(fcode, code, "fused run at {threads} threads failed: {ferr}");
+        assert_eq!(
+            json("fused.json"),
+            json("plain.json"),
+            "at {threads} threads"
+        );
+        assert_eq!(
+            report_payload(&fx.path("fused.html")),
+            report_payload(&fx.path("plain.html")),
+            "the report's rows at {threads} threads"
+        );
+    }
 }
 
 #[test]

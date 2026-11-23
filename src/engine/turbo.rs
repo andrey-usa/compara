@@ -77,6 +77,32 @@ const JOIN_THRESHOLD: usize = 1 << 14;
 /// the loop reaches them.
 const PREFETCH_AHEAD: usize = 32;
 
+/// Bytes a sweep reads between releases of what it has read, where it
+/// releases them (`Slab::release_as_read`): about one call per millisecond of
+/// a sweep thread, and at most this much read and still mapped per thread.
+const RELEASE_STEP: usize = 8 << 20;
+
+/// Proofs between the insertion's releases of its file, where it releases.
+///
+/// The sweep has released every row it read, and the insertion reads some
+/// back: a key whose stored hash matches an earlier key's is proved against
+/// that row's bytes, which on 10M generated rows is about 25,000 rows a side
+/// (32-bit hashes collide that often, and the repeated keys are proved too).
+/// A read maps a whole folio of the page cache, often a few hundred
+/// kilobytes, so that many scattered reads would map most of the file back.
+/// Releasing the file every so many proofs bounds that at about this many
+/// folios; the call costs microseconds when little is mapped.
+const PROOF_RELEASE: usize = 64;
+
+/// B is counted in blocks of `1 << RELEASE_BLOCK_SHIFT` bytes: see `Releases`.
+const RELEASE_BLOCK_SHIFT: u32 = 21;
+
+/// The share of a block's rows still to be matched when the block is released,
+/// as a divisor: a sixteenth. B's added rows are never matched, so a block
+/// waiting for all of its rows would never be released where they are spread
+/// through the file, as they are in every generated pair.
+const RELEASE_SLACK: i32 = 16;
+
 /// Keys per join chunk.
 ///
 /// Sized in rows rather than in threads so that the chunk boundaries -- and so
@@ -929,6 +955,8 @@ struct RowIndex {
     /// file is past page cache. Only kept when the report has row lists.
     dup_key_values: HashMap<u32, Vec<Val>>,
     keep_dup_keys: bool,
+    /// Rows the insertion has read back to prove a match: see `PROOF_RELEASE`.
+    proofs: usize,
 }
 
 impl RowIndex {
@@ -1085,6 +1113,7 @@ impl RowIndex {
             track_later: sink.is_some(),
             dup_key_values: HashMap::new(),
             keep_dup_keys: opt.row_lists,
+            proofs: 0,
         };
         // The file has been read and what is left is the insertion. `after_sweep`
         // starts reading the next file ahead, which fills memory with its
@@ -1107,6 +1136,7 @@ impl RowIndex {
         }
         if let Some(arrays) = arrays {
             if idx.insert_parallel(side, key_size, opt, threads, arrays)? {
+                side.slab.release_all();
                 phases.mark("index insert (parallel)");
                 return Ok((idx, fparts));
             }
@@ -1126,6 +1156,7 @@ impl RowIndex {
             }
             idx.insert(side, row as i32, key_size, opt, &mut probe, &mut mine)?;
         }
+        side.slab.release_all();
         phases.mark("index insert (serial)");
         Ok((idx, fparts))
     }
@@ -1174,6 +1205,10 @@ impl RowIndex {
                 let key = self.pos_of(word);
                 let candidate = self.first_row[key];
                 if self.row_hash[candidate as usize] == hash {
+                    self.proofs += 1;
+                    if self.proofs.is_multiple_of(PROOF_RELEASE) {
+                        side.slab.release_all();
+                    }
                     // This row's fields are re-parsed rather than carried over from
                     // the sweep because the sweep produced ten million of them and
                     // this branch wants one.
@@ -1743,7 +1778,7 @@ impl RowSink<'_> {
         if let Some(next) = next_hash {
             self.ctx.bi.prefetch(next);
         }
-        join_row(
+        let mate = join_row(
             self.ctx,
             part,
             scratch,
@@ -1754,6 +1789,9 @@ impl RowSink<'_> {
             j,
             self.seen,
         );
+        if mate >= 0 {
+            matched_b(self.ctx, scratch, mate);
+        }
     }
 }
 
@@ -1998,6 +2036,10 @@ fn sweep_chunks(
         let mut fields = vec![ABSENT; key_size.max(1)];
         let mut whole_fields = vec![ABSENT; side.width];
         let mut pos = begin;
+        // Where the next release of what this chunk has read starts, where
+        // the file is released as it is read (`Slab::release_as_read`).
+        let releasing = side.slab.releasing();
+        let mut released = begin;
         // Rows that *start* in this chunk belong to it; the last one is finished
         // past the boundary rather than cut in half.
         while pos < stop {
@@ -2061,6 +2103,11 @@ fn sweep_chunks(
                 break; // no progress: a malformed tail rather than an endless loop
             }
             pos = next;
+            // Everything behind `pos` has been parsed and, in the fused join,
+            // joined.
+            if releasing && pos - released >= RELEASE_STEP {
+                released = side.slab.release(released, pos);
+            }
         }
         // The chunk's last row ends where the sweep stopped.
         if let (Some(s), Some((part, scratch))) = (sink, fused.as_mut())
@@ -2069,6 +2116,10 @@ fn sweep_chunks(
             let j = chunk.at.len() - 1;
             s.row(part, scratch, j, lo, pos as u64, chunk.hash[j], None);
         }
+        if let (Some(s), Some((_, scratch))) = (sink, fused.as_mut()) {
+            settle_b(s.ctx, scratch);
+        }
+        side.slab.release(released, pos);
         Ok((chunk, pos, fused.map(|(part, _)| part)))
     })
 }
@@ -2465,6 +2516,89 @@ struct JoinCtx<'a> {
     /// a typed value has no spelling of its own to compare (`31.40` in a CSV is
     /// the 31.4 a Parquet file stores).
     typed: Vec<Typed>,
+    /// B's rows still to be matched, where B is released as it is read.
+    releases: Releases,
+}
+
+/// B's rows still to be matched, a count per block of the file, so that where
+/// B is released as it is read (`Slab::release_as_read`) a block the join is
+/// done with is released, rather than held to the end of the run.
+///
+/// A's rows are read once, in file order, by its own sweep, which releases
+/// them behind it. B's are read in whatever order A's keys find them: in the
+/// same order when the two files are, at random when they are not. So each
+/// block counts the first rows of B's keys that start in it, less a sixteenth
+/// (`RELEASE_SLACK`), and the report that takes the count to zero releases
+/// the block. A row read after its block was released is faulted back in: the
+/// count decides what a later read costs, never what it reads, and a block is
+/// released once. Empty where B is not released.
+struct Releases {
+    left: Vec<BlockLeft>,
+}
+
+/// One block's count, on a cache line of its own: the sweep threads that
+/// report to it run at once.
+#[repr(align(64))]
+struct BlockLeft(std::sync::atomic::AtomicI32);
+
+impl Releases {
+    fn none() -> Releases {
+        Releases { left: Vec::new() }
+    }
+
+    /// Counts the first row of each of `bi`'s keys into its block. Counts that
+    /// cannot be allocated release nothing: they are an economy, not something
+    /// the answer needs.
+    fn of(bi: &RowIndex, len: usize) -> Releases {
+        let blocks = (len >> RELEASE_BLOCK_SHIFT) + 1;
+        let Ok(mut counts) = alloc::filled(0i32, blocks, "the join's release counts") else {
+            return Releases::none();
+        };
+        for &row in &bi.first_row {
+            counts[(bi.row_at[row as usize] as usize) >> RELEASE_BLOCK_SHIFT] += 1;
+        }
+        let Ok(mut left) = alloc::sized::<BlockLeft>(blocks, "the join's release counts") else {
+            return Releases::none();
+        };
+        left.extend(
+            counts
+                .iter()
+                .map(|&n| BlockLeft(std::sync::atomic::AtomicI32::new(n - n / RELEASE_SLACK))),
+        );
+        Releases { left }
+    }
+}
+
+/// Counts B's row `mate` as matched, in the worker's running count for its
+/// block. A worker reports a block's count when it moves on to another, so two
+/// files in the same order cost one atomic operation a block, not one a row.
+fn matched_b(ctx: &JoinCtx, scratch: &mut RowScratch, mate: i32) {
+    if ctx.releases.left.is_empty() {
+        return;
+    }
+    let block = (ctx.bi.row_at[mate as usize] as usize) >> RELEASE_BLOCK_SHIFT;
+    if block != scratch.block {
+        settle_b(ctx, scratch);
+        scratch.block = block;
+    }
+    scratch.matched += 1;
+}
+
+/// Reports the worker's running count to its block, releasing the block if
+/// that takes the count to zero. Only one report can: counts only fall.
+fn settle_b(ctx: &JoinCtx, scratch: &mut RowScratch) {
+    let n = std::mem::take(&mut scratch.matched);
+    if n == 0 {
+        return;
+    }
+    let Some(left) = ctx.releases.left.get(scratch.block) else {
+        return;
+    };
+    let before = left.0.fetch_sub(n, Ordering::Relaxed);
+    if before > 0 && before <= n {
+        let from = scratch.block << RELEASE_BLOCK_SHIFT;
+        ctx.b.slab.release(from, from + (1 << RELEASE_BLOCK_SHIFT));
+    }
 }
 
 /// One row-join's scratch: the two rows' fields, the runs' spans, and the proof
@@ -2475,6 +2609,10 @@ struct RowScratch {
     fb: Vec<Field>,
     spans: Vec<(usize, usize)>,
     refused: usize,
+    /// The block of B this worker's matches are being counted in, and how
+    /// many it has matched there since it last reported (`matched_b`).
+    block: usize,
+    matched: i32,
 }
 
 impl RowScratch {
@@ -2484,6 +2622,8 @@ impl RowScratch {
             fb: vec![ABSENT; width],
             spans: vec![(0usize, 0usize); runs_len],
             refused: 0,
+            block: usize::MAX,
+            matched: 0,
         }
     }
 }
@@ -2553,7 +2693,8 @@ fn mark_seen(seen: &[AtomicU64], row: i32) {
 ///
 /// `row` is the row's id for the pick lists, `from`/`end` its byte range in
 /// A's slab, `hash` its sweep-computed key hash, and `k` its index in the part,
-/// for the proof backoff. `seen` records the mate in B's seen bitmap.
+/// for the proof backoff. `seen` records the mate in B's seen bitmap. Returns
+/// the mate's row, or -1 for a row B does not have.
 #[allow(clippy::too_many_arguments)]
 fn join_row(
     ctx: &JoinCtx,
@@ -2565,7 +2706,7 @@ fn join_row(
     hash: u32,
     k: usize,
     seen: &[AtomicU64],
-) {
+) -> i32 {
     enum Fast {
         Proved(i32),
         Unproven,
@@ -2689,7 +2830,7 @@ fn join_row(
             if out.kept.on {
                 keep_skipped(ctx, out, mate);
             }
-            return;
+            return mate;
         }
         Fast::Missed => {
             out.removed_total += 1;
@@ -2699,7 +2840,7 @@ fn join_row(
                     keep_a(ctx, out, row, from, end);
                 }
             }
-            return;
+            return -1;
         }
         Fast::Unproven | Fast::Skipped => {}
     }
@@ -2784,7 +2925,7 @@ fn join_row(
                 keep_a(ctx, out, row, from, end);
             }
         }
-        return;
+        return -1;
     };
     out.matched += 1;
     mark_seen(seen, mate);
@@ -2804,7 +2945,7 @@ fn join_row(
     // The two rows carry the same bytes across every column either file
     // wants, so no column differs and the mate was never read.
     if same_bytes {
-        return;
+        return mate;
     }
 
     let mut any = false;
@@ -2866,6 +3007,7 @@ fn join_row(
             }
         }
     }
+    mate
 }
 
 /// Copies A's row `row`, bytes `from..end`, into the part's kept rows.
@@ -2976,6 +3118,11 @@ fn join_setup<'a>(
     let typed = (0..nc)
         .map(|i| Typed::of_pair(a.typed[key_size + i], b.typed[key_size + i]))
         .collect();
+    let releases = if b.slab.releasing() {
+        Releases::of(bi, b.slab.data().len())
+    } else {
+        Releases::none()
+    };
     // Which of B's rows some key of A matched.
     //
     // B's half of the join used to answer "is this key in A?" for every key in
@@ -3010,6 +3157,7 @@ fn join_setup<'a>(
         json_proof,
         json_span_proof,
         typed,
+        releases,
     };
     (ctx, seen)
 }
@@ -3887,8 +4035,12 @@ fn compare_fused(
         Input::Text { delimiter, .. } => *delimiter,
         Input::Parquet { .. } => b',',
     };
-    let b = b_input.project(wanted, key_size, total)?;
-    let a = a_input.project(wanted, key_size, total)?;
+    let mut b = b_input.project(wanted, key_size, total)?;
+    let mut a = a_input.project(wanted, key_size, total)?;
+    // This path is taken because the pair does not fit comfortably: each
+    // file's pages are let go of once read (`Slab::release_as_read`).
+    b.slab.release_as_read();
+    a.slab.release_as_read();
     let heap = crate::memory::heap_limit();
     let fits = estimate_may_refuse(
         opt.engine_name().ok(),

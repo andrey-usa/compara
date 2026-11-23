@@ -13,8 +13,12 @@ All notable changes to this project are documented here. The format follows
   stable Rust of its day, and each names it: a release's notes give the
   rustc of its binaries, and the perf gate and the benchmark results the
   rustc of every binary they count. A new rustc moves those counts with no
-  change to the code (1.100 against 1.97: +0.94% on the perf gate's turbo
-  CSV pair).
+  change to the code, so a bump shows what the compiler alone moves.
+- A pair too large to hold in memory, which the text engine joins inside the
+  first file's sweep, has each file's pages let go of once they are read
+  (Linux): under a container's memory limit the kernel then takes back plain
+  page cache instead of pages it must first unmap, and the run's peak RSS
+  falls to a fraction of the two files' size. Pairs that fit are unchanged.
 
 ### Fixed
 

@@ -44,9 +44,16 @@ pub(super) struct Slab {
     /// Where the data starts: past a UTF-8 byte order mark, which is not part
     /// of the first header name (or of the first JSON object).
     start: usize,
+    /// Whether `release` lets go of pages; see `release_as_read`.
+    releasing: bool,
 }
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// The unit [`Slab::release`] rounds to. Where the kernel's pages are larger
+/// it rounds the start down to one of its own, which can release a few bytes
+/// before `from`: they are faulted back in by whatever reads them next.
+const PAGE: usize = 4096;
 
 impl Slab {
     /// Maps a file read-only, with a hint that it will be read front to back.
@@ -70,6 +77,7 @@ impl Slab {
             bytes: Bytes::Mapped { _file: file, map },
             dialect: Dialect::Csv,
             start,
+            releasing: false,
         })
     }
 
@@ -89,12 +97,88 @@ impl Slab {
         let _ = (from, len);
     }
 
+    /// Has `release` let go of what it is given from here on: for a pair read
+    /// past the memory it has, where the text engine joins inside A's sweep.
+    ///
+    /// A mapped file's pages count as this process's for as long as it maps
+    /// them, though the kernel keeps them in its page cache either way. Under
+    /// a container's limit that costs twice: reclaiming a page some process
+    /// still maps means finding and unmapping it first, so with both files
+    /// mapped whole the kernel works hardest on the pages it should give up
+    /// most easily -- the ones the sweep has finished with. Released, they are
+    /// plain page cache, the cheapest memory to take back. On a 10M-row pair
+    /// in a 1 GB or 768 MB cgroup that took a few per cent to a tenth off the
+    /// run.
+    ///
+    /// Where both files fit, the pages are left mapped: there releasing them
+    /// only to fault them back in costs the run time. It would cut peak RSS
+    /// (411 to about 125 MB on 1M rows) by more than it costs anywhere else,
+    /// but measured whole it cost over a tenth of the wall time at 10M rows:
+    /// the sweep's pages are read again by the join, and the insertion's and
+    /// the join's proofs of a matching 32-bit hash read scattered rows, each
+    /// of which maps back a folio of up to a few hundred kilobytes.
+    ///
+    /// Linux only: elsewhere `MADV_DONTNEED` is a hint about what to evict,
+    /// not a release. Not for bytes this process built: there is nothing to
+    /// fault them back in from.
+    pub(super) fn release_as_read(&mut self) {
+        self.releasing = cfg!(target_os = "linux") && matches!(self.bytes, Bytes::Mapped { .. });
+    }
+
+    /// Whether `release` lets go of pages.
+    pub(super) fn releasing(&self) -> bool {
+        self.releasing
+    }
+
+    /// Takes the whole pages inside `from..to` of the data out of this
+    /// process, if `release_as_read` asked for that, and returns where the
+    /// next range to release should start: `to` less the part page it leaves
+    /// mapped (`to` itself when it releases nothing).
+    ///
+    /// Released pages stay in the page cache, and the next read of one maps
+    /// it again: a minor fault, or a disk read if memory ran short in between,
+    /// as it could have anyway. So a release changes what a later read costs,
+    /// never what it reads.
+    pub(super) fn release(&self, from: usize, to: usize) -> usize {
+        if !self.releasing {
+            return to;
+        }
+        #[cfg(target_os = "linux")]
+        if let Bytes::Mapped { map, .. } = &self.bytes {
+            let lo = (from + self.start).next_multiple_of(PAGE);
+            let hi = (to + self.start).min(map.len()) & !(PAGE - 1);
+            if hi > lo {
+                // Safety: the mapping is shared and read-only (`Mmap::map`),
+                // of a file opened read-only and not modified while mapped (see
+                // `map`). Dropping its page table entries leaves the bytes in
+                // the file and the page cache, and any later read of the range
+                // faults the same bytes back in, so no slice into the mapping
+                // ever sees different contents. (On a private mapping with
+                // pages written to it would not hold: those pages would be
+                // lost. This one has none.)
+                let _ = unsafe {
+                    map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, lo, hi - lo)
+                };
+            }
+            return hi.max(from + self.start) - self.start;
+        }
+        let _ = from;
+        to
+    }
+
+    /// Releases every whole page of the data: for a phase that reads it back
+    /// at random, a few rows at a time.
+    pub(super) fn release_all(&self) {
+        self.release(0, self.data().len());
+    }
+
     /// A slab over bytes this process built: the Parquet reader's arena.
     pub(super) fn owned(data: Vec<u8>, dialect: Dialect) -> Self {
         Slab {
             bytes: Bytes::Owned(data),
             dialect,
             start: 0,
+            releasing: false,
         }
     }
 
@@ -636,5 +720,67 @@ mod tests {
         let slab = Slab::owned(text.to_vec(), Dialect::Json);
         let f = pack(6, (text.len() - 8) as u64, true);
         assert_eq!(text_of(&slab, f), r#"{"a": 1}"#);
+    }
+
+    /// What this process has resident of its mappings of `path`, in KB, from
+    /// /proc/self/smaps.
+    #[cfg(target_os = "linux")]
+    fn mapped_kb(path: &Path) -> u64 {
+        let name = path.to_str().expect("a UTF-8 temp path");
+        let smaps = std::fs::read_to_string("/proc/self/smaps").expect("smaps");
+        let mut ours = false;
+        let mut kb = 0;
+        for line in smaps.lines() {
+            let first = line.split_whitespace().next().unwrap_or("");
+            if first.contains('-') && first.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+                ours = line.ends_with(name);
+            } else if ours && let Some(rest) = line.strip_prefix("Rss:") {
+                kb += rest
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(0);
+            }
+        }
+        kb
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_released_range_leaves_the_process_and_reads_back_the_same() {
+        let path = std::env::temp_dir().join(format!("compara-release-{}", std::process::id()));
+        let text: Vec<u8> = (0..4u32 << 20).map(|i| b'a' + (i % 26) as u8).collect();
+        std::fs::write(&path, &text).expect("a temp file");
+        let mut slab = Slab::map(&path).expect("the mapping");
+        assert_eq!(slab.data(), &text[..]);
+        assert!(
+            mapped_kb(&path) >= 4 << 10,
+            "read whole, the file is resident"
+        );
+        assert_eq!(
+            slab.release(100, 3 << 20),
+            3 << 20,
+            "not asked to, nothing released"
+        );
+        assert!(mapped_kb(&path) >= 4 << 10);
+        slab.release_as_read();
+
+        // Whole pages only: the part page at each end stays.
+        assert_eq!(slab.release(100, (3 << 20) + 100), 3 << 20);
+        assert_eq!(slab.release(5, 50), 5, "no whole page, nothing released");
+        let left = mapped_kb(&path);
+        assert!(
+            left <= (1 << 10) + 8,
+            "{left} KB still mapped after releasing 3 MB"
+        );
+
+        // Read again, the same bytes, faulted back in.
+        assert_eq!(slab.data(), &text[..]);
+        slab.release_all();
+        assert!(mapped_kb(&path) <= 8);
+        assert_eq!(slab.data(), &text[..]);
+        drop(slab);
+        let _ = std::fs::remove_file(&path);
     }
 }
