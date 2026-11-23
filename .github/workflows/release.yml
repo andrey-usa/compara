@@ -143,6 +143,26 @@ jobs:
           printf 'id,v\nk1,a\nk2,b\n' > a.csv && printf 'id,v\nk1,a\nk2,c\n' > b.csv
           code=0; "$bin" compare a.csv b.csv -k id --summary || code=$?
           [ "$code" = 1 ]
+      # The rustc that built this target, for the release's notes. A Linux
+      # binary names its own (scripts/buildinfo.py, in a tag from after it
+      # was added), checked against it.
+      - name: Record the compiler
+        env:
+          TARGET: ${{ matrix.target }}
+          GLIBC: ${{ matrix.glibc }}
+        run: |
+          used=$(rustc -V)
+          if [ -n "$GLIBC" ] && [ -f scripts/buildinfo.py ]; then
+            built=$(python3 scripts/buildinfo.py "target/$TARGET/release/compara" | sed 's/^[^:]*: //')
+            [ "$built" = "$used" ] || { echo "::error title=rustc::the binary was built by $built, not $used"; exit 1; }
+          fi
+          mkdir -p toolchain
+          echo "$TARGET: $used" | tee "toolchain/$TARGET.txt" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=rustc::$TARGET built by $used"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rustc-${{ matrix.target }}
+          path: toolchain/
       - name: Package
         if: runner.os != 'Windows'
         run: |
@@ -175,6 +195,12 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: toolchain
+          pattern: rustc-*
           merge-multiple: true
       # Signed build provenance for every archive: `gh attestation verify
       # <file> -R <owner>/<repo>`. (Public repositories only on GitHub's
@@ -191,12 +217,27 @@ jobs:
           PRERELEASE: ${{ needs.plan.outputs.prerelease }}
         run: |
           ls -la dist
+          # The notes' first line names the rustc of the binaries and this
+          # run; a rebuild replaces that line and leaves the rest.
+          run="[run $GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+          rustcs=$(cut -d' ' -f2- toolchain/*.txt | sort -u)
+          if [ "$(echo "$rustcs" | wc -l)" = 1 ]; then
+            built="Binaries built by $rustcs in $run."
+          else
+            built="Binaries built in $run by $(cat toolchain/*.txt | paste -sd';' - | sed 's/;/; /g')."
+          fi
           if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # Creates the tag on the planned commit when it doesn't exist yet.
             case "$REF" in refs/*) target="$GITHUB_SHA" ;; *) target="$REF" ;; esac
-            flags="--title \"$TAG\" --generate-notes --target \"$target\""
-            [ "$PRERELEASE" = true ] && flags="$flags --prerelease"
-            eval gh release create \"$TAG\" -R \"$GITHUB_REPOSITORY\" $flags
+            flags=(--title "$TAG" --generate-notes --notes "$built" --target "$target")
+            [ "$PRERELEASE" = true ] && flags+=(--prerelease)
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" "${flags[@]}"
+          else
+            gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
+            { echo "$built"; echo
+              awk 'drop && /^$/ { drop = 0; next } { drop = 0 } /^Binaries built / { drop = 1; next } { print }' notes.md
+            } > notes-new.md
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --notes-file notes-new.md
           fi
           gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*
           echo "::notice title=release::$TAG published with $(ls dist | wc -l) files: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
