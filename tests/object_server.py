@@ -42,6 +42,11 @@ reads nothing and never answers; `stall` reads the body and never answers;
 answers; `drop` reads half of it and closes the connection; `reset` closes
 it before reading.
 
+--redirect answers a GET or HEAD of /go/<bucket>/<key> with a 302 to
+/<bucket>/<key>?signed=K, K new each time, as GitHub sends a release asset
+to a signed URL on its CDN; --expire-after N then refuses each such URL
+after N GETs of it with 403, as a signed URL does once it expires.
+
 Prints `LISTENING <url>` once it is ready.
 """
 import argparse
@@ -79,6 +84,10 @@ def main() -> None:
     ap.add_argument("--fault-max", type=int, default=0)
     ap.add_argument("--fault-puts", action="store_true", help="the fault hits PUTs, not ranged GETs")
     ap.add_argument("--rate", type=int, default=1024, help="a dribbled PUT's bytes a second")
+    ap.add_argument("--redirect", action="store_true",
+                    help="answer /go/<bucket>/<key> with a 302 to /<bucket>/<key>?signed=K, K new each time")
+    ap.add_argument("--expire-after", type=int, default=0,
+                    help="refuse each signed=K URL with 403 after N GETs of it")
     args = ap.parse_args()
     lock = threading.Lock()
     # Requests read and not yet logged: GET /__settled waits for none.
@@ -88,6 +97,7 @@ def main() -> None:
     ranged = [0]
     puts = [0]
     faults = [0]
+    signed = {}
 
     def picked(i):
         """Whether request i (counted under the lock) is hit."""
@@ -204,6 +214,22 @@ def main() -> None:
             self.record("LIST", len(xml))
 
         def serve(self, head):
+            if args.redirect and self.path.startswith("/go/"):
+                with lock:
+                    k = len(signed) + 1
+                    signed[str(k)] = 0
+                self.send_response(302)
+                self.send_header("Location", f"{self.path[3:]}?signed={k}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return self.record(self.headers.get("Range"), 0)
+            k = re.search(r"signed=(\d+)", urlsplit(self.path).query)
+            if args.expire_after and not head and k and k.group(1) in signed:
+                with lock:
+                    signed[k.group(1)] += 1
+                    expired = signed[k.group(1)] > args.expire_after
+                if expired:
+                    return self.refuse(403)
             full, parts = self.target()
             if args.private and not self.headers.get("Authorization") and not parts.query:
                 return self.refuse(403)

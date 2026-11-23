@@ -1587,6 +1587,29 @@ async fn store_start(
     Ok(Got::Head(size, bytes, etag))
 }
 
+/// Where an `http(s)://` URL's first request was sent on to by a redirect
+/// in this run (GitHub sends a release asset to a signed URL on its CDN):
+/// its parts are asked there directly, which saves each the redirect's
+/// round trip. Forgotten when it is refused ([`fetch_part_once`]), as a
+/// signed URL is once it expires; the URL itself is then asked again.
+static LANDED: std::sync::Mutex<BTreeMap<String, String>> = std::sync::Mutex::new(BTreeMap::new());
+
+fn land(url: &str, at: &str) {
+    if let Ok(mut landed) = LANDED.lock() {
+        landed.insert(url.to_string(), at.to_string());
+    }
+}
+
+fn landed(url: &str) -> Option<String> {
+    LANDED.lock().ok().and_then(|l| l.get(url).cloned())
+}
+
+fn forget_landing(url: &str) {
+    if let Ok(mut landed) = LANDED.lock() {
+        landed.remove(url);
+    }
+}
+
 /// What a ranged GET got.
 enum Answer {
     /// 206: the bytes its Content-Range says it holds, the object's size,
@@ -1623,6 +1646,9 @@ async fn ask(
                 }
             })
         })?;
+    if response.status().is_success() && response.url().as_str() != url {
+        land(url, response.url().as_str());
+    }
     let status = response.status();
     let header = |name| {
         response
@@ -2471,7 +2497,8 @@ async fn fetch_part_once(
             }
         }
         Reader::Http(client, url) => {
-            let mut request = client.get(url).header(
+            let landed = landed(url);
+            let mut request = client.get(landed.as_deref().unwrap_or(url)).header(
                 reqwest::header::RANGE,
                 format!("bytes={}-{}", part.start, part.end - 1),
             );
@@ -2482,6 +2509,14 @@ async fn fetch_part_once(
                 stall_of(&e, false).unwrap_or_else(|| FetchError::Transient(said(&e)))
             })?;
             let status = response.status();
+            // Where it was sent on to refuses it now (a signed URL that has
+            // expired): the URL itself again, redirect and all.
+            if landed.is_some() && status.is_client_error() && status.as_u16() != 412 {
+                forget_landing(url);
+                return Err(FetchError::Transient(format!(
+                    "HTTP {status} where the URL had been sent on to"
+                )));
+            }
             if status == reqwest::StatusCode::PRECONDITION_FAILED {
                 return Err(FetchError::Other(changed()));
             }

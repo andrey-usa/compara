@@ -914,6 +914,52 @@ fn a_store_that_takes_no_suffix_range_is_read_in_ranges() {
     );
 }
 
+/// A URL whose first request is redirected (GitHub sends a release asset to
+/// a signed URL on its CDN) has its parts asked where it was sent, not each
+/// redirected again, to the local answer; once that refuses them, as a
+/// signed URL does when it expires, the URL itself is asked again.
+#[test]
+fn a_redirected_url_is_read_where_it_was_sent() {
+    let f = fixture("20k", &[]);
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let want = compare(&local("t_a.csv"), &local("t_b.csv"), &KEY, &[], None);
+    // Parts of 64 KB: about sixty a file.
+    let env = [("COMPARA_FETCH_PART", "65536")];
+    for extra in [&[][..], &["--expire-after", "20"][..]] {
+        let args = [&["--redirect"][..], extra].concat();
+        let Some(server) = Server::start(&f.0, &args) else {
+            eprintln!("skipping: no python to run the object server");
+            return;
+        };
+        let u = &server.url;
+        let got = compare_urls(
+            &format!("{u}/go/bkt/t_a.csv"),
+            &format!("{u}/go/bkt/t_b.csv"),
+            &env,
+        );
+        assert_eq!(
+            (want.0, &want.2, &want.3),
+            (got.0, &got.2, &got.3),
+            "{extra:?}: {}",
+            got.1
+        );
+        let log = std::fs::read_to_string(&server.log).unwrap();
+        let redirected = log.lines().filter(|l| l.contains("\"/go/")).count();
+        if extra.is_empty() {
+            // The first request of each file.
+            assert_eq!(redirected, 2, "{log}");
+        } else {
+            // Refused where they were sent, then sent there again.
+            let refused = log
+                .lines()
+                .filter(|l| l.contains("signed=") && l.contains("\"sent\": 0"))
+                .count();
+            assert!(refused > 0 && redirected > 2, "{log}");
+        }
+    }
+}
+
 /// Outputs to object storage: the report, the summary and the export land in
 /// the bucket as they would on disk, in one request or as a multipart upload;
 /// `--json -` is the summary on standard output.

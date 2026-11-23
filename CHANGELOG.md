@@ -19,6 +19,11 @@ All notable changes to this project are documented here. The format follows
   (Linux): under a container's memory limit the kernel then takes back plain
   page cache instead of pages it must first unmap, and the run's peak RSS
   falls to a fraction of the two files' size. Pairs that fit are unchanged.
+- An `http(s)://` file whose first request is redirected (every GitHub
+  release asset is sent to a signed URL on its CDN) has its parts asked
+  where it was sent, rather than each redirected again; once that address
+  refuses them, as a signed URL does when it expires, the URL itself is
+  asked again.
 
 ### Fixed
 
