@@ -37,7 +37,7 @@ bench = []
 # s3://, gs://, az:// and https:// inputs, read through Apache Arrow's
 # object_store with each cloud's own credential chain. Off, the binary reads
 # local files only and carries no network or TLS code.
-cloud = ["dep:object_store", "dep:tokio", "dep:futures", "dep:bytes", "dep:url", "dep:reqwest", "dep:libc"]
+cloud = ["dep:object_store", "dep:tokio", "dep:futures", "dep:bytes", "dep:url", "dep:reqwest"]
 
 [dependencies]
 # Engine: native, over the csv crate.
@@ -69,10 +69,11 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls", 
 # Local time with an offset for the report header; std has no calendar.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
-# A thread's signal mask, for SIGPIPE while a transfer writes to a socket
-# (feature `cloud`). Already built for tokio and the rest; std has no sigset_t.
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-libc = { version = "0.2.189", optional = true }
+# The flags that open a temporary name without following a link or waiting
+# on a pipe, and a thread's signal mask, for SIGPIPE while a transfer writes
+# to a socket (feature `cloud`); std has neither. Already built for memmap2.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
 
 [profile.dev]
 debug = 0

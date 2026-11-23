@@ -33,7 +33,7 @@
 //! run and keeps its directory until that process ends too.
 
 use std::fs::{self, File};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -179,7 +179,7 @@ fn remove_if_over(path: &Path, tag: Tag, me: u32, now: SystemTime, settled: Dura
         return false;
     }
     // Opened by name after those checks: it has to be the same directory.
-    let Ok(dir) = File::open(path) else {
+    let Ok(dir) = reopen(path, true) else {
         return false;
     };
     let same = dir
@@ -227,7 +227,7 @@ fn remove_file_if_over(path: &Path, me: u32, now: SystemTime, settled: Duration)
         return false;
     }
     // Opened by name after those checks: it has to be the same file.
-    let Ok(file) = File::open(path) else {
+    let Ok(file) = reopen(path, false) else {
         return false;
     };
     let same = file
@@ -246,6 +246,24 @@ fn remove_file_if_over(path: &Path, me: u32, now: SystemTime, settled: Duration)
         .and_then(|t| now.duration_since(t).ok())
         .is_some_and(|age| age >= settled);
     quiet && fs::remove_file(path).is_ok()
+}
+
+/// Opens `path`, a directory (`dir`) or a file by the look taken at it, to
+/// see whether it is still the one looked at. Where anyone may rename in
+/// the temporary directory (no sticky bit), the name may have been swapped
+/// since: a link put there is not followed, and a pipe is not waited on for
+/// a writer; the open fails, or what it opens is not the one looked at.
+fn reopen(path: &Path, dir: bool) -> std::io::Result<File> {
+    #[cfg(test)]
+    tests::between(path);
+    let mut flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    if dir {
+        flags |= libc::O_DIRECTORY;
+    }
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
 }
 
 /// What a directory's contents are: its files, its subdirectories, and the
@@ -321,6 +339,168 @@ fn alive(pid: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::process::Command;
+    use std::sync::mpsc;
+
+    thread_local! {
+        /// What a test does to a name once the sweep has looked at it and
+        /// before it opens it: what another user can do in a temporary
+        /// directory open to all without the sticky bit.
+        static SWAP: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn between(path: &Path) {
+        if let Some(swap) = SWAP.take() {
+            swap(path);
+        }
+    }
+
+    /// Moves what is at `path` aside, to `moved` beside it.
+    fn aside(path: &Path) -> PathBuf {
+        let moved = path.with_file_name("moved");
+        fs::rename(path, &moved).unwrap();
+        moved
+    }
+
+    fn to_pipe(path: &Path) {
+        aside(path);
+        let made = Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+    }
+
+    fn to_link(path: &Path) {
+        aside(path);
+        symlink("moved", path).unwrap();
+    }
+
+    /// Whether `remove` of `path`, with `swap` done to it between the look
+    /// and the open, removed it: `None` when it was still waiting after 10 s.
+    /// A wait on a pipe is then ended by opening its other end.
+    fn raced(path: &Path, swap: fn(&Path), remove: fn(&Path) -> bool) -> Option<bool> {
+        let (tx, rx) = mpsc::channel();
+        let on = path.to_path_buf();
+        let run = std::thread::spawn(move || {
+            SWAP.set(Some(swap));
+            let _ = tx.send(remove(&on));
+        });
+        let got = rx.recv_timeout(Duration::from_secs(10)).ok();
+        if got.is_none() {
+            let _ = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path);
+        }
+        run.join().unwrap();
+        got
+    }
+
+    /// A private directory for one test, removed after.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir = std::env::temp_dir()
+                .join(format!("compara-sweep-unit-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const OLD: Duration = Duration::from_secs(2 * 60 * 60);
+
+    fn remove_file(path: &Path) -> bool {
+        remove_file_if_over(path, euid(), SystemTime::now(), SETTLED)
+    }
+
+    fn remove_dir(path: &Path) -> bool {
+        remove_if_over(path, Tag::Export, euid(), SystemTime::now(), SETTLED)
+    }
+
+    /// A dead run's temporary file, quiet for long enough to be removed.
+    fn file_at(scratch: &Scratch) -> PathBuf {
+        let path = scratch.0.join("compara-41-0badc0de-0-stdin-locked");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.set_modified(SystemTime::now() - OLD).unwrap();
+        path
+    }
+
+    /// A dead run's export directory, the same.
+    fn dir_at(scratch: &Scratch) -> PathBuf {
+        let path = scratch.0.join("compara-41-0badc0de-0-export-locked");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let added = path.join("added.csv");
+        fs::write(&added, "id\n").unwrap();
+        for at in [&added, &path] {
+            File::open(at)
+                .unwrap()
+                .set_modified(SystemTime::now() - OLD)
+                .unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn a_name_swapped_after_its_check_is_not_waited_on_or_followed() {
+        // Left alone, each goes: what a swap changes is the name alone.
+        let scratch = Scratch::new("alone");
+        assert!(remove_file(&file_at(&scratch)));
+        assert!(remove_dir(&dir_at(&scratch)));
+
+        let mut got = Vec::new();
+        // A pipe: opening it to read would wait for a writer for good.
+        let scratch = Scratch::new("file-pipe");
+        got.push((
+            "file to pipe",
+            raced(&file_at(&scratch), to_pipe, remove_file),
+        ));
+        let scratch = Scratch::new("dir-pipe");
+        got.push(("dir to pipe", raced(&dir_at(&scratch), to_pipe, remove_dir)));
+        // A link to the file looked at: followed, it is the same file, every
+        // later check passes, and the link is what is removed.
+        let scratch = Scratch::new("file-link");
+        let path = file_at(&scratch);
+        got.push(("file to link", raced(&path, to_link, remove_file)));
+        got.push(("link left", Some(fs::symlink_metadata(&path).is_ok())));
+        // A link to the directory looked at: followed, what is in it is
+        // removed through the link.
+        let scratch = Scratch::new("dir-link");
+        got.push(("dir to link", raced(&dir_at(&scratch), to_link, remove_dir)));
+        let kept = scratch.0.join("moved").join("added.csv").exists();
+        got.push(("its file left", Some(kept)));
+        drop(scratch);
+
+        assert_eq!(
+            got,
+            [
+                ("file to pipe", Some(false)),
+                ("dir to pipe", Some(false)),
+                ("file to link", Some(false)),
+                ("link left", Some(true)),
+                ("dir to link", Some(false)),
+                ("its file left", Some(true)),
+            ]
+        );
+    }
 
     #[test]
     fn only_compara_s_own_names_are_taken() {
