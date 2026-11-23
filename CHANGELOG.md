@@ -63,8 +63,18 @@ All notable changes to this project are documented here. The format follows
 - `-o -` writes the HTML report to standard output, with the counts on
   standard error, as `--json -` does for the summary (both at once is
   refused). It replaces `-o /dev/stdout`, which is a link and now refused.
+- `compara-gen-data --unique-keys` writes the pair without its repeated
+  keys (0.01% of a file's), every other row the same.
 
 ### Changed
+
+- The weekly comparison against other tools (bench-contenders) leads with
+  pairs where no key repeats in a file, on which each tool runs its plainest
+  query; the pairs that repeat keys, where the others have to be told to
+  keep a key's first row, stay as a table of their own. Parquet is also
+  measured as Polars and DuckDB write it with their defaults, beside
+  `compara-gen-data`'s own; ClickHouse (`clickhouse local`) joins on the
+  unique-key pairs; and the tools' order turns each round.
 
 - An `https://` file is read over HTTP/1.1, a connection to each part, also
   from a server that offers HTTP/2 (CloudFront and Google Cloud Storage

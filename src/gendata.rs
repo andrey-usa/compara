@@ -15,6 +15,11 @@
 //! | rows only in A | 0.10% |
 //! | duplicate keys | 0.01% per file |
 //!
+//! The duplicate keys can be left out ([`Keys::Unique`], `--unique-keys`):
+//! every other row is the same, so the pair differs from the default only by
+//! the repeated rows. A comparison of such a pair needs no rule for which of
+//! two rows with one key counts, which is the case most tools are built for.
+//!
 //! The recipe and the hash are the same as the Python, TypeScript, Java and Go
 //! generators — the CSV files come out byte for byte identical — so a benchmark
 //! number from any of them is directly comparable.
@@ -109,6 +114,18 @@ const CHG_VALUE_DATE: u64 = 30;
 const REMOVED_MOD: i64 = 1000;
 const ADDED_RATIO: i64 = 1000;
 const DUP_MOD: i64 = 10_000;
+
+/// Whether a key may appear twice in one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Keys {
+    /// The recipe as the other generators write it: 0.01% of the keys a file
+    /// appear twice (in A, the first rows again at the end; in B, a row
+    /// written twice in a row).
+    #[default]
+    Repeated,
+    /// No key appears twice in either file; every other row is unchanged.
+    Unique,
+}
 
 /// splitmix-style hash, matching the other implementations bit for bit.
 fn hash(i: i64, salt: i64, seed: i64) -> u64 {
@@ -449,11 +466,25 @@ pub fn generate_with(
     format: Format,
     layout: ParquetLayout,
 ) -> Result<()> {
+    generate_keys(rows, a_path, b_path, seed, format, layout, Keys::Repeated)
+}
+
+/// [`generate_with`], with or without the repeated keys.
+pub fn generate_keys(
+    rows: i64,
+    a_path: &Path,
+    b_path: &Path,
+    seed: i64,
+    format: Format,
+    layout: ParquetLayout,
+    keys: Keys,
+) -> Result<()> {
     let days = days();
+    let repeat = keys == Keys::Repeated;
     let mut fa = Sink::create(a_path, format, layout)?;
     let mut fb = Sink::create(b_path, format, layout)?;
 
-    let dup_extra = (rows / DUP_MOD).max(1);
+    let dup_extra = if repeat { (rows / DUP_MOD).max(1) } else { 0 };
     let added = (rows / ADDED_RATIO).max(1);
 
     let mut line = Row::new();
@@ -465,7 +496,7 @@ pub fn generate_with(
             row(&mut line, i, true, seed, &days);
             fb.row(&line)?;
         }
-        if i % DUP_MOD == 3 && i < rows / 2 {
+        if repeat && i % DUP_MOD == 3 && i < rows / 2 {
             row(&mut line, i, true, seed, &days);
             fb.row(&line)?;
         }

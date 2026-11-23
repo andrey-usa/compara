@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use compara::gendata::{COLUMNS, Compression, Format, ParquetLayout, generate_with, parse_rows};
+use compara::gendata::{
+    COLUMNS, Compression, Format, Keys, ParquetLayout, generate_keys, parse_rows,
+};
 
 fn main() -> ExitCode {
     match run() {
@@ -32,6 +34,8 @@ usage: compara-gen-data [options]
       --row-group-size N  rows per Parquet row group (default 1000000)
       --dict-limit N    distinct values a Parquet column chunk may hold before
                         it is written plain (default 131072)
+      --unique-keys     no key twice in a file: the recipe without its 0.01%
+                        repeated rows, every other row the same
   -h, --help            this
 
 Writes <prefix>_a.<ext> and <prefix>_b.<ext>. Fifty million rows of CSV is
@@ -54,6 +58,7 @@ fn run() -> compara::Result<()> {
     let mut seed: i64 = 7;
     let mut format = Format::Csv;
     let mut layout = ParquetLayout::default();
+    let mut keys = Keys::Repeated;
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -67,6 +72,16 @@ fn run() -> compara::Result<()> {
         if flag == "-h" || flag == "--help" {
             println!("{USAGE}");
             std::process::exit(0);
+        }
+        if flag == "--unique-keys" {
+            if inline.is_some() {
+                return Err(compara::Error::new(format!(
+                    "--unique-keys takes no value, got: {arg}\n\n{USAGE}"
+                )));
+            }
+            keys = Keys::Unique;
+            i += 1;
+            continue;
         }
 
         // Every remaining flag takes a value, from `=` or the next argument.
@@ -144,7 +159,7 @@ fn run() -> compara::Result<()> {
     let b = dir.join(format!("{label}_b.{}", format.extension()));
 
     let start = Instant::now();
-    generate_with(rows, &a, &b, seed, format, layout)?;
+    generate_keys(rows, &a, &b, seed, format, layout, keys)?;
     println!(
         "rust: {rows} rows x {} columns in {:.1}s",
         COLUMNS.len(),

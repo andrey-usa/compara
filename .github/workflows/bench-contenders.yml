@@ -1,8 +1,11 @@
 name: bench-contenders
 
-# Weekly: compara against DuckDB, Polars and qsv (CSV only) at their latest, on one keyed
-# comparison of two generated 20-column tables (1M and 10M rows, CSV and
-# Parquet), every tool's counts checked identical (correctness gate). The
+# Weekly: compara against DuckDB, Polars, qsv (CSV only) and ClickHouse (unique
+# keys only) at their latest, on one keyed comparison of two generated 20-column
+# tables (1M and 10M rows): the headline pairs have no key twice in a file, in CSV
+# and in Parquet as compara-gen-data, Polars and DuckDB each write it; the pairs
+# that repeat 0.01% of their keys (CSV, and compara-gen-data's Parquet) are a table
+# of their own. Every tool's counts are checked identical (correctness gate). The
 # results are printed as `bench json` notices, so the docs are written from
 # the run itself: scripts/gen_bench_docs.py <run id> --readme README.md
 # --page docs/benchmarks.md --losses docs/losses.md.
@@ -36,7 +39,7 @@ jobs:
   compare:
     if: inputs.measure != 'changes'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -75,16 +78,40 @@ jobs:
           echo "qsv release $tag"
           "$RUNNER_TEMP/qsv/qsv" --version
 
+      # ClickHouse: its official release binary (clickhouse-common-static) at the
+      # latest release, the tag and `clickhouse local --version` printed.
+      - name: Install ClickHouse (latest release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo ClickHouse/ClickHouse --json tagName --jq .tagName)
+          version=${tag#v}; version=${version%-*}
+          mkdir -p "$RUNNER_TEMP/clickhouse"
+          gh release download "$tag" --repo ClickHouse/ClickHouse --pattern "clickhouse-common-static-$version-amd64.tgz" --dir "$RUNNER_TEMP/clickhouse"
+          tar -xzf "$RUNNER_TEMP/clickhouse/clickhouse-common-static-$version-amd64.tgz" -C "$RUNNER_TEMP/clickhouse" --strip-components 3 "clickhouse-common-static-$version/usr/bin/clickhouse"
+          rm "$RUNNER_TEMP/clickhouse/clickhouse-common-static-$version-amd64.tgz"
+          echo "clickhouse release $tag"
+          "$RUNNER_TEMP/clickhouse/clickhouse" local --version
+
       # Each tool in a cgroup of 13 GB of the runner's 16: a tool that needs
       # more is stopped and recorded as out of memory, and the runner lives.
       # Every run starts with its inputs in a stated page-cache state, warm
       # and cold, so what one tool leaves in memory does not decide how fast
       # the next one reads; each tool's number is its median of five.
-      - name: Benchmark (1M and 10M rows, CSV and Parquet, five rounds, warm and cold)
+      - name: Benchmark (1M and 10M rows, unique and repeated keys, CSV and three Parquet writers, five rounds, warm and cold)
         run: |
           python3 scripts/bench_contenders.py --compara target/release/compara \
-            --gen target/release/compara-gen-data --qsv "$RUNNER_TEMP/qsv/qsv" --rows 1m,10m --runs 5 --cache warm,cold \
-            --work "$RUNNER_TEMP/bench" --delete --memory-max 13G --json bench-results.json --notices
+            --gen target/release/compara-gen-data --qsv "$RUNNER_TEMP/qsv/qsv" \
+            --clickhouse "$RUNNER_TEMP/clickhouse/clickhouse" --rows 1m,10m --runs 5 --cache warm,cold \
+            --work "$RUNNER_TEMP/bench" --delete --memory-max 13G --json bench-results.json
+
+      # GitHub keeps 10 notices a step: the results go out in steps of ten.
+      - name: Results as notices (1-10)
+        run: python3 scripts/bench_contenders.py --notices-of bench-results.json --notice-step 1
+      - name: Results as notices (11-20)
+        run: python3 scripts/bench_contenders.py --notices-of bench-results.json --notice-step 2
+      - name: Results as notices (21-30)
+        run: python3 scripts/bench_contenders.py --notices-of bench-results.json --notice-step 3
 
       - name: Publish table
         run: |

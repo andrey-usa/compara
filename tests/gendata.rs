@@ -2,9 +2,13 @@
 //! generators byte for byte, so a benchmark number from any of them is directly
 //! comparable.
 
+use std::collections::HashSet;
 use std::fs;
+use std::process::Command;
 
-use compara::gendata::{COLUMNS, generate, parse_rows};
+use compara::gendata::{
+    COLUMNS, Compression, Format, Keys, ParquetLayout, generate, generate_keys, parse_rows,
+};
 
 #[test]
 fn the_shape_and_drift_are_what_the_recipe_says() {
@@ -61,4 +65,100 @@ fn parse_rows_accepts_the_usual_shorthands() {
         assert_eq!(parse_rows(input).expect(input), want, "parse_rows({input})");
     }
     assert!(parse_rows("many").is_err());
+}
+
+/// The key of a CSV line: its first two fields.
+fn key(line: &str) -> &str {
+    let second = line.find(',').expect("a field") + 1;
+    let end = second + line[second..].find(',').expect("a second field");
+    &line[..end]
+}
+
+#[test]
+fn unique_keys_is_the_default_pair_without_its_repeated_rows() {
+    let dir = std::env::temp_dir().join(format!("compara-gen-unique-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let read = |name: &str| fs::read_to_string(dir.join(name)).expect("read");
+    let layout = ParquetLayout {
+        compression: Compression::None,
+        ..ParquetLayout::default()
+    };
+    for (keys, a, b) in [
+        (Keys::Repeated, "r_a.csv", "r_b.csv"),
+        (Keys::Unique, "u_a.csv", "u_b.csv"),
+    ] {
+        generate_keys(
+            20_000,
+            &dir.join(a),
+            &dir.join(b),
+            7,
+            Format::Csv,
+            layout,
+            keys,
+        )
+        .expect("generate");
+    }
+    let (ra, rb, ua, ub) = (
+        read("r_a.csv"),
+        read("r_b.csv"),
+        read("u_a.csv"),
+        read("u_b.csv"),
+    );
+
+    // The default pair repeats keys; the unique one never does, in either file.
+    for (text, repeats) in [(&ra, true), (&rb, true), (&ua, false), (&ub, false)] {
+        let mut seen = HashSet::new();
+        let twice = text
+            .lines()
+            .skip(1)
+            .filter(|l| !seen.insert(key(l)))
+            .count();
+        assert_eq!(twice > 0, repeats, "repeated keys: {twice}");
+    }
+    // 20k rows a side; 20 removed from B and 20 added to it.
+    assert_eq!(ua.lines().count(), 20_001);
+    assert_eq!(ub.lines().count(), 20_001);
+
+    // Every other row is the default pair's, in its order: the repeated keys
+    // are the only difference, so a run on either pair measures the same data.
+    let first_only = |text: &str| -> Vec<String> {
+        let mut seen = HashSet::new();
+        text.lines()
+            .filter(|l| seen.insert(key(l).to_string()))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        first_only(&ra),
+        ua.lines().map(str::to_string).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        first_only(&rb),
+        ub.lines().map(str::to_string).collect::<Vec<_>>()
+    );
+
+    // The command line writes the same bytes with --unique-keys, and the
+    // default pair without it.
+    let tool = env!("CARGO_BIN_EXE_compara-gen-data");
+    for (flag, prefix, want_a) in [(Some("--unique-keys"), "cu", &ua), (None, "cr", &ra)] {
+        let mut cmd = Command::new(tool);
+        cmd.args(["--rows", "20k", "--prefix", prefix, "--out-dir"])
+            .arg(&dir);
+        cmd.args(flag);
+        let out = cmd.output().expect("run compara-gen-data");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(&read(&format!("{prefix}_a.csv")), want_a, "{flag:?}");
+    }
+    assert_eq!(read("cu_b.csv"), ub);
+    let bad = Command::new(tool)
+        .args(["--unique-keys=yes"])
+        .output()
+        .expect("run");
+    assert!(!bad.status.success());
+
+    let _ = fs::remove_dir_all(dir);
 }
