@@ -31,10 +31,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # The rustc rust-toolchain.toml names, with its rustfmt and clippy.
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
-          toolchain: stable
-          components: rustfmt, clippy
           # No cache from a job that stopped early. A key, once saved, is
           # kept until the dependencies change, so a job cancelled by a newer
           # push or failed mid-build would leave a target with nothing in it
@@ -62,7 +61,6 @@ jobs:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
-          toolchain: stable
           cache-on-failure: false
           # The keys from before cache-on-failure may hold that partial build.
           cache-key: whole
@@ -80,7 +78,6 @@ jobs:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
-          toolchain: stable
           cache-on-failure: false
       - run: cargo build --locked --release --all-features
       - name: Generate 200k rows a side
@@ -135,7 +132,6 @@ jobs:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
-          toolchain: stable
           cache-on-failure: false
       - uses: ./.github/actions/apt-install
         with:
@@ -155,21 +151,41 @@ jobs:
           git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
           # The base is a released tree: a warning a newer cargo has for
           # it (1.100: `homepage` repeating `documentation`) can't be
-          # fixed there, so it is not denied there.
+          # fixed there, so it is not denied there. Built from here, it
+          # takes the head's rust-toolchain.toml: one compiler for both,
+          # so the gate measures the code.
           CARGO_BUILD_WARNINGS=warn cargo build --locked --release --bin compara \
             --manifest-path "$RUNNER_TEMP/base/Cargo.toml" --target-dir target
           cp target/release/compara gate/base
+          # A base that names another rustc: the head built by that one
+          # too, so the summary shows what the compiler alone moves.
+          channel() { sed -n 's/^channel = "\(.*\)"/\1/p'; }
+          old=$(git show "$BASE_SHA:rust-toolchain.toml" 2>/dev/null | channel || true)
+          if [ -n "$old" ] && [ "$old" != "$(channel < rust-toolchain.toml)" ]; then
+            rustup toolchain install "$old" --profile minimal --no-self-update
+            cargo +"$old" build --locked --release --bin compara --target-dir "$RUNNER_TEMP/target-old"
+            cp "$RUNNER_TEMP/target-old/release/compara" gate/head-old
+          fi
       - name: Files of 50k and 200k rows a side
         run: |
           ./target/release/compara-gen-data --rows 200k --out-dir gate
           for s in a b; do head -n 50001 "gate/200k_$s.csv" > "gate/50k_$s.csv"; done
       - name: Gate
         run: |
+          files=(--small gate/50k_a.csv gate/50k_b.csv --large gate/200k_a.csv gate/200k_b.csv)
           python3 scripts/perf_gate.py --head gate/head --base gate/base \
-            --counter cachegrind --require \
-            --small gate/50k_a.csv gate/50k_b.csv --large gate/200k_a.csv gate/200k_b.csv \
+            --counter cachegrind --require "${files[@]}" \
             -- -k account_id,txn_id -i updated_at | tee -a "$GITHUB_STEP_SUMMARY"
-          exit "${PIPESTATUS[0]}"
+          code=${PIPESTATUS[0]}
+          # Not a bound: a new rustc is taken or not on its own measure.
+          if [ -x gate/head-old ]; then
+            printf '\n%s\n\n' "The compiler alone: this head built by the base's rustc (base) and by its own (head)." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            python3 scripts/perf_gate.py --head gate/head --base gate/head-old \
+              --counter cachegrind --require "${files[@]}" \
+              -- -k account_id,txn_id -i updated_at | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$code"
 
   # Known-vulnerable dependencies (RustSec advisory database).
   audit:
@@ -195,6 +211,8 @@ jobs:
           persist-credentials: false
       - id: msrv
         run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      # A toolchain named here is set as the checkout's override, which
+      # rustup puts before rust-toolchain.toml.
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
           toolchain: ${{ steps.msrv.outputs.version }}

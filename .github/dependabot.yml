@@ -18,3 +18,11 @@ updates:
         patterns: ["*"]
     cooldown:
       default-days: 7
+  # The compiler rust-toolchain.toml names, in a pull request of its own:
+  # its perf gate shows what the new rustc alone moves (ci.yml).
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

@@ -45,10 +45,9 @@ jobs:
         with:
           persist-credentials: false
 
+      # The rustc rust-toolchain.toml names; the results record it.
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
-        with:
-          toolchain: stable
 
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
@@ -139,8 +138,12 @@ jobs:
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
-        with:
-          toolchain: stable
+
+      # The builds of other commits below are made in their own checkouts,
+      # where rustup would take their rust-toolchain.toml, or none: this
+      # checkout's rustc for all of them, so they differ by the code alone.
+      - name: One rustc for every build
+        run: echo "RUSTUP_TOOLCHAIN=$(rustup show active-toolchain | cut -d' ' -f1)" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
@@ -150,7 +153,8 @@ jobs:
       - name: Benchmark
         run: |
           python3 scripts/bench_zstd.py --rows 10m --runs 3 --baseline origin/main --work "$RUNNER_TEMP/bench" | tee /tmp/zstd-table.md
-          { echo "## bench-contenders — zstd inputs (10M rows x 20 cols)"; sed -n '/^Linux/,$p' /tmp/zstd-table.md; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "## bench-contenders — zstd inputs (10M rows x 20 cols)"; echo; echo "compara built by $(rustc -V)."; echo
+            sed -n '/^Linux/,$p' /tmp/zstd-table.md; } >> "$GITHUB_STEP_SUMMARY"
 
   # By hand only (measure: changes): the timings a version's CHANGELOG quotes for
   # what changed since the last release, this commit against the release's own
@@ -173,8 +177,12 @@ jobs:
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
-        with:
-          toolchain: stable
+
+      # The builds of other commits below are made in their own checkouts,
+      # where rustup would take their rust-toolchain.toml, or none: this
+      # checkout's rustc for all of them, so they differ by the code alone.
+      - name: One rustc for every build
+        run: echo "RUSTUP_TOOLCHAIN=$(rustup show active-toolchain | cut -d' ' -f1)" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7

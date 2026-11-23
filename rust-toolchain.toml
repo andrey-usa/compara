@@ -1,0 +1,10 @@
+# The compiler that builds what CI checks, what the perf gate counts and
+# what a release ships. A new rustc moves instruction counts with no change
+# to the code (1.100 against 1.97: +0.94% on the perf gate's turbo CSV
+# pair), so the version is named here and moves in a pull request of its
+# own, as CONTRIBUTING.md describes. The oldest supported Rust is
+# rust-version in Cargo.toml, checked by ci's msrv job.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

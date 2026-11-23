@@ -107,9 +107,10 @@ jobs:
         with:
           ref: ${{ needs.plan.outputs.ref }}
           persist-credentials: false
+      # The rustc the release's rust-toolchain.toml names (stable for a
+      # tag from before it had one).
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
-          toolchain: stable
           target: ${{ matrix.target }}
           # No cache in a release: a poisoned cache entry would ship.
           cache: false
@@ -368,7 +369,6 @@ jobs:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
-          toolchain: stable
           cache: false
       - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth

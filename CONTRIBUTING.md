@@ -17,6 +17,23 @@ across every engine and every input format, cell for cell: a change that makes
 two engines, or a CSV and a Parquet copy of the same rows, disagree fails
 them.
 
+### The toolchain
+
+`rust-toolchain.toml` names the rustc that CI, the perf gate, the benchmarks
+and the release workflow build with, and rustup installs it for any `cargo`
+run in the checkout (`cargo +stable ...` builds with another). A new rustc
+moves instruction counts with no change to the code, so the perf gate, the
+benchmark results and each release's notes name the rustc that built every
+binary they measure or ship; `scripts/buildinfo.py <binary>` reads it from a
+Linux binary. Compare counts from one compiler only.
+
+The version moves in a pull request that changes nothing else; Dependabot
+opens one when a new rustc is out. Its perf gate builds both sides
+with the new rustc, then the head with the base's, and prints what the
+compiler alone moves under "The compiler alone"; that table goes in the pull
+request and in the next CHANGELOG. `rust-version` in `Cargo.toml` (the oldest
+Rust that builds compara, checked by ci's `msrv` job) does not move with it.
+
 ### Test data
 
 ```sh

@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The release binaries, the perf gate and the benchmarks are built by one
+  named rustc, 1.100.0 (`rust-toolchain.toml`), where each run took the
+  stable Rust of its day, and each names it: a release's notes give the
+  rustc of its binaries, and the perf gate and the benchmark results the
+  rustc of every binary they count. A new rustc moves those counts with no
+  change to the code (1.100 against 1.97: +0.94% on the perf gate's turbo
+  CSV pair).
+
 ### Fixed
 
 - On Windows, `-o NUL` and `--json NUL` failed (exit 2, after the whole
