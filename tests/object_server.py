@@ -46,6 +46,9 @@ it before reading.
 /<bucket>/<key>?signed=K, K new each time, as GitHub sends a release asset
 to a signed URL on its CDN; --expire-after N then refuses each such URL
 after N GETs of it with 403, as a signed URL does once it expires.
+--secret S adds `&sig=S` to that URL, a made-up credential a test then
+looks for in what the client prints. --fault http-403 and http-500 answer
+the picked ranged GETs (PUTs with --fault-puts) with that status.
 
 Prints `LISTENING <url>` once it is ready.
 """
@@ -78,7 +81,8 @@ def main() -> None:
     ap.add_argument("--no-etag", action="store_true")
     ap.add_argument("--grow", action="store_true")
     ap.add_argument("--fault", choices=["silent", "stall", "drop", "reset", "overlong", "dribble",
-                                        "suffix-501", "suffix-416", "suffix-200", "ranges-501", "wide"])
+                                        "suffix-501", "suffix-416", "suffix-200", "ranges-501", "wide",
+                                        "http-403", "http-500"])
     ap.add_argument("--fault-at", type=int, default=0)
     ap.add_argument("--fault-every", type=int, default=0)
     ap.add_argument("--fault-max", type=int, default=0)
@@ -88,6 +92,7 @@ def main() -> None:
                     help="answer /go/<bucket>/<key> with a 302 to /<bucket>/<key>?signed=K, K new each time")
     ap.add_argument("--expire-after", type=int, default=0,
                     help="refuse each signed=K URL with 403 after N GETs of it")
+    ap.add_argument("--secret", help="add &sig=SECRET to each redirect's signed URL")
     args = ap.parse_args()
     lock = threading.Lock()
     # Requests read and not yet logged: GET /__settled waits for none.
@@ -219,7 +224,8 @@ def main() -> None:
                     k = len(signed) + 1
                     signed[str(k)] = 0
                 self.send_response(302)
-                self.send_header("Location", f"{self.path[3:]}?signed={k}")
+                sig = f"&sig={args.secret}" if args.secret else ""
+                self.send_header("Location", f"{self.path[3:]}?signed={k}{sig}")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return self.record(self.headers.get("Range"), 0)
@@ -267,6 +273,8 @@ def main() -> None:
             if fault == "silent":
                 time.sleep(3600)
                 return self.close_now()
+            if fault in ("http-403", "http-500"):
+                return self.refuse(int(fault[5:]))
             suffix = bool(asked) and not head and asked.strip().startswith("bytes=-")
             if (suffix and args.fault == "suffix-501") or (asked and not head and args.fault == "ranges-501"):
                 return self.refuse(501, "Unsupported client range")
@@ -385,6 +393,9 @@ def main() -> None:
                     puts[0] += 1
                     fault = args.fault if picked(i) else None
             n = int(self.headers.get("Content-Length") or 0)
+            if fault in ("http-403", "http-500"):
+                self.body()
+                return self.refuse(int(fault[5:]))
             if fault == "reset":
                 return self.close_now()
             if fault == "silent":

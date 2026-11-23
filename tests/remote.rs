@@ -960,6 +960,182 @@ fn a_redirected_url_is_read_where_it_was_sent() {
     }
 }
 
+/// A made-up credential, in the URLs [`no_credential_in_a_url_is_shown`]
+/// reads; its `)` is one a query string can hold, where a message that
+/// cut a URL at the first `)` showed the rest.
+const SECRET: &str = "x)SECRETnot-a-real-key";
+
+/// `compara compare a b` with the report and the summary written, and
+/// everything it said: exit code, then stdout, stderr, the summary and the
+/// report, one after the other.
+fn said_all(a: &str, b: &str, env: &[(&str, &str)]) -> (i32, String) {
+    let dir = std::env::temp_dir().join(format!("compara-said-{}-{}", std::process::id(), id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_compara"))
+        .args(["compare", a, b])
+        .args(KEY)
+        .arg("--json")
+        .arg(dir.join("summary.json"))
+        .arg("-o")
+        .arg(dir.join("report.html"))
+        .arg("--no-compress")
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() && started.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    let mut all = String::from_utf8_lossy(&out.stdout).into_owned();
+    all.push_str(&String::from_utf8_lossy(&out.stderr));
+    for name in ["summary.json", "report.html"] {
+        all.push_str(&std::fs::read_to_string(dir.join(name)).unwrap_or_default());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    (out.status.code().unwrap_or(-1), all)
+}
+
+/// A credential in a URL is never shown: not in an error, a step line, the
+/// summary or the report. A redirect to a signed URL (`?sig=…`) whose parts
+/// then fail -- a reset connection, a body cut short, a stall, a 403, a 500
+/// -- names the URL given; so does a URL given with a token in its query or
+/// a password before its host, read or not found, a proxy's with one, and
+/// an output URL that refuses the upload. The reset had shown the
+/// signature's end (`error sending request<rest>): …`), and every URL given
+/// was shown whole.
+#[test]
+fn no_credential_in_a_url_is_shown() {
+    let f = fixture("20k", &[]);
+    let bucket = f.0.join("bkt");
+    let local = |n: &str| bucket.join(n).to_string_lossy().into_owned();
+    let quick = [
+        ("COMPARA_FETCH_PART", "65536"),
+        ("COMPARA_READ_TIMEOUT", "1"),
+    ];
+    let secret = SECRET.trim_start_matches("x)");
+    // Every case is run before any is failed, so a failure lists them all.
+    let mut shown: Vec<(String, String)> = Vec::new();
+    let mut check = |case: &str, all: &str| {
+        if all.contains(secret) {
+            shown.push((case.to_string(), all.to_string()));
+        }
+    };
+    for fault in ["reset", "drop", "stall", "http-403", "http-500"] {
+        let Some(server) = Server::start(
+            &f.0,
+            &[
+                "--redirect",
+                "--secret",
+                SECRET,
+                "--fault",
+                fault,
+                "--fault-at",
+                "1",
+                "--fault-every",
+                "1",
+            ],
+        ) else {
+            eprintln!("skipping: no python to run the object server");
+            return;
+        };
+        let given = format!("{}/go/bkt/t_a.csv", server.url);
+        // A short read timeout only for the stall: under it the resets
+        // too end as a stall, which names no URL.
+        let env = if fault == "stall" {
+            &quick[..]
+        } else {
+            &quick[..1]
+        };
+        let (code, all) = said_all(&given, &local("t_b.csv"), env);
+        assert_eq!(code, 2, "{fault}: {all}");
+        assert!(all.contains(&given), "{fault}: {all}");
+        check(fault, &all);
+    }
+    let Some(server) = Server::start(&f.0, &["--redirect", "--secret", SECRET]) else {
+        return;
+    };
+    let u = &server.url;
+    let host = u.strip_prefix("http://").unwrap();
+    let (code, all) = said_all(&format!("{u}/go/bkt/t_a.csv"), &local("t_b.csv"), &quick);
+    assert_eq!(code, 1, "{all}");
+    check("redirected, read", &all);
+    for (case, a, code) in [
+        ("query, read", format!("{u}/bkt/t_a.csv?token={SECRET}"), 1),
+        (
+            "password, read",
+            format!("http://u:{secret}@{host}/bkt/t_a.csv"),
+            1,
+        ),
+        (
+            "query, not found",
+            format!("{u}/bkt/nope.csv?token={SECRET}"),
+            2,
+        ),
+        (
+            "password, not found",
+            format!("http://u:{secret}@{host}/bkt/nope.csv"),
+            2,
+        ),
+    ] {
+        let (got, all) = said_all(&a, &local("t_b.csv"), &quick);
+        assert_eq!(got, code, "{a}: {all}");
+        assert!(all.contains(&format!("{host}/bkt/")), "{a}: {all}");
+        check(case, &all);
+    }
+    let proxy = format!("http://u:{secret}@127.0.0.1:9");
+    let (code, all) = said_all(
+        &format!("{u}/bkt/t_a.csv"),
+        &local("t_b.csv"),
+        &[
+            ("NO_PROXY", ""),
+            ("no_proxy", ""),
+            ("HTTP_PROXY", &proxy),
+            ("HTTPS_PROXY", &proxy),
+        ],
+    );
+    assert_eq!(code, 2, "{all}");
+    assert!(all.contains("a proxy is set: http://"), "{all}");
+    check("proxy", &all);
+    drop(server);
+    let Some(server) = Server::start(
+        &f.0,
+        &["--fault", "http-403", "--fault-every", "1", "--fault-puts"],
+    ) else {
+        return;
+    };
+    let out = Command::new(env!("CARGO_BIN_EXE_compara"))
+        .args(["compare", &local("t_a.csv"), &local("t_b.csv")])
+        .args(KEY)
+        .args([
+            "--json",
+            &format!("{}/out/summary.json?sig={SECRET}", server.url),
+        ])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{all}");
+    assert!(all.contains("403"), "{all}");
+    check("output URL", &all);
+    let cases: Vec<&str> = shown.iter().map(|(case, _)| case.as_str()).collect();
+    let all: Vec<String> = shown.iter().map(|(c, all)| format!("{c}: {all}")).collect();
+    assert!(
+        shown.is_empty(),
+        "shown in {} cases: {}\n{}",
+        cases.len(),
+        cases.join("; "),
+        all.join("\n---\n")
+    );
+}
+
 /// Outputs to object storage: the report, the summary and the export land in
 /// the bucket as they would on disk, in one request or as a multipart upload;
 /// `--json -` is the summary on standard output.

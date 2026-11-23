@@ -5,7 +5,6 @@ use std::fmt;
 
 /// Anything that stops a comparison: a missing file, a key that is not in both
 /// headers, an engine that cannot run.
-#[derive(Debug)]
 pub struct Error {
     /// Borrowed only for the refusal that had no room left to write its
     /// own ([`crate::alloc::refuse`]).
@@ -167,10 +166,25 @@ impl Error {
     }
 }
 
+/// Said with every URL in it shown without a credential ([`crate::redact`]):
+/// a message can name the URL a request went to, which a redirect may have
+/// signed, or a library's own text can.
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)?;
-        f.write_str(&self.hint)
+        f.write_str(&crate::redact::urls(&self.message))?;
+        f.write_str(&crate::redact::urls(&self.hint))
+    }
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Error")
+            .field("message", &crate::redact::urls(&self.message))
+            .field("unsupported", &self.unsupported)
+            .field("out_of_memory", &self.out_of_memory)
+            .field("input", &self.input)
+            .field("hint", &crate::redact::urls(&self.hint))
+            .finish()
     }
 }
 

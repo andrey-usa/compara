@@ -190,6 +190,11 @@ impl Source {
                 held: None,
             }
         };
+        // Named from here on as messages name it: a URL without its
+        // credentials.
+        if let std::borrow::Cow::Owned(shown) = crate::redact::urls(&source.spec) {
+            source.spec = shown;
+        }
         source.decompress()?;
         if source.path != Path::new(&source.spec)
             && let Ok(mut given) = GIVEN.lock()
@@ -204,7 +209,8 @@ impl Source {
         Ok(source)
     }
 
-    /// What the caller named: the path, `-`, or the URL.
+    /// What the caller named: the path, `-`, or the URL with no credential
+    /// in it ([`crate::redact::urls`]).
     pub fn spec(&self) -> &str {
         &self.spec
     }

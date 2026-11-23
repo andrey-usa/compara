@@ -1684,7 +1684,7 @@ async fn ask(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| stall_of(&e, true).unwrap_or_else(|| FetchError::Transient(e.to_string())))?
+        .map_err(|e| stall_of(&e, true).unwrap_or_else(|| FetchError::Transient(said(&e))))?
     {
         heard.now();
         bytes.extend_from_slice(&chunk);
@@ -1802,9 +1802,9 @@ async fn whole(
         while let Some(chunk) = response.chunk().await.map_err(|e| {
             stall_of(&e, true).unwrap_or_else(|| {
                 if e.is_timeout() || e.is_body() {
-                    FetchError::Transient(e.to_string())
+                    FetchError::Transient(said(&e))
                 } else {
-                    FetchError::Other(e.to_string())
+                    FetchError::Other(said(&e))
                 }
             })
         })? {
@@ -2550,7 +2550,7 @@ async fn fetch_part_once(
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| {
-                    stall_of(&e, true).unwrap_or_else(|| FetchError::Transient(e.to_string()))
+                    stall_of(&e, true).unwrap_or_else(|| FetchError::Transient(said(&e)))
                 })?;
                 heard.now();
                 let len = chunk.len() as u64;
@@ -2760,7 +2760,13 @@ impl reqwest::dns::Resolve for NoMetadata {
 /// connection that failed says which way it failed instead, and that a proxy
 /// is set when one is: through a dead proxy every host looks unreachable.
 fn said(e: &reqwest::Error) -> String {
+    // The URL it names is the one the request went to: after a redirect, a
+    // signed one. Taken out whole, whatever it holds; `plain` then finds no
+    // `for url (` to cut at its first `)`, which a query string can hold.
     let mut text = e.to_string();
+    if let Some(url) = e.url() {
+        text = text.replacen(&format!(" for url ({url})"), "", 1);
+    }
     let mut cause = std::error::Error::source(e);
     while let Some(c) = cause {
         let more = c.to_string();

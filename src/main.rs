@@ -633,9 +633,13 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
         result.meta.engine,
         result.meta.seconds
     );
-    let report_line = written
-        .as_ref()
-        .map(|(dest, bytes)| format!("Report: {dest} ({:.0} KB)", *bytes as f64 / 1024.0));
+    let report_line = written.as_ref().map(|(dest, bytes)| {
+        format!(
+            "Report: {} ({:.0} KB)",
+            compara::redact::urls(dest),
+            *bytes as f64 / 1024.0
+        )
+    });
     for text in std::iter::once(line).chain(report_line) {
         if json_to_stdout || report_to_stdout {
             eprintln!("{text}");

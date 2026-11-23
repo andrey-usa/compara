@@ -88,6 +88,18 @@ All notable changes to this project are documented here. The format follows
   asked for their end that way: each later object under a prefix saves a
   round trip.
 
+### Security
+
+- A URL is shown by its scheme, host and path, with `…` for a password
+  before its host (`http://…@host/`) and for its query string or fragment
+  (`https://host/a.csv?…`), wherever compara names one: errors, the step
+  lines on standard error, `--json` and the report. A presigned S3 or Azure
+  SAS URL, a token in a query string, or a user and password, given as an
+  input, an output or a proxy, had been shown whole; and a request to a
+  signed URL a redirect had sent the input to could show the end of its
+  signature in an error. Object storage URLs (`s3://`, `gs://`, `az://`)
+  carry no credential and are shown as given.
+
 ## [0.8.0] - 2026-11-21
 
 ### Added

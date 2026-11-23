@@ -36,6 +36,7 @@ pub mod parallel;
 pub mod parquet;
 pub mod phases;
 pub mod profiles;
+pub mod redact;
 pub mod report;
 pub mod rowstore;
 pub mod sections;
