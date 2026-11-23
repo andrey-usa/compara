@@ -53,15 +53,18 @@ All notable changes to this project are documented here. The format follows
   where it was refused below 48 MB.
 - A run killed while `sortmerge` spilled (SIGKILL, the OOM killer, an
   abort) left its runs in the temporary directory for good, and enough such
-  runs filled the disk. The next run that makes a temporary directory now
-  removes what killed runs left there: only directories by compara's own
-  names, this user's and closed to others, holding only the files compara
-  writes in them, whose process is gone and whose run is over: each run now
-  locks its directory and names it `...-locked`, and such a directory goes
-  once nothing in it has changed for a minute. One an earlier version left
-  (no lock, and its run may be going on in another pid namespace that
-  shares the directory) waits until nothing in it has changed for a day.
-  Anything else is left, and nothing is followed through a link. Unix only.
+  runs filled the disk; a killed run's spooled standard input, download,
+  decompressed copy or table of parts stayed there too. The next run that
+  makes a temporary file or directory now removes what killed runs left
+  there: only files and directories by compara's own names, this user's and
+  closed to others, a file with no other name, a directory holding only the
+  files compara writes in it, whose process is gone and whose run is over:
+  each run now locks each of its temporary files and directories and names
+  it `...-locked`, and such a one goes once nothing of it has changed for a
+  minute. One an earlier version left (no lock, and its run may be going on
+  in another pid namespace that shares the directory) waits until nothing
+  of it has changed for a day. Anything else is left, and nothing is
+  followed through a link. Unix only.
 - A URL read near a heap limit (`ulimit -d`, or a container's) no longer
   ends the process on signal 6, "memory allocation of ... bytes failed":
   the HTTP client grows each connection's read buffer with no way to refuse,
