@@ -28,12 +28,13 @@ or report a wrong count is a bug we want to hear about.
   who ran it alone: a spooled standard input, a download, a decompressed
   copy, the runs `sortmerge` spills, an export on its way to object storage.
   Files are made with mode 0600 and directories 0700, never at a name that
-  already exists, and removed when the run ends. A directory a killed run
-  left there is removed by the next run that makes one, when it is provably
-  compara's and over: compara's own name, this user's and closed to others,
-  only compara's files in it and no link, not locked by a live run, its
-  process gone, and nothing in it changed for a minute; a day for one an
-  earlier version left, which no lock protects (Unix).
+  already exists, and removed when the run ends. A file or directory a
+  killed run left there is removed by the next run that makes one, when it
+  is provably compara's and over: compara's own name, this user's and closed
+  to others, not a link, a file with no other name, only compara's files in
+  a directory and no link, not locked by a live run, its process gone, and
+  nothing of it changed for a minute; a day for one an earlier version
+  left, which no lock protects (Unix).
 - The files a run is told to write (`-o`, `--json`, `--export-dir`) are
   written only at the names given: a symbolic link at one (or at the
   export directory) is refused, not followed, a name that is one of the

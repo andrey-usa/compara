@@ -16,8 +16,8 @@
 //!   compares (see [`remote`]).
 //!
 //! Temporary files live in the system's temporary directory (`TMPDIR`) and go
-//! when the [`Source`] does; a temporary directory that a killed run left
-//! there goes with the next run that makes one. In a container that is the writable scratch
+//! when the [`Source`] does; a temporary file or directory that a killed run
+//! left there goes with the next run that makes one. In a container that is the writable scratch
 //! space -- an `emptyDir` under a read-only root -- and a page cache the
 //! kernel can reclaim, where holding the bytes in memory would count against
 //! the container's limit until the end. A decompressed input is the exception
@@ -49,7 +49,7 @@ pub struct Source {
     /// The bytes the input holds where it is stored: the object's size, the
     /// compressed file's, what came in on stdin.
     stored: u64,
-    temps: Vec<PathBuf>,
+    temps: Vec<Temp>,
     steps: Vec<String>,
     /// The in-memory file `path` names, when the input was expanded into one;
     /// it goes when the [`Source`] does.
@@ -58,9 +58,7 @@ pub struct Source {
 
 impl Drop for Source {
     fn drop(&mut self) {
-        for path in &self.temps {
-            let _ = std::fs::remove_file(path);
-        }
+        self.temps.clear();
         if let Ok(mut given) = GIVEN.lock() {
             given.retain(|(path, _)| *path != self.path);
         }
@@ -244,7 +242,7 @@ impl Source {
     /// The files of a local directory or glob, in path order, as one.
     fn local_many(spec: &str, files: Vec<(String, PathBuf)>, note: &str) -> Result<Source> {
         let started = Instant::now();
-        let mut combined = many::Combined::new()?;
+        let (mut combined, temp) = many::Combined::new()?;
         let relative: Vec<String> = files.iter().map(|f| f.0.clone()).collect();
         let partitions = many::table_partitions(&relative);
         if let Some((names, _)) = &partitions {
@@ -254,7 +252,7 @@ impl Source {
             spec: spec.to_string(),
             path: combined.path.clone(),
             stored: 0,
-            temps: vec![combined.path.clone()],
+            temps: vec![temp],
             steps: Vec::new(),
             held: None,
         };
@@ -279,12 +277,12 @@ impl Source {
 
     fn stdin() -> Result<Source> {
         let started = Instant::now();
-        let (path, file) = temp_file("stdin")?;
+        let (temp, file) = temp_file("stdin")?;
         let mut source = Source {
             spec: "-".to_string(),
-            path: path.clone(),
+            path: temp.path().to_path_buf(),
             stored: 0,
-            temps: vec![path],
+            temps: vec![temp],
             steps: Vec::new(),
             held: None,
         };
@@ -398,8 +396,8 @@ impl Source {
         out.flush().map_err(bad)?;
         // A downloaded or spooled compressed file is not needed once it is
         // expanded; a local one is the caller's and stays.
-        if let Some(i) = self.temps.iter().position(|t| *t == self.path) {
-            let _ = std::fs::remove_file(self.temps.remove(i));
+        if let Some(i) = self.temps.iter().position(|t| t.path() == self.path) {
+            drop(self.temps.remove(i));
         }
         let place = match out {
             Sink::Memory(file) => {
@@ -430,16 +428,17 @@ enum Sink {
 }
 
 impl Sink {
-    fn disk(temps: &mut Vec<PathBuf>) -> Result<Sink> {
-        let (path, file) = temp_file("plain")?;
-        temps.push(path.clone());
+    fn disk(temps: &mut Vec<Temp>) -> Result<Sink> {
+        let (temp, file) = temp_file("plain")?;
+        let path = temp.path().to_path_buf();
+        temps.push(temp);
         let out = BufWriter::with_capacity(1 << 20, crate::memory::WriteBehind::new(file));
         Ok(Sink::Disk(out, path))
     }
 
     /// A temporary file holding what the in-memory one does, which it
     /// replaces.
-    fn spill(memory: &mut File, temps: &mut Vec<PathBuf>) -> Result<Sink> {
+    fn spill(memory: &mut File, temps: &mut Vec<Temp>) -> Result<Sink> {
         use std::io::{Seek, SeekFrom};
         let mut disk = Sink::disk(temps)?;
         memory.seek(SeekFrom::Start(0))?;
@@ -597,6 +596,60 @@ fn no_temp(what: &str, e: &std::io::Error) -> Error {
     ))
 }
 
+/// A temporary file of this run's, removed when this goes.
+///
+/// Until then it is locked, which is what tells a later run, in any pid
+/// namespace, that this one is not over; its name ends `-locked` to say so
+/// (see [`sweep`]). The lock is held on a descriptor of its own, so it lasts
+/// as long as this does, whatever becomes of the one the file was made
+/// with: most are closed once the file is written, and the file is read
+/// again by its name.
+pub(crate) struct Temp {
+    path: PathBuf,
+    _lock: Option<File>,
+}
+
+impl Temp {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Temp {
+    fn drop(&mut self) {
+        // Before the lock goes with the fields: the file is not unlocked
+        // while it is there.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A new file in the temporary directory, for this user alone (see
+/// [`new_temp_file`]), locked while the [`Temp`] lives. The first a process
+/// makes removes, first, the files that killed runs left there.
+pub(crate) fn temp_file(tag: &str) -> Result<(Temp, File)> {
+    sweep_once();
+    #[cfg(unix)]
+    {
+        let (path, file) = new_temp_file(&format!("{tag}-{}", sweep::LOCKED))?;
+        if let Some(lock) = file.try_clone().ok().filter(|l| l.try_lock().is_ok()) {
+            return Ok((
+                Temp {
+                    path,
+                    _lock: Some(lock),
+                },
+                file,
+            ));
+        }
+        // As for a directory (`TempDir::new`): where the lock cannot be
+        // taken, the file is one of an unlocked run's, which a later run
+        // leaves for a day.
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+    let (path, file) = new_temp_file(tag)?;
+    Ok((Temp { path, _lock: None }, file))
+}
+
 /// A new file in the temporary directory, for this user alone.
 ///
 /// What goes in one is the data being compared: standard input, a download
@@ -605,7 +658,7 @@ fn no_temp(what: &str, e: &std::io::Error) -> Error {
 /// writable by its owner only (it was made with the default mode, which
 /// leaves it readable by every user), and only where nothing is: a file or a
 /// link already at the name is not opened.
-pub(crate) fn temp_file(tag: &str) -> Result<(PathBuf, File)> {
+fn new_temp_file(tag: &str) -> Result<(PathBuf, File)> {
     for _ in 0..16 {
         let path = temp_path(tag);
         let mut options = OpenOptions::new();
@@ -719,8 +772,8 @@ impl Drop for TempDir {
     }
 }
 
-/// Removes, once a process, the temporary directories runs that were killed
-/// left behind.
+/// Removes, once a process, the temporary files and directories runs that
+/// were killed left behind.
 fn sweep_once() {
     #[cfg(unix)]
     {
@@ -734,7 +787,8 @@ fn sweep_once() {
 /// Whether a temporary file can be made: stdin, compressed and remote inputs
 /// need one, and so does the engine that spills to disk.
 pub fn temp_dir_writable() -> bool {
-    match temp_file("probe") {
+    // Only a look: nothing is swept or locked.
+    match new_temp_file("probe") {
         Ok((path, _)) => {
             let _ = std::fs::remove_file(path);
             true
@@ -839,10 +893,12 @@ mod tests {
     fn temporary_files_and_directories_are_this_user_s_alone() {
         use std::os::unix::fs::PermissionsExt;
         let others = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o077;
-        let (path, file) = temp_file("probe").unwrap();
+        let (temp, file) = temp_file("probe").unwrap();
+        let path = temp.path().to_path_buf();
         assert_eq!(others(&path), 0, "{}", path.display());
         drop(file);
-        std::fs::remove_file(&path).unwrap();
+        drop(temp);
+        assert!(!path.exists(), "the file goes when it is dropped");
 
         let dir = TempDir::new("probe").unwrap();
         assert_eq!(others(dir.path()), 0, "{}", dir.path().display());

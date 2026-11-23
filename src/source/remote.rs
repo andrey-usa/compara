@@ -33,7 +33,7 @@ use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, path::Path
 
 use super::delta;
 use super::many::{self, Combined, read_at, write_at};
-use super::{Source, Want, human, room_for, temp_file};
+use super::{Source, Temp, Want, human, room_for, temp_file};
 use crate::error::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -180,13 +180,13 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
     let (size, tail, etag, tail_at) = match got {
         Got::Tail(size, tail, etag) => (size, tail, etag, None),
         Got::Head(size, head, etag) => (size, head, etag, Some(0)),
-        Got::Whole(path, size) => {
+        Got::Whole(temp, size) => {
             let secs = started.elapsed().as_secs_f64();
             return Ok(Source {
                 spec: spec.to_string(),
-                path: path.clone(),
+                path: temp.path().to_path_buf(),
                 stored: size,
-                temps: vec![path],
+                temps: vec![temp],
                 steps: vec![format!(
                     "downloaded {} whole (the server sends no ranges) in {secs:.1}s ({}/s)",
                     human(size),
@@ -197,12 +197,12 @@ async fn fetch_async(spec: &str, want: &Want) -> Result<Source> {
         }
     };
 
-    let (path, file) = temp_file("download")?;
+    let (temp, file) = temp_file("download")?;
     let mut source = Source {
         spec: spec.to_string(),
-        path: path.clone(),
+        path: temp.path().to_path_buf(),
         stored: size,
-        temps: vec![path],
+        temps: vec![temp],
         steps: Vec::new(),
         held: None,
     };
@@ -446,12 +446,12 @@ async fn fetch_many(spec: &str, want: &Want) -> Result<Source> {
     let compressed = objects
         .iter()
         .any(|m| named_compressed(m.location.as_ref()));
-    let mut combined = Combined::new()?;
+    let (mut combined, temp) = Combined::new()?;
     let mut source = Source {
         spec: spec.to_string(),
         path: combined.path.clone(),
         stored: listed_bytes,
-        temps: vec![combined.path.clone()],
+        temps: vec![temp],
         steps: Vec::new(),
         held: None,
     };
@@ -659,8 +659,7 @@ async fn append_whole(
                     .await
                     .map_err(|e| e.into_error(name))?
                     .ranged(name)?;
-                let (path, file) = temp_file("part")?;
-                let guard = TempPath(path);
+                let (temp, file) = temp_file("part")?;
                 file.set_len(size)?;
                 write_at(&file, &tail, size - tail.len() as u64)?;
                 let rest = size - tail.len() as u64;
@@ -675,24 +674,15 @@ async fn append_whole(
                     )
                     .await?;
                 }
-                Ok::<_, Error>((name, guard, values))
+                Ok::<_, Error>((name, temp, values))
             }
         }))
         .await?;
         for (name, temp, values) in done {
-            combined.append_file(name, &temp.0, values)?;
+            combined.append_file(name, temp.path(), values)?;
         }
     }
     Ok(())
-}
-
-/// A temporary file removed when this goes.
-struct TempPath(PathBuf);
-
-impl Drop for TempPath {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
 }
 
 /// Writes the local file `from` to `dest`: in one request when it is small,
@@ -1202,7 +1192,7 @@ enum Got {
     Head(u64, Vec<u8>, Option<String>),
     /// A server that doesn't do ranges sent the whole object: already
     /// written to this temporary file, of this size.
-    Whole(PathBuf, u64),
+    Whole(Temp, u64),
 }
 
 impl Got {
@@ -1213,8 +1203,8 @@ impl Got {
             Got::Head(..) => Err(Error::new(format!(
                 "{spec}: the store sent the start of the object for its end"
             ))),
-            Got::Whole(path, ..) => {
-                let _ = std::fs::remove_file(path);
+            Got::Whole(temp, ..) => {
+                drop(temp);
                 Err(Error::new(format!(
                     "{spec}: the store sent the whole object for a range"
                 )))
@@ -1804,7 +1794,7 @@ async fn whole(
     if let Some(len) = response.content_length() {
         room_for(len, spec).map_err(other)?;
     }
-    let (path, mut file) = temp_file("download").map_err(other)?;
+    let (temp, mut file) = temp_file("download").map_err(other)?;
     let mut written = 0u64;
     let mut checked = 0u64;
     let mut response = response;
@@ -1830,11 +1820,9 @@ async fn whole(
         Ok(())
     }
     .await;
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&path);
-        return Err(e);
-    }
-    Ok(Got::Whole(path, written))
+    // An error drops the file with `temp`.
+    result?;
+    Ok(Got::Whole(temp, written))
 }
 
 /// Whether the answer for the end of an object of `size` bytes, `len` bytes

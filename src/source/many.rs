@@ -29,7 +29,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use super::{human, read_up_to, temp_file};
+use super::{Temp, human, read_up_to, temp_file};
 use crate::error::{Error, Result};
 
 /// Whether `s` holds a glob character.
@@ -461,10 +461,12 @@ pub(crate) struct Combined {
 }
 
 impl Combined {
-    pub(crate) fn new() -> Result<Combined> {
-        let (path, file) = temp_file("combined")?;
-        Ok(Combined {
-            path,
+    /// A new one, and the temporary file it writes: the caller keeps that
+    /// for as long as the file is read, which is past this.
+    pub(crate) fn new() -> Result<(Combined, Temp)> {
+        let (temp, file) = temp_file("combined")?;
+        let combined = Combined {
+            path: temp.path().to_path_buf(),
             file,
             end: 0,
             kind: None,
@@ -474,7 +476,8 @@ impl Combined {
             parts: 0,
             partitions: Vec::new(),
             text_partitions: None,
-        })
+        };
+        Ok((combined, temp))
     }
 
     /// The partition columns the parts' paths hold, for each part's values to

@@ -1,27 +1,32 @@
-//! Temporary directories left behind by runs that did not end on their own.
+//! Temporary files and directories left behind by runs that did not end on
+//! their own.
 //!
-//! A run's temporary directory goes when the run does, unless the run is
-//! killed (SIGKILL, the OOM killer, an abort): then nothing of it runs to
-//! remove it, and what `sortmerge` spilled -- both files' rows -- stays in
-//! the temporary directory until someone looks. A run about to make a
-//! temporary directory first removes such leftovers, and only those that are
-//! provably compara's and provably over:
+//! A run's temporary files and directories go when the run does, unless the
+//! run is killed (SIGKILL, the OOM killer, an abort): then nothing of it
+//! runs to remove them, and what they hold -- standard input, a download, a
+//! decompressed copy, the rows `sortmerge` spilled -- stays in the temporary
+//! directory until someone looks. A run about to make a temporary file or
+//! directory first removes such leftovers, and only those that are provably
+//! compara's and provably over:
 //!
 //! - named as compara names them, `compara-<pid>-<8 hex>-<n>-<tag>`, with a
-//!   tag whose contents are known;
-//! - a directory, not a link, owned by this user and closed to every other;
-//! - not locked: a run holds a lock on its directory for as long as it
-//!   lives, and the kernel drops the lock however the run ends, in whatever
-//!   pid namespace it ran;
+//!   tag compara uses: a directory's says what it holds, a file's what it
+//!   is;
+//! - a directory or a file as the tag says, not a link, owned by this user
+//!   and closed to every other; a file with no other name;
+//! - not locked: a run holds a lock on each of its temporary files and
+//!   directories for as long as it uses them, and the kernel drops the lock
+//!   however the run ends, in whatever pid namespace it ran;
 //! - its process gone here;
-//! - holding only the files compara writes there: no link, nothing else;
-//! - nothing in it changed for a while: the directory, its subdirectories
-//!   and every file in them. A directory whose name ends `-locked` was made
-//!   by a run that locks it, and a minute is enough: it covers the moment
-//!   between making the directory and locking it. One without was made by
-//!   an earlier version, which took no lock; it may belong to a run still
-//!   going in another pid namespace (containers sharing a `/tmp`), where its
-//!   process id means nothing here, so it waits a day.
+//! - for a directory, holding only the files compara writes there: no link,
+//!   nothing else;
+//! - nothing of it changed for a while: the file, or the directory, its
+//!   subdirectories and every file in them. A name that ends `-locked` was
+//!   made by a run that locks it, and a minute is enough: it covers the
+//!   moment between making the file or directory and locking it. One without
+//!   was made by an earlier version, which took no lock; it may belong to a
+//!   run still going in another pid namespace (containers sharing a `/tmp`),
+//!   where its process id means nothing here, so it waits a day.
 //!
 //! Anything else is left as it is, and so is what cannot be removed; neither
 //! is an error. A process id the system has handed on again reads as a live
@@ -42,8 +47,8 @@ const SETTLED_UNLOCKED: Duration = Duration::from_secs(24 * 60 * 60);
 /// The end of the name of a directory its run locks.
 pub(super) const LOCKED: &str = "locked";
 
-/// Removes from `dir` the temporary directories that runs which have ended
-/// left behind; how many went.
+/// Removes from `dir` the temporary files and directories that runs which
+/// have ended left behind; how many went.
 pub(super) fn sweep(dir: &Path) -> usize {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
@@ -57,22 +62,48 @@ pub(super) fn sweep(dir: &Path) -> usize {
             continue;
         };
         let settled = if locked { SETTLED } else { SETTLED_UNLOCKED };
-        if !alive(pid) && remove_if_over(&entry.path(), tag, me, now, settled) {
+        if alive(pid) {
+            continue;
+        }
+        let gone = if tag.is_file() {
+            remove_file_if_over(&entry.path(), me, now, settled)
+        } else {
+            remove_if_over(&entry.path(), tag, me, now, settled)
+        };
+        if gone {
             removed += 1;
         }
     }
     removed
 }
 
-/// What a temporary directory compara makes is for, by its tag.
+/// What a temporary directory or file compara makes is for, by its tag.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Tag {
-    /// `sortmerge`'s spilled runs, under `a/` and `b/`.
+    /// A directory: `sortmerge`'s spilled runs, under `a/` and `b/`.
     Sortmerge,
-    /// An export on its way to object storage.
+    /// A directory: an export on its way to object storage.
     Export,
-    /// An output on its way to object storage or a URL.
+    /// A directory: an output on its way to object storage or a URL.
     Out,
+    /// A file: what came in on standard input.
+    Stdin,
+    /// A file: a gzip or zstd input, decompressed.
+    Plain,
+    /// A file: an object or a URL, downloaded.
+    Download,
+    /// A file: one object under a prefix, downloaded whole before it is
+    /// added to the table it is part of.
+    Part,
+    /// A file: the parts of a table -- a local directory or glob, or a
+    /// prefix in object storage -- as one.
+    Combined,
+}
+
+impl Tag {
+    fn is_file(self) -> bool {
+        !matches!(self, Tag::Sortmerge | Tag::Export | Tag::Out)
+    }
 }
 
 /// The process id and tag of a name `compara-<pid>-<8 hex>-<n>-<tag>`, and
@@ -96,6 +127,11 @@ fn parse(name: &str) -> Option<(i32, Tag, bool)> {
         "sortmerge" => Tag::Sortmerge,
         "export" => Tag::Export,
         "out" => Tag::Out,
+        "stdin" => Tag::Stdin,
+        "plain" => Tag::Plain,
+        "download" => Tag::Download,
+        "part" => Tag::Part,
+        "combined" => Tag::Combined,
         _ => return None,
     };
     Some((pid, tag, locked))
@@ -173,6 +209,43 @@ fn remove_if_over(path: &Path, tag: Tag, me: u32, now: SystemTime, settled: Dura
         let _ = fs::remove_dir(sub);
     }
     fs::remove_dir(path).is_ok()
+}
+
+/// Removes `path`, a temporary file of a run whose process is gone, if every
+/// other check passes; whether it went.
+fn remove_file_if_over(path: &Path, me: u32, now: SystemTime, settled: Duration) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    // A file compara made has the one name it gave it: one with another is
+    // somebody's file too.
+    if !meta.file_type().is_file()
+        || meta.uid() != me
+        || meta.mode() & 0o077 != 0
+        || meta.nlink() != 1
+    {
+        return false;
+    }
+    // Opened by name after those checks: it has to be the same file.
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let same = file
+        .metadata()
+        .is_ok_and(|m| (m.dev(), m.ino()) == (meta.dev(), meta.ino()));
+    // Refused while the run that made it uses it; once taken, held until the
+    // file is gone.
+    if !same || file.try_lock().is_err() {
+        return false;
+    }
+    // When it last changed is read under the lock, from the file opened.
+    let quiet = file
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| now.duration_since(t).ok())
+        .is_some_and(|age| age >= settled);
+    quiet && fs::remove_file(path).is_ok()
 }
 
 /// What a directory's contents are: its files, its subdirectories, and the
@@ -263,11 +336,26 @@ mod tests {
             parse("compara-41-0badc0de-0-export-locked"),
             Some((41, Tag::Export, true))
         );
+        for (tag, want) in [
+            ("stdin", Tag::Stdin),
+            ("plain", Tag::Plain),
+            ("download", Tag::Download),
+            ("part", Tag::Part),
+            ("combined", Tag::Combined),
+        ] {
+            assert_eq!(
+                parse(&format!("compara-41-0badc0de-3-{tag}-locked")),
+                Some((41, want, true))
+            );
+            assert!(want.is_file());
+        }
+        assert!(!Tag::Sortmerge.is_file() && !Tag::Export.is_file() && !Tag::Out.is_file());
         for name in [
             "compara-0-0badc0de-3-sortmerge",
             "compara--1-0badc0de-3-sortmerge",
             "compara-41-0badc0d-3-sortmerge",
-            "compara-41-0badc0de-3-stdin",
+            "compara-41-0badc0de-3-probe",
+            "compara-41-0badc0de-3-stdin-x",
             "compara-41-0badc0de-3-sortmerge-x",
             "compara-41-0badc0de-3-sortmerge-locked-locked",
             "compara-41-0badc0de-3-locked",
