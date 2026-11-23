@@ -26,9 +26,12 @@ spill and merge path: at its default batch the small file is sorted in
 memory and the large one spilled, a step in cost per row that is not a
 regression.
 
-Prints a Markdown table (for $GITHUB_STEP_SUMMARY). Exits 1 on a bound
-broken; with no counter on the machine prints SKIPPED and exits 0, or 1
-with --require.
+Prints a Markdown table (for $GITHUB_STEP_SUMMARY), headed by the rustc that
+built each binary (buildinfo.py): a new compiler moves the counts with no
+change to the code, so a count is compared only with one from the same
+compiler, and a head and base from two compilers are named as such. Exits
+1 on a bound broken; with no counter on the machine prints SKIPPED and exits
+0, or 1 with --require.
 """
 import argparse
 import json
@@ -37,6 +40,9 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from buildinfo import rustc_of  # noqa: E402
+
 FIXED = {"COMPARA_HASH_SEED": "1", "COMPARA_SORTMERGE_BATCH_BYTES": str(4 << 20)}
 
 
@@ -96,6 +102,13 @@ def main():
     cols = ["engine", "small", "large", "ratio"]
     if a.base:
         cols += ["base small", "base large", "change small", "change large"]
+    built = {"head": rustc_of(a.head) or "unknown"}
+    if a.base:
+        built["base"] = rustc_of(a.base) or "unknown"
+    print("Built by: " + "; ".join(f"{k} {v}" for k, v in built.items()) + "\n")
+    if a.base and built["head"] != built["base"]:
+        print("NOTE: the head and the base were built by different compilers; "
+              "the change columns measure the compiler as well as the code.\n")
     print(f"Instructions of `compare` ({counter}):\n")
     print("| " + " | ".join(cols) + " |")
     print("|" + "---|" * len(cols))

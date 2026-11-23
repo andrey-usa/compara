@@ -68,6 +68,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench_contenders import env, evict, notices, preread, resident  # noqa: E402
+from buildinfo import rustc_of  # noqa: E402
 
 KEY = ["account_id", "txn_id"]
 IGNORE = "updated_at"
@@ -531,9 +532,12 @@ CLAIMS = {"sortmerge": claim_sortmerge, "wide": claim_wide, "names": claim_names
 
 
 def build_versions(builds):
+    """Each build's --version and the rustc that built it: a claim compares two
+    builds of compara, so it holds only for builds from the same compiler."""
     v = {}
     for name, binary in builds.items():
         v[name] = subprocess.run([binary, "--version"], capture_output=True, text=True).stdout.strip()
+        v[f"{name} rustc"] = rustc_of(binary)
     return v
 
 

@@ -91,6 +91,9 @@ import sys
 import threading
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from buildinfo import rustc_of  # noqa: E402
+
 KEY = ["account_id", "txn_id"]
 IGNORE = "updated_at"
 
@@ -538,6 +541,8 @@ def bench(args, pair):
 
 def versions(args):
     v = {"compara": subprocess.run([args.compara, "--version"], capture_output=True, text=True).stdout.strip()}
+    # The compiler moves compara's numbers as a new version of a rival moves its.
+    v["compara rustc"] = rustc_of(args.compara)
     for mod in ("duckdb", "polars"):
         v[mod] = subprocess.run([sys.executable, "-c", f"import {mod}; print({mod}.__version__)"],
                                 capture_output=True, text=True).stdout.strip()

@@ -348,7 +348,9 @@ def main():
              + (", the order turned by one tool each round" if split else "")
              + "), so a slow minute on the runner falls on all of them.", ""] + runs + ["",
              "## Versions", "",
-             f"compara built from the run's commit ({v['compara']}); DuckDB {v.get('duckdb')} and Polars "
+             f"compara built from the run's commit ({v['compara']}"
+             + (f", by {v['compara rustc']}" if v.get("compara rustc") else "")
+             + f"); DuckDB {v.get('duckdb')} and Polars "
              f"{v.get('polars')} installed from PyPI at their latest in the run, on Python {v.get('python')}."
              + (f" qsv {ver['qsv']} is its release binary, as downloaded in the run." if v.get("qsv") else "")
              + (f" ClickHouse {ver['clickhouse']} is its official release binary (`{v['clickhouse']}`), as "
