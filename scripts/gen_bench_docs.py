@@ -259,12 +259,25 @@ def main():
 
     readme = ["## Benchmarks", "",
               f"{what}, on GitHub's `{runner}` ({machine}), {link}, {date}"
-              + (", on pairs with no key twice in a file:" if split else ":"), ""] + table(headline)
+              + (", on pairs with no key twice in a file:" if split else ":"), ""]
+    # With more pairs than the README can hold, it shows the largest; the page has every one.
+    def count(rows):  # "10m" -> 10,000,000 (a run names its sizes as given), or a number as it is
+        if not isinstance(rows, str):
+            return rows
+        r = rows.lower()
+        return float(r.rstrip("km")) * (1_000_000 if r.endswith("m") else 1_000 if r.endswith("k") else 1)
+    most = max(count(i["rows"]) for i in headline)
+    top = [inp for inp in headline if count(inp["rows"]) == most] if split else headline
+    readme += table(top)
+    if len(top) < len(headline):
+        readme += ["", f"Smaller pairs, every run and the method: [Benchmarks]({SITE}benchmarks/results.html)."]
     if split:
-        readme += ["", "The same comparison where a file repeats 0.01% of its keys, each compared by its first "
-                   "row as compara does: DuckDB, Polars and qsv have to be told to keep the first row (the page "
-                   "says how), which costs them time:", ""] + table(repeated)
-    readme += ["", note, "", loss_line, "",
+        # The README keeps to the headline: the pairs that repeat keys, and how long the disk alone took,
+        # are on the page, so the README stays short enough to read whole.
+        readme += ["", "Where a file repeats 0.01% of its keys, each compared by its first row as compara does, "
+                   f"DuckDB, Polars and qsv have to be told to keep the first row, which costs them time: "
+                   f"[that table]({SITE}benchmarks/results.html)."]
+    readme += ["", note.replace(floor_note, "") if split else note, "", loss_line, "",
                f"The method, every run and object storage: [Benchmarks]({SITE}benchmarks/results.html).", ""]
     if "--readme" in opts:
         p = opts["--readme"]
