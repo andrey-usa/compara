@@ -1372,7 +1372,16 @@ async fn tail_once(
     known: Option<u64>,
     heard: &Heard,
 ) -> std::result::Result<Got, FetchError> {
+    // Refused before at this store or host: not asked again.
+    let place = suffix_place(reader);
     match reader {
+        Reader::Store(store, path) if suffix_refused(&place) => {
+            store_start(store, path, known, heard).await
+        }
+        Reader::Http(client, url) if suffix_refused(&place) => {
+            let suffix = format!("bytes=-{TAIL}");
+            start_of(client, url, &suffix, 501, spec, heard).await
+        }
         Reader::Store(store, path) => {
             let got = store
                 .get_opts(
@@ -1406,6 +1415,7 @@ async fn tail_once(
                 // No end by this form (Fastly: 501 Unsupported client
                 // range): by the first byte, as from a plain HTTP server.
                 Err(e) if not_implemented(&e) => {
+                    refuse_suffix(place);
                     return store_start(store, path, known, heard).await;
                 }
                 // An empty object has no suffix to give.
@@ -1436,11 +1446,46 @@ async fn tail_once(
                 // No end by this form (Fastly: 501 Unsupported client range),
                 // or an empty object: the start says which, and the size.
                 Answer::Status(refused @ (416 | 501), _) => {
+                    // A 416 may be an empty object; a 501 is the server's.
+                    if refused == 501 {
+                        refuse_suffix(place);
+                    }
                     start_of(client, url, &suffix, refused, spec, heard).await
                 }
                 Answer::Status(status, _) => Err(Refused(status)),
             }
         }
+    }
+}
+
+/// Where a suffix range was answered 501 in this run, by
+/// [`suffix_place`]: the next object there is asked for its start, or its
+/// end by first byte, at once: under a prefix of 256 objects behind such a
+/// server, 16 objects a side are refused (those asked together), not 256. A
+/// and B of a pair are asked together, so B is refused too.
+static NO_SUFFIX: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// A store and its bucket (`AmazonS3(bkt)`), or an HTTP host and port.
+fn suffix_place(reader: &Reader) -> String {
+    match reader {
+        Reader::Store(store, _) => store.to_string(),
+        Reader::Http(_, url) => url::Url::parse(url)
+            .ok()
+            .map(|u| {
+                let port = u.port_or_known_default().unwrap_or(0);
+                format!("{}:{port}", u.host_str().unwrap_or(""))
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn suffix_refused(place: &str) -> bool {
+    NO_SUFFIX.lock().is_ok_and(|set| set.contains(place))
+}
+
+fn refuse_suffix(place: String) {
+    if let Ok(mut set) = NO_SUFFIX.lock() {
+        set.insert(place);
     }
 }
 

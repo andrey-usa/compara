@@ -75,7 +75,10 @@ All notable changes to this project are documented here. The format follows
   It is now read as such an `https://` file is: its start first (under a
   prefix, its end by its first byte, the listing having given its size),
   then ranges that name their first byte. A 501 to any store request is no
-  longer asked again: it says the server does not do what was asked.
+  longer asked again: it says the server does not do what was asked. Once
+  a store or an `https://` host has refused it, its next objects are not
+  asked for their end that way: each later object under a prefix saves a
+  round trip.
 
 ## [0.8.0] - 2026-11-21
 

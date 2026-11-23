@@ -806,6 +806,7 @@ fn a_server_that_takes_no_suffix_range_is_read_in_ranges() {
 /// byte, to the local answer, CSV and Parquet, one object or the parts under
 /// a prefix. object_store had asked again after the 501 ten times, for
 /// seconds to minutes by its random backoff, and then the read was an error.
+/// Once refused, a store is not asked for another object's end that way.
 /// A store that refuses every range says so at once, and what to do.
 #[test]
 fn a_store_that_takes_no_suffix_range_is_read_in_ranges() {
@@ -829,6 +830,8 @@ fn a_store_that_takes_no_suffix_range_is_read_in_ranges() {
     };
     let env = s3_env(&server.url);
     let env = borrowed(&env);
+    // One object at a time, so that each is asked after the one before.
+    let one_by_one = [&env[..], &[("COMPARA_FETCH_CONCURRENCY", "1")]].concat();
     let limit = Some(std::time::Duration::from_secs(30));
     for (a, b, extra) in [
         ("t_a.csv", "t_b.csv", &[][..]),
@@ -839,13 +842,14 @@ fn a_store_that_takes_no_suffix_range_is_read_in_ranges() {
         let want = compare(&local(a), &local(b), &args, &[], None);
         let start = server.requests().len();
         let started = std::time::Instant::now();
-        let slash = if a.starts_with("parts") { "/" } else { "" };
+        let prefix = a.starts_with("parts");
+        let slash = if prefix { "/" } else { "" };
         let got = compare_within(
             Command::new(env!("CARGO_BIN_EXE_compara")),
             &format!("s3://bkt/{a}{slash}"),
             &format!("s3://bkt/{b}{slash}"),
             &args,
-            &env,
+            if prefix { &one_by_one } else { &env },
             None,
             limit,
         );
@@ -855,13 +859,13 @@ fn a_store_that_takes_no_suffix_range_is_read_in_ranges() {
             "{a}: {}",
             got.1
         );
-        // Each object's suffix asked once: the 501 is not asked again.
-        let objects = if slash.is_empty() { 2 } else { 8 };
+        // A suffix refused is not asked again, nor asked of the next part:
+        // A's first and B's.
         let refused = server.requests()[start..]
             .iter()
             .filter(|(range, _)| range.starts_with("bytes=-"))
             .count();
-        assert!(refused <= objects, "{a}: {refused} suffix ranges asked");
+        assert!(refused <= 2, "{a}: {refused} suffix ranges asked");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(20),
             "{a}: {:?}",
