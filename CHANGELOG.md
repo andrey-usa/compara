@@ -98,6 +98,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- A temporary file a run writes and then reads back (standard input, a
+  download, a decompressed input, the files of a directory or a prefix
+  combined, each object of a compressed prefix) is read only while its name
+  is still the file the run made, never through a link. In a temporary
+  directory others can rename files in, another user's file, or a link to
+  one, put at the name after the file was written had been read and
+  compared in place of the input; the run now stops with an error that says
+  so and asks for a `TMPDIR` of the user's own. For the library:
+  `source::open_input` and `source::input_metadata` open an input as the
+  engines do.
+
 - What a run writes into its own temporary directories (`sortmerge`'s
   sorted runs, an export or an output on its way to object storage) is
   made, read and removed through the directory it created, never by its
