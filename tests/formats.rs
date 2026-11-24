@@ -841,6 +841,101 @@ fn the_same_records_written_pretty_and_compact_are_the_same_table() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// A nested JSON value and the same JSON in a CSV cell or a Parquet string,
+/// written as `json.dumps` spaces it: the text cell is read as JSON where it
+/// is one JSON object or array, and is equal to the value however either is
+/// spaced or its strings escaped. Read as written, the same records in NDJSON
+/// and in a CSV were changed in every nested cell; compact, they were equal,
+/// so the answer turned on the writer's spacing. Text that is not one JSON
+/// value stays as written, a JSON string is a string, and a key column of
+/// nested values hashes as it compares.
+#[test]
+fn a_nested_json_value_and_the_same_json_in_a_text_cell_are_equal() {
+    use compara::gendata::parquet::{Compression, Writer};
+    let dir = std::env::temp_dir().join(format!("compara-json-text-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("a temp dir");
+    // (id, the nested value in NDJSON, the text in the CSV cell and the
+    // Parquet string, equal)
+    let rows: [(&str, &str, &str, bool); 7] = [
+        (
+            "1",
+            r#"{"a":[1,2],"s":"caf\u00e9 \/"}"#,
+            r#"{"a": [1, 2], "s": "café /"}"#,
+            true,
+        ),
+        (
+            "2",
+            r#"[{"t":"x}{"},{"t":"\""}]"#,
+            "\n [ {\"t\": \"x}{\"}, {\"t\": \"\\u0022\"} ] ",
+            true,
+        ),
+        ("3", r#"{"a":1,"b":2}"#, r#"{"b": 2, "a": 1}"#, false),
+        ("4", r#"[1.0,2]"#, "[1, 2]", false),
+        // Not JSON: as written, which the nested value's text is not.
+        ("5", r#"{"a":1}"#, "{a: 1}", false),
+        ("6", r#"[3,4]"#, "[3, 4] x", false),
+        // Compact text is the nested value's own text, as before.
+        ("7", r#"{"a":[1,2]}"#, r#"{"a":[1,2]}"#, true),
+    ];
+    let json = dir.join("a.ndjson");
+    let csv = dir.join("b.csv");
+    let parquet = dir.join("b.parquet");
+    let mut nd = String::new();
+    let mut text = String::from("id,k,m\n");
+    let mut w = Writer::create(&parquet, &["id", "k", "m"], Compression::None, 3).unwrap();
+    for (id, nested, cell, _) in rows {
+        nd.push_str(&format!(
+            "{{\"id\":\"{id}\",\"k\":{nested},\"m\":{nested}}}\n"
+        ));
+        let quoted = format!("\"{}\"", cell.replace('"', "\"\""));
+        text.push_str(&format!("{id},{quoted},{quoted}\n"));
+        w.write_row([id, cell, cell].into_iter()).unwrap();
+    }
+    w.finish().unwrap();
+    fs::write(&json, nd).unwrap();
+    fs::write(&csv, text).unwrap();
+    let equal = rows.iter().filter(|r| r.3).count() as i64;
+    for other in [&csv, &parquet] {
+        for (a, b) in [(&json, other), (other, &json)] {
+            for threads in [1usize, 4] {
+                for trim in [false, true] {
+                    let mut opt = options(&["id"]);
+                    opt.threads = Some(threads);
+                    opt.trim = trim;
+                    let result = run(a, b, &mut opt);
+                    assert_eq!(result.counts.matched, 7, "{}", answer(&result));
+                    assert_eq!(result.counts.changed, 7 - equal, "{}", answer(&result));
+                    // Keyed on the nested column, the equal rows match.
+                    let mut opt = options(&["k"]);
+                    opt.threads = Some(threads);
+                    opt.trim = trim;
+                    let result = run(a, b, &mut opt);
+                    assert_eq!(result.counts.matched, equal, "{}", answer(&result));
+                    assert_eq!(result.counts.changed, 0, "{}", answer(&result));
+                }
+            }
+        }
+    }
+    // A JSON string holding the text is a string, and two CSV cells are
+    // compared as written: both as before.
+    let strings = dir.join("strings.ndjson");
+    fs::write(&strings, "{\"id\":\"1\",\"m\":\"{\\\"a\\\": 1}\"}\n").unwrap();
+    let nested = dir.join("nested.ndjson");
+    fs::write(&nested, "{\"id\":\"1\",\"m\":{\"a\":1}}\n").unwrap();
+    let result = run(&strings, &nested, &mut options(&["id"]));
+    assert_eq!(result.counts.changed, 1, "{}", answer(&result));
+    let spaced = dir.join("spaced.csv");
+    fs::write(&spaced, "id,m\n1,\"{\"\"a\"\": 1}\"\n").unwrap();
+    let compact = dir.join("compact.csv");
+    fs::write(&compact, "id,m\n1,\"{\"\"a\"\":1}\"\n").unwrap();
+    let result = run(&spaced, &compact, &mut options(&["id"]));
+    assert_eq!(result.counts.changed, 1, "{}", answer(&result));
+    // Against a JSON string, the CSV cell is text too.
+    let result = run(&strings, &spaced, &mut options(&["id"]));
+    assert_eq!(result.counts.changed, 0, "{}", answer(&result));
+    fs::remove_dir_all(&dir).ok();
+}
+
 /// Two nested values that differ in a lone surrogate, which a JSON escape can
 /// name and UTF-8 cannot hold, are compared different, and the report showed
 /// both as U+FFFD: alike, and under `--trim`, which compares their text,

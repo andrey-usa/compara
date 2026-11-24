@@ -261,6 +261,11 @@ fn is_absent(slab: &Slab, f: Field, opt: &Options) -> bool {
     value(slab, f, opt).is_none()
 }
 
+// Out of line, as the compiler kept it before the JSON reading of a text
+// cell was added: inlined into `RowIndex::lookup`, its key check took 3.3M
+// more instructions there than the 1.0M of its calls on the perf gate's
+// 200k-row CSV pair (callgrind, one thread), +0.55% of the compare.
+#[inline(never)]
 fn same(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
     if !needs_normalising(opt) {
         // Fast path: `plain_absent` is the field-word check without the
@@ -271,7 +276,41 @@ fn same(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
         }
         return same_bytes(a, x, b, y);
     }
-    value(a, x, opt) == value(b, y, opt)
+    same_normalised(a, x, b, y, opt)
+}
+
+/// [`same`] with `--trim`, `--ignore-case` or `--tolerance`. Out of line, so
+/// that the fast path above does not pay for the strings this one holds.
+#[inline(never)]
+fn same_normalised(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
+    let (va, vb) = values(a, x, b, y, opt);
+    va == vb
+}
+
+/// The two values the normalising route compares: as [`value`] reads each,
+/// but a CSV or Parquet text cell against a nested JSON value read as JSON
+/// where it is one (`slab::text_as_json`), as `same_bytes` reads it.
+fn values(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> (Val, Val) {
+    let text = |s: &Slab, f: Field, other: &Slab, of: Field| {
+        s.dialect() != Dialect::Json && !s.is_nested(f) && other.is_nested(of)
+    };
+    if text(a, x, b, y) {
+        (json_value(a, x, opt), value(b, y, opt))
+    } else if text(b, y, a, x) {
+        (value(a, x, opt), json_value(b, y, opt))
+    } else {
+        (value(a, x, opt), value(b, y, opt))
+    }
+}
+
+/// [`value`] read as JSON where it is one JSON object or array, for a pair of
+/// JSON and CSV or Parquet: what a text cell is compared and hashed as.
+fn json_value(slab: &Slab, f: Field, opt: &Options) -> Val {
+    let v = value(slab, f, opt)?;
+    if slab.is_nested(f) {
+        return Some(v);
+    }
+    Some(slab::str_as_json(&v).unwrap_or(v))
 }
 
 /// Whether a field is absent, when nothing has to be normalised first.
@@ -311,7 +350,13 @@ fn cell_differs(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
     if !needs_normalising(opt) {
         return !same(a, x, b, y, opt);
     }
-    differs(&value(a, x, opt), &value(b, y, opt), opt)
+    differs_normalised(a, x, b, y, opt)
+}
+
+/// [`cell_differs`] with the options that normalise; see [`same_normalised`].
+fn differs_normalised(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
+    let (va, vb) = values(a, x, b, y, opt);
+    differs(&va, &vb, opt)
 }
 
 /// FNV-1a over eight bytes at a time.
@@ -342,7 +387,15 @@ fn hash_bytes(bytes: &[u8], seed: u64, mul: u64) -> u64 {
 }
 
 /// A hash of the bytes equality would compare, so the two cannot disagree.
-fn hash_field(slab: &Slab, f: Field, opt: &Options, normalise: bool, seed: u64, mul: u64) -> u64 {
+fn hash_field(
+    slab: &Slab,
+    f: Field,
+    opt: &Options,
+    normalise: bool,
+    json_text: bool,
+    seed: u64,
+    mul: u64,
+) -> u64 {
     let mut h = seed;
     // Fast path: no normalization options set, so absence is just the field
     // word. The `needs_normalising` check was done once per sweep, not once
@@ -359,9 +412,20 @@ fn hash_field(slab: &Slab, f: Field, opt: &Options, normalise: bool, seed: u64, 
     // field reached the hash by one path and the comparison by another.
     let mut len = 0u64;
     if normalise {
-        let owned = value(slab, f, opt).unwrap_or_default();
+        let owned = if json_text {
+            json_value(slab, f, opt)
+        } else {
+            value(slab, f, opt)
+        };
+        let owned = owned.unwrap_or_default();
         h = hash_bytes(owned.as_bytes(), h, mul);
         len = owned.len() as u64;
+    } else if let Some(json) = json_text.then(|| slab::text_as_json(slab, f)).flatten() {
+        // A pair of JSON and CSV or Parquet: a text cell that is one JSON
+        // object or array may equal a nested value, which is read past its
+        // spacing, so it is hashed as read that way; see `same_bytes`.
+        h = hash_bytes(&json, h, mul);
+        len = json.len() as u64;
     } else if !field::is_escaped(f) {
         // Nothing to unescape, so the bytes are the value and eight of them can
         // be taken at a time. See `hash_bytes`.
@@ -445,8 +509,15 @@ fn rows_to_positions_with(part: &mut [u32], pos_mask: u32, words: &[u64], before
 /// normalising option and no test hook, which the sweep asks once rather than
 /// once a row. The same number by the same steps; `None` for an escaped key,
 /// which goes through `key_hash` and its decoder.
+///
+/// With `JSON_TEXT`, also `None` for a key that may be a JSON object or array
+/// (its first byte a bracket or space): `key_hash` hashes it as read as JSON.
 #[inline(always)]
-fn key_hash_plain(data: &[u8], keys: &[Field], k: keyhash::Keys) -> Option<u64> {
+fn key_hash_plain<const JSON_TEXT: bool>(
+    data: &[u8],
+    keys: &[Field],
+    k: keyhash::Keys,
+) -> Option<u64> {
     let mut h = k.start;
     for &f in keys {
         if !field::is_real(f) || field::len_of(f) == 0 {
@@ -457,6 +528,14 @@ fn key_hash_plain(data: &[u8], keys: &[Field], k: keyhash::Keys) -> Option<u64> 
             return None;
         }
         let (at, len) = (field::offset_of(f), field::len_of(f));
+        if JSON_TEXT
+            && matches!(
+                data.get(at),
+                Some(b'{' | b'[' | b' ' | b'\t' | b'\n' | b'\r')
+            )
+        {
+            return None;
+        }
         h = hash_bytes(data.get(at..at + len)?, h, k.mul);
         h = keyhash::word(h, len as u64, k.mul);
     }
@@ -468,8 +547,9 @@ fn key_hash(slab: &Slab, fields: &[Field], key_size: usize, opt: &Options) -> u6
     let mut h = k.start;
     // Hoisted from per-field: the options do not change mid-sweep.
     let normalise = needs_normalising(opt);
+    let json_text = slab.json_text();
     for f in &fields[..key_size] {
-        h = hash_field(slab, *f, opt, normalise, h, k.mul);
+        h = hash_field(slab, *f, opt, normalise, json_text, h, k.mul);
     }
     match narrow_hash() {
         Some(mask) => {
@@ -906,7 +986,11 @@ struct Chunk {
 impl Chunk {
     /// Pushes a row's offset and hash with a single capacity check, instead of
     /// two separate fallible pushes. The sweep does this for every row, so the
-    /// doubled branch and `Result` handling was measurable.
+    /// doubled branch and `Result` handling was measurable. Inlined: called
+    /// from each of the sweep's two copies (`sweep_chunks_as`), the compiler
+    /// kept it out of line, 13M instructions of calls on the perf gate's
+    /// 200k-row CSV pair.
+    #[inline(always)]
     fn push(&mut self, at: u64, hash: u32) -> Result<()> {
         if self.at.len() == self.at.capacity() {
             alloc::room(&mut self.at, 1, "one offset per row")?;
@@ -2019,6 +2103,27 @@ fn sweep_chunks(
     opt: &Options,
     sink: Option<&RowSink<'_>>,
 ) -> Vec<Result<(Chunk, usize, Option<Part>)>> {
+    // Chosen once for the file, so that a pair with no JSON reading of text
+    // keys asks nothing more of a row than it did.
+    if side.slab.json_text() {
+        sweep_chunks_as::<true>(side, keys, whole, bounds, key_size, opt, sink)
+    } else {
+        sweep_chunks_as::<false>(side, keys, whole, bounds, key_size, opt, sink)
+    }
+}
+
+/// [`sweep_chunks`], `JSON_TEXT` being whether a text key cell that may be a
+/// JSON object or array is hashed as one (`slab::text_as_json`).
+#[allow(clippy::type_complexity)]
+fn sweep_chunks_as<const JSON_TEXT: bool>(
+    side: &Side,
+    keys: &RowParser,
+    whole: &RowParser,
+    bounds: &[usize],
+    key_size: usize,
+    opt: &Options,
+    sink: Option<&RowSink<'_>>,
+) -> Vec<Result<(Chunk, usize, Option<Part>)>> {
     let data = side.slab.data();
     let parts = bounds.len() - 1;
     // Asked once for the file rather than once a row (see `key_hash_plain`).
@@ -2073,11 +2178,12 @@ fn sweep_chunks(
                      use --engine native"
                 )));
             }
-            let hash =
-                match plain_keys.then(|| key_hash_plain(data, &fields[..key_size], hash_keys)) {
-                    Some(Some(h)) => h,
-                    _ => key_hash(&side.slab, &fields, key_size, opt),
-                };
+            let hash = match plain_keys
+                .then(|| key_hash_plain::<JSON_TEXT>(data, &fields[..key_size], hash_keys))
+            {
+                Some(Some(h)) => h,
+                _ => key_hash(&side.slab, &fields, key_size, opt),
+            };
             // Folded here, once, at the sweep: every later use -- the
             // tag, the slot, the equality filter -- reads the stored
             // value, so a stored hash is always the same 32 bits.
@@ -4034,8 +4140,11 @@ fn compare_fused(
         Input::Text { delimiter, .. } => *delimiter,
         Input::Parquet { .. } => b',',
     };
+    let json_text = a_input.is_json() != b_input.is_json();
     let mut b = b_input.project(wanted, key_size, total)?;
     let mut a = a_input.project(wanted, key_size, total)?;
+    b.slab.set_json_text(json_text);
+    a.slab.set_json_text(json_text);
     // This path is taken because the pair does not fit comfortably: each
     // file's pages are let go of once read (`Slab::release_as_read`).
     b.slab.release_as_read();
@@ -4496,6 +4605,13 @@ impl Input {
         }
     }
 
+    /// Whether the file is JSON: a pair of one JSON and one CSV or Parquet
+    /// file reads a text cell that holds one JSON object or array as that
+    /// value against a nested one (`slab::text_as_json`).
+    fn is_json(&self) -> bool {
+        matches!(self, Input::Text { slab, .. } if slab.dialect() == Dialect::Json)
+    }
+
     /// The mapped size, for the fused join's size gate. `None` for Parquet:
     /// the fused join is text only.
     fn text_bytes(&self) -> Option<u64> {
@@ -4618,8 +4734,10 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let per_file = (total / 2).max(1);
     let first = AtomicU64::new(UNCOUNTED);
     let fits = fits_counted(crate::memory::heap_limit(), &first);
+    let json_text = a_input.is_json() != b_input.is_json();
     let prepare = |input: Input, tag: &'static str| -> Result<(Side, RowIndex)> {
-        let side = input.project(&wanted, key_size, per_file)?;
+        let mut side = input.project(&wanted, key_size, per_file)?;
+        side.slab.set_json_text(json_text);
         let fits = fits
             .as_ref()
             .map(|f| f as &(dyn Fn(usize) -> Result<()> + Sync));

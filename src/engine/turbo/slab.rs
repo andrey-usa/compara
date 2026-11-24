@@ -47,6 +47,10 @@ pub(super) struct Slab {
     start: usize,
     /// Whether `release` lets go of pages; see `release_as_read`.
     releasing: bool,
+    /// The run compares this file with one of the other kind, JSON with CSV
+    /// or Parquet, so a text cell that holds one JSON object or array is
+    /// hashed as that value; see [`text_as_json`].
+    json_text: bool,
 }
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -81,6 +85,7 @@ impl Slab {
             dialect: Dialect::Csv,
             start,
             releasing: false,
+            json_text: false,
         })
     }
 
@@ -182,6 +187,7 @@ impl Slab {
             dialect,
             start: 0,
             releasing: false,
+            json_text: false,
         }
     }
 
@@ -191,6 +197,23 @@ impl Slab {
 
     pub(super) fn dialect(&self) -> Dialect {
         self.dialect
+    }
+
+    /// Marks the file as compared with one of the other kind; see
+    /// [`text_as_json`].
+    pub(super) fn set_json_text(&mut self, on: bool) {
+        self.json_text = on;
+    }
+
+    /// Whether a text cell of this file that holds one JSON object or array
+    /// is hashed as that value.
+    pub(super) fn json_text(&self) -> bool {
+        self.json_text
+    }
+
+    /// Whether the field is a JSON object or array, read past its spacing.
+    pub(super) fn is_nested(&self, f: Field) -> bool {
+        self.mode(f) == Mode::Nested
     }
 
     pub(super) fn data(&self) -> &[u8] {
@@ -562,13 +585,282 @@ pub(super) fn same_bytes(a: &Slab, x: Field, b: &Slab, y: Field) -> bool {
 /// 0.85% of a turbo compare of the perf gate's 200k-row CSV pair.
 #[inline(never)]
 fn same_escaped(a: &Slab, x: Field, b: &Slab, y: Field) -> bool {
+    let (mx, my) = (a.mode(x), b.mode(y));
     // The same bytes read the same way are the same value, and two nested
     // values a writer spelled alike, as one writer does, are equal without
     // reading them a byte at a time.
-    if a.mode(x) == b.mode(y) && a.raw(x) == b.raw(y) {
+    if mx == my && a.raw(x) == b.raw(y) {
         return true;
     }
+    if mx == Mode::Nested && my != Mode::Nested && b.dialect != Dialect::Json {
+        return nested_and_text(a, x, b, y);
+    }
+    if my == Mode::Nested && mx != Mode::Nested && a.dialect != Dialect::Json {
+        return nested_and_text(b, y, a, x);
+    }
     a.logical(x).eq(b.logical(y))
+}
+
+/// Whether a nested JSON value, `n` of slab `ns`, is the text cell `t` of a
+/// CSV or Parquet file: the text read as JSON where it is one JSON object or
+/// array ([`text_as_json`]), as written where it is not.
+///
+/// A CSV cell or a Parquet string has no type but text, so the JSON that
+/// `json.dumps` or a database wrote into one is spaced as its writer spaced
+/// it; read as written, `{"a": [1, 2]}` in a CSV cell differed from the same
+/// value in an NDJSON file, which is read past its spacing. A JSON string is
+/// left alone: its file says it is a string, not an object.
+fn nested_and_text(ns: &Slab, n: Field, ts: &Slab, t: Field) -> bool {
+    // Text already spelled as the nested value reads is that value, JSON or
+    // not (the reading of JSON so spelled is itself), and told without a
+    // copy; spaced text is told from it within a few bytes.
+    if ns.logical(n).eq(ts.logical(t)) {
+        return true;
+    }
+    let Some(text) = text_of_json(ts, t) else {
+        return false;
+    };
+    match json_text(&text) {
+        Some(json) => ns.logical(n).eq(LogicalBytes::new(json, Mode::Nested)),
+        None => false,
+    }
+}
+
+/// A text field's value read as JSON, its spacing dropped and its strings
+/// spelled one way as a nested value's are ([`LogicalBytes::next_nested`]),
+/// where the value is one JSON object or array and nothing else, space aside.
+/// `None` for anything else, a nested field included (its own bytes already
+/// read that way).
+///
+/// Asked only of a run that compares JSON with CSV or Parquet: for a cell
+/// against a nested value, and for the hash of every text key cell, so that
+/// two cells equal by any route hash alike.
+pub(super) fn text_as_json(slab: &Slab, f: Field) -> Option<Vec<u8>> {
+    let text = text_of_json(slab, f)?;
+    let json = json_text(&text)?;
+    let mut out = Vec::with_capacity(json.len());
+    out.extend(LogicalBytes::new(json, Mode::Nested));
+    Some(out)
+}
+
+/// A text field's value, if it may be JSON: its first byte past space a
+/// bracket. Borrowed where it has no escape to undo; else decoded into a
+/// buffer sized for it, so the copy is made in one allocation.
+fn text_of_json(slab: &Slab, f: Field) -> Option<std::borrow::Cow<'_, [u8]>> {
+    let mode = slab.mode(f);
+    if mode == Mode::Nested || !is_real(f) {
+        return None;
+    }
+    let raw = slab.raw(f);
+    if mode == Mode::Raw {
+        let first = raw.iter().find(|&&b| !is_space(b));
+        return matches!(first, Some(b'{' | b'[')).then_some(raw.into());
+    }
+    // Most cells are not JSON: told by their first byte before any is copied.
+    if !matches!(slab.logical(f).find(|&b| !is_space(b)), Some(b'{' | b'[')) {
+        return None;
+    }
+    let mut text = Vec::with_capacity(raw.len());
+    text.extend(slab.logical(f));
+    Some(text.into())
+}
+
+/// `text` as [`text_as_json`] reads it, for a value already decoded: the
+/// normalising route (`--trim`, `--ignore-case`), which compares strings.
+pub(super) fn str_as_json(text: &str) -> Option<String> {
+    let json = json_text(text.as_bytes())?;
+    Some(shown(LogicalBytes::new(json, Mode::Nested).collect()))
+}
+
+/// `text` without the space around it, if it is one JSON object or array.
+fn json_text(text: &[u8]) -> Option<&[u8]> {
+    let from = text.iter().position(|&b| !is_space(b))?;
+    let to = text.iter().rposition(|&b| !is_space(b))? + 1;
+    let text = &text[from..to];
+    (matches!(text[0], b'{' | b'[') && one_json_value(text)).then_some(text)
+}
+
+/// Whether `text` is one JSON object or array, by RFC 8259's grammar, with
+/// nothing after it; `text` starts with its bracket and ends without space.
+///
+/// Strict where the nested reading is lenient: a cell is read as JSON only
+/// when it is JSON, so text that merely looks like it (`[1 2]`, `{a: 1}`,
+/// `["\x"]`) stays as written. Iterative, the open brackets on a stack of
+/// their own: a cell's depth is bounded by its length, not by the call stack.
+fn one_json_value(text: &[u8]) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Want {
+        Value,
+        ValueOrClose,
+        Name,
+        NameOrClose,
+        Colon,
+        Next,
+    }
+    let n = text.len();
+    let mut open: Vec<u8> = Vec::new();
+    let mut want = Want::Value;
+    let mut at = 0;
+    loop {
+        while at < n && is_space(text[at]) {
+            at += 1;
+        }
+        if at == n {
+            return open.is_empty() && want == Want::Next;
+        }
+        let b = text[at];
+        match want {
+            Want::Value | Want::ValueOrClose => {
+                if want == Want::ValueOrClose && b == b']' {
+                    open.pop();
+                    at += 1;
+                    want = Want::Next;
+                    continue;
+                }
+                match b {
+                    b'{' => {
+                        open.push(b'{');
+                        at += 1;
+                        want = Want::NameOrClose;
+                    }
+                    b'[' => {
+                        open.push(b'[');
+                        at += 1;
+                        want = Want::ValueOrClose;
+                    }
+                    b'"' => match json_string_end(text, at) {
+                        Some(end) => {
+                            at = end;
+                            want = Want::Next;
+                        }
+                        None => return false,
+                    },
+                    b'-' | b'0'..=b'9' => match json_number_end(text, at) {
+                        Some(end) => {
+                            at = end;
+                            want = Want::Next;
+                        }
+                        None => return false,
+                    },
+                    _ => {
+                        let literal: &[u8] = match b {
+                            b't' => b"true",
+                            b'f' => b"false",
+                            b'n' => b"null",
+                            _ => return false,
+                        };
+                        if !text[at..].starts_with(literal) {
+                            return false;
+                        }
+                        at += literal.len();
+                        want = Want::Next;
+                    }
+                }
+            }
+            Want::Name | Want::NameOrClose => {
+                if want == Want::NameOrClose && b == b'}' {
+                    open.pop();
+                    at += 1;
+                    want = Want::Next;
+                    continue;
+                }
+                if b != b'"' {
+                    return false;
+                }
+                match json_string_end(text, at) {
+                    Some(end) => {
+                        at = end;
+                        want = Want::Colon;
+                    }
+                    None => return false,
+                }
+            }
+            Want::Colon => {
+                if b != b':' {
+                    return false;
+                }
+                at += 1;
+                want = Want::Value;
+            }
+            Want::Next => {
+                let Some(&top) = open.last() else {
+                    // Something after the value.
+                    return false;
+                };
+                at += 1;
+                match (b, top) {
+                    (b',', b'{') => want = Want::Name,
+                    (b',', _) => want = Want::Value,
+                    (b'}', b'{') | (b']', b'[') => {
+                        open.pop();
+                    }
+                    _ => return false,
+                }
+            }
+        }
+    }
+}
+
+/// Past the JSON string whose quote is at `at`: its escapes JSON's own, no
+/// control character as itself.
+fn json_string_end(text: &[u8], mut at: usize) -> Option<usize> {
+    at += 1;
+    loop {
+        match *text.get(at)? {
+            b'"' => return Some(at + 1),
+            b'\\' => match *text.get(at + 1)? {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => at += 2,
+                b'u' => {
+                    let digits = text.get(at + 2..at + 6)?;
+                    if !digits.iter().all(u8::is_ascii_hexdigit) {
+                        return None;
+                    }
+                    at += 6;
+                }
+                _ => return None,
+            },
+            0..=0x1F => return None,
+            _ => at += 1,
+        }
+    }
+}
+
+/// Past the JSON number that starts at `at`: `-`, then `0` or digits not led
+/// by one, then a fraction and an exponent, each optional.
+fn json_number_end(text: &[u8], mut at: usize) -> Option<usize> {
+    let digits = |at: &mut usize| {
+        let from = *at;
+        while text.get(*at).is_some_and(u8::is_ascii_digit) {
+            *at += 1;
+        }
+        *at > from
+    };
+    if text.get(at) == Some(&b'-') {
+        at += 1;
+    }
+    match text.get(at) {
+        Some(b'0') => at += 1,
+        Some(b'1'..=b'9') => {
+            digits(&mut at);
+        }
+        _ => return None,
+    }
+    if text.get(at) == Some(&b'.') {
+        at += 1;
+        if !digits(&mut at) {
+            return None;
+        }
+    }
+    if matches!(text.get(at), Some(b'e' | b'E')) {
+        at += 1;
+        if matches!(text.get(at), Some(b'+' | b'-')) {
+            at += 1;
+        }
+        if !digits(&mut at) {
+            return None;
+        }
+    }
+    Some(at)
 }
 
 /// Decoded bytes as text: UTF-8 as it is, and a lone surrogate as the
@@ -770,6 +1062,97 @@ mod tests {
         let slab = Slab::owned(text.to_vec(), Dialect::Json);
         let f = pack(6, (text.len() - 8) as u64, true);
         assert_eq!(text_of(&slab, f), r#"{"a": 1}"#);
+    }
+
+    #[test]
+    fn text_is_read_as_json_only_where_it_is_one_json_value() {
+        for json in [
+            "{}",
+            "[]",
+            r#"{"a": [1, -0.5e+3, true, false, null, "x\"\\\/\b\f\n\r\t\u00e9"], "": {}}"#,
+            " \t[ [ [ ] ] ]\r\n",
+            r#"[0, -0, 1E5, 10.25]"#,
+        ] {
+            let text = json.trim_matches(|c| " \t\r\n".contains(c));
+            assert!(one_json_value(text.as_bytes()), "{json}");
+        }
+        for not in [
+            "[1 2]",
+            "[1,]",
+            "{a: 1}",
+            r#"{"a" 1}"#,
+            r#"{"a":1,}"#,
+            "[01]",
+            "[1.]",
+            "[.5]",
+            "[1e]",
+            "[+1]",
+            r#"["\x"]"#,
+            r#"["\u00g0"]"#,
+            "[\"a\tb\"]",
+            "[\"open]",
+            "[1]]",
+            "[1] [2]",
+            "[1] x",
+            "{\"a\":1]",
+            "[1}",
+            "[tru]",
+            "[",
+        ] {
+            assert!(!one_json_value(not.as_bytes()), "{not}");
+        }
+        // Deep, and no deeper than the cell: no recursion to overflow.
+        let deep = format!("{}{}", "[".repeat(200_000), "]".repeat(200_000));
+        assert!(one_json_value(deep.as_bytes()));
+        assert!(!one_json_value(&deep.as_bytes()[1..]));
+    }
+
+    #[test]
+    fn a_text_cell_holding_json_reads_as_the_nested_value() {
+        let cell = |text: &[u8], dialect: Dialect| {
+            let slab = Slab::owned(text.to_vec(), dialect);
+            let f = pack(0, text.len() as u64, dialect != Dialect::Raw);
+            text_as_json(&slab, f).map(|b| String::from_utf8(b).expect("utf-8"))
+        };
+        // A CSV cell's doubled quotes undone first, then read as JSON.
+        assert_eq!(
+            cell(br#"{""a"": [1, 2], ""s"": ""caf\u00e9""}"#, Dialect::Csv).as_deref(),
+            Some("{\"a\":[1,2],\"s\":\"caf\u{e9}\"}")
+        );
+        assert_eq!(
+            cell(b" [ 1 , {} ] ", Dialect::Raw).as_deref(),
+            Some("[1,{}]")
+        );
+        assert_eq!(cell(b"[1 2]", Dialect::Raw), None);
+        assert_eq!(cell(b"plain", Dialect::Raw), None);
+        assert_eq!(cell(br#""""a"""#, Dialect::Csv), None);
+        // As a nested value's own text reads.
+        let (slab, f) = member("{ \"a\" : [1, 2], \"s\": \"caf\\u00e9\" }");
+        let nested: Vec<u8> = slab.logical(f).collect();
+        assert_eq!(
+            cell(br#"{""a"": [1, 2], ""s"": ""caf\u00e9""}"#, Dialect::Csv).map(String::into_bytes),
+            Some(nested)
+        );
+        assert_eq!(text_as_json(&slab, f), None, "a nested field reads itself");
+    }
+
+    #[test]
+    fn a_nested_value_and_a_csv_cell_of_its_text_are_the_same_bytes() {
+        let (a, x) = member("{\"a\":[1,2]}");
+        let text = br#"{""a"": [1, 2]}"#;
+        let csv = Slab::owned(text.to_vec(), Dialect::Csv);
+        let y = pack(0, text.len() as u64, true);
+        assert!(same_bytes(&a, x, &csv, y));
+        assert!(same_bytes(&csv, y, &a, x));
+        // A JSON string holding the text is a string.
+        let text = br#"{"s":"{\"a\": [1, 2]}"}"#;
+        let json = Slab::owned(text.to_vec(), Dialect::Json);
+        let s = pack(6, (text.len() - 8) as u64, true);
+        assert!(!same_bytes(&a, x, &json, s));
+        // Not JSON: as written.
+        let text = b"{a: [1, 2]}";
+        let raw = Slab::owned(text.to_vec(), Dialect::Raw);
+        assert!(!same_bytes(&a, x, &raw, pack(0, text.len() as u64, false)));
     }
 
     #[test]
