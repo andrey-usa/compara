@@ -77,16 +77,23 @@ from one machine and one sitting only.
 ### The performance gate
 
 Every pull request counts the instructions `compare` takes, for each engine,
-on 50k and 200k generated rows a side, at its head and at its base:
+on 50k and 200k generated rows a side, and with turbo on 200k rows of NDJSON
+written compactly (`--format ndjson`) and as Python's `json.dumps` writes
+them by default (each line loaded and dumped again: `, ` and `: `), at its
+head and at its base:
 
 ```sh
 python3 scripts/perf_gate.py --head target/release/compara --base /path/to/base/compara \
-  --small 50k_a.csv 50k_b.csv --large 200k_a.csv 200k_b.csv -- -k account_id,txn_id -i updated_at
+  --small 50k_a.csv 50k_b.csv --large 200k_a.csv 200k_b.csv \
+  --json 200k_a.ndjson 200k_b.ndjson --json-spaced 200ksp_a.ndjson 200ksp_b.ndjson \
+  -- -k account_id,txn_id -i updated_at
 ```
 
-It fails when an engine's count rises more than 5% over the base's, or when
-four times the rows cost more than 5.5 times the instructions (linear and
-n log n work sits at 4.0-4.2, quadratic at 16). A count repeats to a few
+It fails when a count rises more than 5% over the base's, when four times
+the rows cost more than 5.5 times the instructions (linear and n log n work
+sits at 4.0-4.2, quadratic at 16), or when the spaced NDJSON costs more than
+1.1 times the compact in the head (about 1.04 when each spaced row is read
+as a compact one is; about 2 when it is not). A count repeats to a few
 hundredths of a percent where a time on a shared runner varies by two or
 three times, so the bounds can be tight. `scripts/icount.py` counts one
 command: with the processor's counter where the kernel offers one, else with

@@ -2,9 +2,10 @@
 """perf_gate: hold a change to the work a comparison takes, not to a timer.
 
     perf_gate.py --head BIN [--base BIN] --small A B --large A B
+                 [--json A B [--json-spaced A B]]
                  [--engines sortmerge,turbo] [--counter auto|perf|cachegrind]
-                 [--max-ratio 5.5] [--max-growth 0.05] [--require]
-                 -- COMPARE OPTIONS (keys, ignores)
+                 [--max-ratio 5.5] [--max-growth 0.05] [--max-spaced 1.1]
+                 [--require] -- COMPARE OPTIONS (keys, ignores)
 
 For each engine it counts the instructions of `compara compare` (icount.py)
 on two fixed pairs of files, the large one four times the rows of the small:
@@ -18,8 +19,22 @@ on two fixed pairs of files, the large one four times the rows of the small:
            the same way. This catches a constant slowdown, such as an extra
            pass, which the ratio does not see.
 
+With --json, an NDJSON pair is counted too, by turbo (the engine that reads
+JSON), and held to the same growth bound. --json-spaced gives the same rows
+as Python's json.dumps writes them by default, with `, ` and `: ` between
+tokens; it is held to the growth bound and to one more:
+
+  spaced   the spaced pair must cost under --max-spaced times the compact
+           one, both counted on the head. The spaces are a few bytes a
+           member, so they cost little when a spaced row is read as a
+           compact one is (about 1.04x); a reader that tells members by
+           their bytes only when they are written compactly costs about
+           twice. The bound is that 1.04 and the growth bound's 5% on top.
+           It holds whatever the base: against a base that read spaced rows
+           at twice the cost, growth alone would let most of that back in.
+
 Counts repeat to about 0.03% between runs (threads and the per-process hash
-keys included), so both bounds hold on a busy shared runner. The hash keys
+keys included), so the bounds hold on a busy shared runner. The hash keys
 are fixed (COMPARA_HASH_SEED) all the same, and sortmerge's batch is made
 small (COMPARA_SORTMERGE_BATCH_BYTES, 4 MiB) so that both sizes take its
 spill and merge path: at its default batch the small file is sorted in
@@ -64,14 +79,20 @@ def main():
     ap.add_argument("--base", help="the binary it is compared with")
     ap.add_argument("--small", nargs=2, required=True, metavar=("A", "B"))
     ap.add_argument("--large", nargs=2, required=True, metavar=("A", "B"))
+    ap.add_argument("--json", nargs=2, metavar=("A", "B"), help="an NDJSON pair, counted by turbo")
+    ap.add_argument("--json-spaced", nargs=2, metavar=("A", "B"),
+                    help="the --json rows as json.dumps writes them by default")
     ap.add_argument("--engines", default="sortmerge,turbo")
     ap.add_argument("--counter", default="auto", choices=["auto", "perf", "cachegrind"])
     ap.add_argument("--max-ratio", type=float, default=5.5)
     ap.add_argument("--max-growth", type=float, default=0.05)
+    ap.add_argument("--max-spaced", type=float, default=1.1)
     ap.add_argument("--require", action="store_true", help="fail when there is no counter")
     ap.add_argument("--env", action="append", default=[], help="NAME=value for the head only")
     ap.add_argument("compare_args", nargs="*")
     a = ap.parse_args()
+    if a.json_spaced and not a.json:
+        ap.error("--json-spaced is held to the --json pair: give both")
     head_env = dict(e.split("=", 1) for e in a.env)
 
     counter = a.counter
@@ -99,6 +120,24 @@ def main():
                     bad.append(f"{eng}, {size}: {g:+.2%} instructions against the base (bound +{a.max_growth:.0%})")
         rows.append(line)
 
+    json_rows = []
+    if a.json:
+        extra = [*a.compare_args, "--engine", "turbo"]
+        pairs = [("compact", a.json)] + ([("spaced", a.json_spaced)] if a.json_spaced else [])
+        hj = {p: count(counter, a.head, files, extra, head_env)["instructions"] for p, files in pairs}
+        bj = {p: count(counter, a.base, files, extra, {})["instructions"] for p, files in pairs} if a.base else {}
+        for p, _ in pairs:
+            line = [p, f"{hj[p]:,}", f"{hj[p] / hj['compact']:.2f}x"]
+            if a.base:
+                g = hj[p] / bj[p] - 1
+                line += [f"{bj[p]:,}", f"{bj[p] / bj['compact']:.2f}x", f"{g:+.2%}"]
+                if g > a.max_growth:
+                    bad.append(f"NDJSON {p}: {g:+.2%} instructions against the base (bound +{a.max_growth:.0%})")
+            json_rows.append(line)
+        if "spaced" in hj and hj["spaced"] / hj["compact"] > a.max_spaced:
+            bad.append(f"NDJSON spaced: {hj['spaced'] / hj['compact']:.2f}x the instructions of the same rows "
+                       f"written compactly (bound {a.max_spaced:.2f}x)")
+
     cols = ["engine", "small", "large", "ratio"]
     if a.base:
         cols += ["base small", "base large", "change small", "change large"]
@@ -115,6 +154,15 @@ def main():
     for r in rows:
         print("| " + " | ".join(r) + " |")
     print()
+    if json_rows:
+        cols = ["NDJSON, turbo", "head", "/ compact"]
+        if a.base:
+            cols += ["base", "base / compact", "change"]
+        print("| " + " | ".join(cols) + " |")
+        print("|" + "---|" * len(cols))
+        for r in json_rows:
+            print("| " + " | ".join(r) + " |")
+        print()
     for b in bad:
         print(f"FAIL: {b}")
     print("perf gate: " + ("FAILED" if bad else "ok"))

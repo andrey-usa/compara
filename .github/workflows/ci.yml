@@ -117,8 +117,10 @@ jobs:
 
   # The work a comparison takes, held to a base: instructions counted by
   # valgrind (exact, so a busy runner can't move them) on fixed files at two
-  # sizes, for each engine. Fails on more than 5% over the base, or on a cost
-  # that grows faster than the rows (scripts/perf_gate.py). The base is the
+  # sizes, for each engine, and on 200k rows of NDJSON written compactly and
+  # as Python's json.dumps spaces it. Fails on more than 5% over the base, on
+  # a cost that grows faster than the rows, or on spaced NDJSON costing over
+  # 1.1 times the compact (scripts/perf_gate.py). The base is the
   # pull request's; on a push to next the latest release, so a slowdown
   # shows at the commit that brought it; on a dispatch the tag in perf_base.
   perf-gate:
@@ -170,9 +172,20 @@ jobs:
         run: |
           ./target/release/compara-gen-data --rows 200k --out-dir gate
           for s in a b; do head -n 50001 "gate/200k_$s.csv" > "gate/50k_$s.csv"; done
+          ./target/release/compara-gen-data --rows 200k --format ndjson --out-dir gate
+          # The same rows as json.dumps writes them by default: `, ` and `: `.
+          python3 - gate/200k_a.ndjson gate/200k_b.ndjson <<'PY'
+          import json, sys
+          for path in sys.argv[1:]:
+              out = path.replace("200k_", "200ksp_")
+              with open(path, encoding="utf-8") as src, open(out, "w", encoding="utf-8") as dst:
+                  for line in src:
+                      dst.write(json.dumps(json.loads(line)) + "\n")
+          PY
       - name: Gate
         run: |
-          files=(--small gate/50k_a.csv gate/50k_b.csv --large gate/200k_a.csv gate/200k_b.csv)
+          files=(--small gate/50k_a.csv gate/50k_b.csv --large gate/200k_a.csv gate/200k_b.csv
+            --json gate/200k_a.ndjson gate/200k_b.ndjson --json-spaced gate/200ksp_a.ndjson gate/200ksp_b.ndjson)
           python3 scripts/perf_gate.py --head gate/head --base gate/base \
             --counter cachegrind --require "${files[@]}" \
             -- -k account_id,txn_id -i updated_at | tee -a "$GITHUB_STEP_SUMMARY"
