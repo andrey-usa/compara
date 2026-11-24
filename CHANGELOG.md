@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- A Hive part whose rows hold a partition column themselves gives it the
+  directory's value in every row, as DuckDB reads such a table (CSV, JSON
+  and Parquet parts) and Polars (Parquet parts). A CSV or Parquet part kept
+  its own value, and a JSON part went by its first row: with the column
+  there, rows without it had none; without it, the directory's value
+  replaced the later rows' own.
 - JSON is compared with fewer instructions: where the CPU has AVX2 (x86-64)
   or NEON (ARM), the walk over each row's keys reads its bytes a vector
   register at a time, and tells each member by one compare; elsewhere it
@@ -37,6 +43,20 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A nested JSON value against a CSV cell or a Parquet string holding the
+  same JSON as `json.dumps` writes it (`{"a": [1, 2]}`) was changed, and
+  equal only when the JSON was compact: the cell was read as written, the
+  nested value past its spacing. A text cell that is one JSON object or
+  array is now read the same way against a nested value, key columns too;
+  other text, and a JSON string, is compared as written.
+- A partitioned JSON part with a row that never closes (a brace missing, a
+  string left open) is refused by its own name and the line the row opens
+  on. The rows from it on had been given no partition values, and the
+  error named a line of the joined parts, in a later part.
+- A lone surrogate in a nested JSON value (`["\ud800"]`) is shown as its
+  escape in the report and the export, where every one read as U+FFFD:
+  two different values looked alike, and under `--trim` or
+  `--ignore-case` they were equal.
 - On Windows, a URL whose server refused the connection was reported as the
   raw error, without saying the connection was refused or that a proxy was
   set: Windows words it "actively refused", or in the language it is set
