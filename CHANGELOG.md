@@ -98,6 +98,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- What a run writes into its own temporary directories (`sortmerge`'s
+  sorted runs, an export or an output on its way to object storage) is
+  made, read and removed through the directory it created, never by its
+  name: in a temporary directory others can write to, a name swapped for a
+  link or another directory after it was made had sent those files there,
+  and the run's clean-up had removed that directory. A new temporary
+  directory must be this user's, readable by no one else. For the library:
+  `source::upload` takes an open `File` instead of a path.
+
 - A URL is shown by its scheme, host and path, with `…` for a password
   before its host (`http://…@host/`) and for its query string or fragment
   (`https://host/a.csv?…`), wherever compara names one: errors, the step
