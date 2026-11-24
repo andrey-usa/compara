@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- NDJSON written with a space after each comma and colon, as Python's
+  `json.dumps` writes it by default, is compared about as fast as compact
+  NDJSON, where it had taken about twice as long: each member is told by
+  its name and separators as the file's first row spells them. Compact
+  NDJSON, and names written with escapes, are read a little faster too.
 - The release binaries, the perf gate and the benchmarks are built by one
   named rustc, 1.100.0 (`rust-toolchain.toml`), where each run took the
   stable Rust of its day, and each names it: a release's notes give the
