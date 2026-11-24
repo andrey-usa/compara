@@ -2760,6 +2760,23 @@ fn refused(lower: &str) -> bool {
     lower.contains("connection refused") || lower.contains("actively refused")
 }
 
+/// Whether one of `e`'s causes is an operating-system error of `kind`. The
+/// kind is the same on every system and in every language, where the text is
+/// not: Windows words its errors in the language it is set up in, so a German
+/// one refuses a connection without the English words [`refused`] reads.
+fn caused_by(e: &reqwest::Error, kind: std::io::ErrorKind) -> bool {
+    let mut cause = std::error::Error::source(e);
+    while let Some(c) = cause {
+        if c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == kind)
+        {
+            return true;
+        }
+        cause = c.source();
+    }
+    false
+}
+
 /// An HTTP error in plain words, with what caused it (a refused redirect
 /// says why only there).
 ///
@@ -2796,9 +2813,13 @@ fn said(e: &reqwest::Error) -> String {
     .any(|m| lower.contains(m))
     {
         Some("the host name does not resolve")
-    } else if refused(&lower) {
+    } else if refused(&lower) || caused_by(e, std::io::ErrorKind::ConnectionRefused) {
         Some("connection refused (nothing answers on that port)")
-    } else if e.is_connect() && (e.is_timeout() || lower.contains("timed out")) {
+    } else if e.is_connect()
+        && (e.is_timeout()
+            || lower.contains("timed out")
+            || caused_by(e, std::io::ErrorKind::TimedOut))
+    {
         Some("no answer within 30 s")
     } else if e.is_connect() && (lower.contains("certificate") || lower.contains("tls")) {
         Some("the TLS handshake failed (a certificate this system doesn't trust?)")
@@ -3441,6 +3462,33 @@ mod tests {
         assert!(refused(unix));
         assert!(refused(windows));
         assert!(!refused("error sending request: operation timed out"));
+    }
+
+    /// A refused connection is told by its error's kind, which no system's
+    /// language changes, and not only by the words of an English one: a real
+    /// refusal from this system, through every layer of the client.
+    #[test]
+    fn a_refused_connection_is_told_by_its_kind_in_any_language() {
+        // A port nothing listens on: one just given up.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .map(|a| a.port())
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let e = runtime("test")
+            .unwrap()
+            .block_on(client.get(format!("http://127.0.0.1:{port}/")).send())
+            .unwrap_err();
+        assert!(
+            caused_by(&e, std::io::ErrorKind::ConnectionRefused),
+            "{e:?}"
+        );
+        assert!(!caused_by(&e, std::io::ErrorKind::TimedOut), "{e:?}");
+        assert!(
+            said(&e).starts_with("cannot connect: connection refused"),
+            "{}",
+            said(&e)
+        );
     }
 
     #[test]
