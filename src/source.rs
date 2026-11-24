@@ -163,7 +163,7 @@ pub fn reads_file(spec: &str, file: &Path) -> bool {
 impl Source {
     /// Opens `spec` -- a path, `-` or a URL -- as a local file.
     pub fn open(spec: &str, want: &Want) -> Result<Source> {
-        let mut source = if spec == "-" {
+        let source = if spec == "-" {
             Source::stdin()?
         } else if is_remote(spec) {
             Source::remote(spec, want)?
@@ -191,23 +191,34 @@ impl Source {
                 held: None,
             }
         };
+        source.ready()
+    }
+
+    /// What every input goes through once it is a local file: named as
+    /// messages name it, expanded when compressed, and its local file tied to
+    /// what the user gave.
+    fn ready(mut self) -> Result<Source> {
         // Named from here on as messages name it: a URL without its
         // credentials.
-        if let std::borrow::Cow::Owned(shown) = crate::redact::urls(&source.spec) {
-            source.spec = shown;
+        if let std::borrow::Cow::Owned(shown) = crate::redact::urls(&self.spec) {
+            self.spec = shown;
         }
-        source.decompress()?;
-        if source.path != Path::new(&source.spec)
+        #[cfg(all(test, unix))]
+        tests::written(&self.path);
+        self.decompress()?;
+        #[cfg(all(test, unix))]
+        tests::written(&self.path);
+        if self.path != Path::new(&self.spec)
             && let Ok(mut given) = GIVEN.lock()
         {
-            let name = if source.spec == "-" {
+            let name = if self.spec == "-" {
                 "standard input".to_string()
             } else {
-                source.spec.clone()
+                self.spec.clone()
             };
-            given.push((source.path.clone(), name));
+            given.push((self.path.clone(), name));
         }
-        Ok(source)
+        Ok(self)
     }
 
     /// What the caller named: the path, `-`, or the URL with no credential
@@ -283,6 +294,12 @@ impl Source {
     }
 
     fn stdin() -> Result<Source> {
+        Source::spool(&mut std::io::stdin().lock())
+    }
+
+    /// Standard input, or what stands for it in a test, spooled to a
+    /// temporary file.
+    fn spool<R: Read>(input: &mut R) -> Result<Source> {
         let started = Instant::now();
         let (temp, file) = temp_file("stdin")?;
         let mut source = Source {
@@ -294,7 +311,7 @@ impl Source {
             held: None,
         };
         let mut out = BufWriter::with_capacity(1 << 20, crate::memory::WriteBehind::new(file));
-        let n = std::io::copy(&mut std::io::stdin().lock(), &mut out)
+        let n = std::io::copy(input, &mut out)
             .and_then(|n| out.flush().map(|_| n))
             .map_err(|e| Error::new(format!("cannot read standard input: {e}")))?;
         source.stored = n;
@@ -360,7 +377,11 @@ impl Source {
                 .map_err(|e| Error::new(format!("cannot read {}: {e}", self.spec)))?,
         );
         let budget = crate::memory::in_memory_budget();
-        let mut out = match memfd::create() {
+        #[cfg(all(test, unix))]
+        let memory = (!tests::ON_DISK.get()).then(memfd::create).flatten();
+        #[cfg(not(all(test, unix)))]
+        let memory = memfd::create();
+        let mut out = match memory {
             Some(file) => Sink::Memory(file),
             None => Sink::disk(&mut self.temps)?,
         };
@@ -1051,6 +1072,362 @@ impl std::fmt::Display for Human {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::cell::{Cell, RefCell};
+
+    /// What a test does to the name of one of a run's temporary files once
+    /// what it holds is written, before it is read back: the file's tag
+    /// (`stdin`, `download`, ...), the swap, and the file of someone else's
+    /// it swaps in.
+    #[cfg(unix)]
+    type Swap = (&'static str, fn(&Path, &Path), PathBuf);
+
+    /// A row of the tests below: the kind of input, the tag of the
+    /// temporary file it makes, and how it is opened.
+    #[cfg(unix)]
+    type Case<'a> = (
+        &'static str,
+        &'static str,
+        Box<dyn Fn() -> Result<Source> + 'a>,
+    );
+
+    #[cfg(unix)]
+    thread_local! {
+        /// A decompressed input goes to a temporary file, as it does where
+        /// there are no in-memory files or past the memory free.
+        pub(super) static ON_DISK: Cell<bool> = const { Cell::new(false) };
+        static SWAP: RefCell<Option<Swap>> = const { RefCell::new(None) };
+        static SWAPPED: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Where a run's temporary file has been written and is about to be read
+    /// back by what comes next: the input's expansion, the engines, the
+    /// combined file a part goes into.
+    #[cfg(unix)]
+    pub(super) fn written(path: &Path) {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let hit = SWAP.with_borrow(|s| {
+            s.as_ref().is_some_and(|(tag, _, _)| {
+                name.ends_with(&format!("-{tag}")) || name.ends_with(&format!("-{tag}-locked"))
+            })
+        });
+        if hit && let Some((_, swap, theirs)) = SWAP.take() {
+            swap(path, &theirs);
+            SWAPPED.set(Some(path.to_path_buf()));
+        }
+    }
+
+    #[cfg(unix)]
+    fn aside(path: &Path) -> PathBuf {
+        let mut moved = path.as_os_str().to_owned();
+        moved.push(".moved");
+        PathBuf::from(moved)
+    }
+
+    /// Their file moved onto the name, as anyone can where the temporary
+    /// directory is open to all without the sticky bit.
+    #[cfg(unix)]
+    fn onto(path: &Path, theirs: &Path) {
+        std::fs::rename(path, aside(path)).unwrap();
+        std::fs::rename(theirs, path).unwrap();
+    }
+
+    /// A link to their file at the name.
+    #[cfg(unix)]
+    fn link(path: &Path, theirs: &Path) {
+        std::fs::rename(path, aside(path)).unwrap();
+        std::os::unix::fs::symlink(theirs, path).unwrap();
+    }
+
+    /// A's rows, which B has too; and what another user swaps in.
+    #[cfg(unix)]
+    const OURS: &[u8] = b"id,v\n1,a\n2,b\n";
+    #[cfg(unix)]
+    const THEIRS: &[u8] = b"id,v\n1,x\n";
+
+    #[cfg(unix)]
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        e.write_all(bytes).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// What was compared, when `open` makes A with its `tag` file swapped
+    /// by `swap` once written: `ours`, `theirs`, `refused` (the run stopped
+    /// at the swap), or what else came of it.
+    #[cfg(unix)]
+    fn swapped_and_read(
+        scratch: &Path,
+        tag: &'static str,
+        swap: fn(&Path, &Path),
+        open: &dyn Fn() -> Result<Source>,
+    ) -> String {
+        let theirs = scratch.join("theirs.csv");
+        std::fs::write(&theirs, THEIRS).unwrap();
+        let b = scratch.join("b.csv");
+        std::fs::write(&b, OURS).unwrap();
+        SWAP.set(Some((tag, swap, theirs)));
+        let said = |e: Error| {
+            let e = e.to_string();
+            if e.contains("no longer the temporary file") {
+                "refused".to_string()
+            } else {
+                format!("error: {e}")
+            }
+        };
+        let got = match open() {
+            Err(e) => said(e),
+            Ok(a) => {
+                let mut opt = Options::with_key(["id"]);
+                match crate::engine::compare(a.path(), &b, &mut opt) {
+                    Ok(r) if (r.counts.changed, r.counts.added, r.counts.removed) == (0, 0, 0) => {
+                        "ours".to_string()
+                    }
+                    Ok(_) => "theirs".to_string(),
+                    Err(e) => said(e),
+                }
+            }
+        };
+        SWAP.set(None);
+        match SWAPPED.take() {
+            Some(at) => {
+                let _ = std::fs::remove_file(aside(&at));
+                let _ = std::fs::remove_file(&at);
+                got
+            }
+            None => format!("not swapped ({got})"),
+        }
+    }
+
+    /// A run's temporary file -- standard input spooled, an input expanded,
+    /// the files of a directory combined -- is read back after it is
+    /// written. Where anyone may rename in the temporary directory, its name
+    /// may by then be someone else's file, or a link to one: what is read
+    /// must be the file the run wrote, or nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_temporary_file_is_read_back_only_as_the_run_wrote_it() {
+        let scratch =
+            std::env::temp_dir().join(format!("compara-read-back-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir(&scratch).unwrap();
+        let gz = scratch.join("a.csv.gz");
+        std::fs::write(&gz, gzip(OURS)).unwrap();
+        let zst = scratch.join("a.csv.zst");
+        std::fs::write(&zst, zstd::stream::encode_all(OURS, 3).unwrap()).unwrap();
+        let parts = scratch.join("parts");
+        std::fs::create_dir(&parts).unwrap();
+        std::fs::write(parts.join("1.csv"), b"id,v\n1,a\n").unwrap();
+        std::fs::write(parts.join("2.csv"), b"id,v\n2,b\n").unwrap();
+        let spec = |p: &Path| p.to_str().unwrap().to_string();
+        let (gz, zst, parts) = (spec(&gz), spec(&zst), spec(&parts));
+        let cases: [Case; 5] = [
+            (
+                "stdin",
+                "stdin",
+                Box::new(|| Source::spool(&mut &OURS[..])?.ready()),
+            ),
+            (
+                "stdin, gzip",
+                "stdin",
+                Box::new(|| Source::spool(&mut &gzip(OURS)[..])?.ready()),
+            ),
+            (
+                "gzip file",
+                "plain",
+                Box::new(|| Source::open(&gz, &Want::all())),
+            ),
+            (
+                "zstd file",
+                "plain",
+                Box::new(|| Source::open(&zst, &Want::all())),
+            ),
+            (
+                "directory",
+                "combined",
+                Box::new(|| Source::open(&parts, &Want::all())),
+            ),
+        ];
+        // Unswapped, each reads its own.
+        ON_DISK.set(true);
+        let mut got = Vec::new();
+        for (kind, tag, open) in &cases {
+            got.push((
+                *kind,
+                "none",
+                swapped_and_read(&scratch, "none", onto, open),
+            ));
+            for (how, swap) in [("theirs", onto as fn(&Path, &Path)), ("link", link)] {
+                got.push((*kind, how, swapped_and_read(&scratch, tag, swap, open)));
+            }
+        }
+        ON_DISK.set(false);
+        let _ = std::fs::remove_dir_all(&scratch);
+        let want: Vec<_> = got
+            .iter()
+            .map(|&(kind, how, _)| {
+                let read = if how == "none" {
+                    "not swapped (ours)"
+                } else {
+                    "refused"
+                };
+                (kind, how, read.to_string())
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// The same for what a download makes: an object or a URL fetched, and
+    /// the objects under a prefix, fetched into one file or, compressed,
+    /// each to a file of its own first. From a local stand-in for object
+    /// storage (`tests/object_server.py`, skipped where there is no Python),
+    /// in a child -- this test binary again -- whose environment points S3
+    /// at it.
+    #[cfg(all(unix, feature = "cloud"))]
+    #[test]
+    fn a_download_is_read_back_only_as_the_run_wrote_it() {
+        use std::io::BufRead;
+        const CHILD: &str = "COMPARA_TEST_READ_BACK_SERVERS";
+        if let Ok(urls) = std::env::var(CHILD) {
+            let (url, whole) = urls.split_once(' ').unwrap();
+            downloads_swapped(url, whole);
+            return;
+        }
+        let Some(python) = ["python3", "python"].into_iter().find(|p| {
+            std::process::Command::new(p)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        }) else {
+            return;
+        };
+        let root =
+            std::env::temp_dir().join(format!("compara-read-back-objects-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bucket = root.join("b");
+        for dir in ["gz", "plain"] {
+            std::fs::create_dir_all(bucket.join(dir)).unwrap();
+        }
+        std::fs::write(bucket.join("a.csv"), OURS).unwrap();
+        std::fs::write(bucket.join("a.csv.gz"), gzip(OURS)).unwrap();
+        for (name, rows) in [("1.csv", &b"id,v\n1,a\n"[..]), ("2.csv", b"id,v\n2,b\n")] {
+            std::fs::write(bucket.join("plain").join(name), rows).unwrap();
+            std::fs::write(bucket.join("gz").join(format!("{name}.gz")), gzip(rows)).unwrap();
+        }
+        let mut servers = Vec::new();
+        let mut urls = Vec::new();
+        for extra in [&[][..], &["--no-ranges"]] {
+            let mut child = std::process::Command::new(python)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/object_server.py"
+                ))
+                .arg("--root")
+                .arg(&root)
+                .arg("--log")
+                .arg(root.join(format!("log-{}.jsonl", servers.len())))
+                .args(extra)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            urls.push(line.trim().strip_prefix("LISTENING ").unwrap().to_string());
+            servers.push(child);
+        }
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "source::tests::a_download_is_read_back_only_as_the_run_wrote_it",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, urls.join(" "))
+            .env("AWS_ENDPOINT_URL", &urls[0])
+            .env("AWS_ACCESS_KEY_ID", "test")
+            .env("AWS_SECRET_ACCESS_KEY", "test")
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .output()
+            .expect("the test binary runs");
+        for mut server in servers {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// [`a_download_is_read_back_only_as_the_run_wrote_it`], in the child:
+    /// `url` serves ranges, `whole` does not.
+    #[cfg(all(unix, feature = "cloud"))]
+    fn downloads_swapped(url: &str, whole: &str) {
+        let scratch =
+            std::env::temp_dir().join(format!("compara-read-back-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir(&scratch).unwrap();
+        let open = |spec: String| move || Source::open(&spec, &Want::all());
+        let cases: [Case; 6] = [
+            ("url", "download", Box::new(open(format!("{url}/b/a.csv")))),
+            (
+                "url, no ranges",
+                "download",
+                Box::new(open(format!("{whole}/b/a.csv"))),
+            ),
+            (
+                "url, gzip",
+                "download",
+                Box::new(open(format!("{url}/b/a.csv.gz"))),
+            ),
+            (
+                "s3 object",
+                "download",
+                Box::new(open("s3://b/a.csv".into())),
+            ),
+            (
+                "s3 prefix",
+                "combined",
+                Box::new(open("s3://b/plain/".into())),
+            ),
+            (
+                "s3 prefix, gzip",
+                "part",
+                Box::new(open("s3://b/gz/".into())),
+            ),
+        ];
+        let mut got = Vec::new();
+        for (kind, tag, open) in &cases {
+            got.push((
+                *kind,
+                "none",
+                swapped_and_read(&scratch, "none", onto, open),
+            ));
+            for (how, swap) in [("theirs", onto as fn(&Path, &Path)), ("link", link)] {
+                got.push((*kind, how, swapped_and_read(&scratch, tag, swap, open)));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+        let want: Vec<_> = got
+            .iter()
+            .map(|&(kind, how, _)| {
+                let read = if how == "none" {
+                    "not swapped (ours)"
+                } else {
+                    "refused"
+                };
+                (kind, how, read.to_string())
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
 
     #[test]
     fn a_temp_file_with_no_room_is_refused_up_front() {

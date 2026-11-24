@@ -679,6 +679,8 @@ async fn append_whole(
         }))
         .await?;
         for (name, temp, values) in done {
+            #[cfg(all(test, unix))]
+            super::tests::written(temp.path());
             combined.append_file(name, temp.path(), values)?;
         }
     }
