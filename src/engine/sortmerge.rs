@@ -640,9 +640,21 @@ const SPILL_BUFFER: &str = "the buffer a sorted run is written through";
 /// The refusal of a buffer, a row or a table the sort or the merge needs:
 /// they are sized to fit, so only a heap that is full already gets here.
 fn no_room_for(what: &str, bytes: usize) -> Error {
-    crate::alloc::refuse(what, bytes)
-        .without_hint()
-        .context_after(what_to_do(""))
+    refused(what, bytes)
+}
+
+/// [`crate::alloc::refuse`], with what to do. Under a heap limit `refuse` has
+/// said it, in room set aside for the refusal: the heap is full to the byte
+/// here, and writing the same words again, into a string of its own, was the
+/// allocation the refusal aborted on ("memory allocation of 64 bytes failed",
+/// the 2M-row pair at 6 and 9.5 MB). With no limit set, it is the machine
+/// that has no more to give, and that is said here.
+fn refused(what: &str, bytes: usize) -> Error {
+    let refusal = crate::alloc::refuse(what, bytes);
+    if crate::memory::heap_limit().is_some() {
+        return refusal;
+    }
+    refusal.without_hint().context_after(what_to_do(""))
 }
 
 /// A buffer for a run, from the allocator, or the refusal naming `what`.
@@ -933,9 +945,7 @@ impl Ahead {
 /// The refusal of a row the sort has no room for, with no batch left to
 /// spill or wait for.
 fn no_room_to_sort(text: usize, width: usize) -> Error {
-    crate::alloc::refuse("a batch of rows to sort", text + width * 4 + 8)
-        .without_hint()
-        .context_after(what_to_do(""))
+    refused("a batch of rows to sort", text + width * 4 + 8)
 }
 
 /// The refusal of a row the read-ahead has no room for with every block back.
