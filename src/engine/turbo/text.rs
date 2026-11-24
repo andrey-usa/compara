@@ -495,7 +495,16 @@ fn later_keys_swar<const LINES: bool>(
     max_rows: usize,
     budget: &KeyBudget,
 ) -> Result<LaterKeys> {
-    later_keys::<_, LINES>(Swar, slab, lo, hi, known, max_rows, budget)
+    later_keys::<_, LINES>(
+        Swar,
+        |_, pos, _, _, member| (pos, member),
+        slab,
+        lo,
+        hi,
+        known,
+        max_rows,
+        budget,
+    )
 }
 
 /// [`later_keys`], compiled for AVX2 in a baseline x86-64 build, and for NEON on aarch64.
@@ -522,14 +531,21 @@ unsafe fn later_keys_wide<const LINES: bool>(
     max_rows: usize,
     budget: &KeyBudget,
 ) -> Result<LaterKeys> {
-    later_keys::<_, LINES>(w, slab, lo, hi, known, max_rows, budget)
+    // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
+    let run = |data: &[u8], pos, end, packed: &Packed, member| unsafe {
+        spelled_run_wide(w, data, pos, end, packed, member)
+    };
+    later_keys::<_, LINES>(w, run, slab, lo, hi, known, max_rows, budget)
 }
 
 /// [`json_later_keys`] for a file read a line at a time (`LINES`) or framed
-/// by its braces, scanning `scan`'s width.
+/// by its braces, scanning `scan`'s width; `run` goes past the members a
+/// row's bytes tell wholly ([`spelled_run`]), where that width has one.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn later_keys<S: Scan, const LINES: bool>(
     scan: S,
+    run: impl Fn(&[u8], usize, usize, &Packed, usize) -> (usize, usize),
     slab: &Slab,
     lo: usize,
     hi: usize,
@@ -552,6 +568,13 @@ fn later_keys<S: Scan, const LINES: bool>(
     // Each of the first object's members as this piece's rows spell it, so
     // the common row is asked one comparison a member.
     let spelled = spellings::<LINES>(slab, lo, end, open, known);
+    // The same, a register apiece, for the members a row's bytes tell
+    // wholly (`spelled_run`). Wide scans only: a register is what they compare.
+    let packed = if S::WIDE {
+        Packed::new(&spelled, S::STEP)
+    } else {
+        Packed::default()
+    };
     // Names are looked up, not searched for: a file built to carry a new key
     // in every row would otherwise cost the square of its rows. Each to its
     // place in the first object.
@@ -603,6 +626,12 @@ fn later_keys<S: Scan, const LINES: bool>(
         let mut lost = false;
         let mut member = 0usize; // the place of this key in the first object
         loop {
+            // The commonest members, a register at a time: those spelled as
+            // the first row spells them with a string value that holds no
+            // escape. The first member that is not one is the walk's below.
+            if S::WIDE {
+                (pos, member) = run(data, pos, end, &packed, member);
+            }
             // The common member: the comma before it, its name and its
             // colon written as this piece's first row writes them, spaces
             // and all (`spellings`), which go straight to its value.
@@ -817,6 +846,122 @@ fn later_keys<S: Scan, const LINES: bool>(
         rows,
         repeats,
     })
+}
+
+/// The first object's member spellings (`spellings`) laid out for a
+/// register compare: member `i`'s bytes from `step * i`, the rest of its
+/// register zero. A spelling that leaves no room in its register for the
+/// value's opening quote and a byte after it has none (length 0), nor has
+/// a member without one.
+#[derive(Default)]
+struct Packed {
+    bytes: Vec<u8>,
+    /// Each member's spelling length, and a bit for each of its bytes.
+    lens: Vec<(usize, u64)>,
+    step: usize,
+}
+
+impl Packed {
+    fn new(spelled: &[Vec<u8>], step: usize) -> Packed {
+        let mut bytes = vec![0u8; spelled.len() * step];
+        let lens = spelled
+            .iter()
+            .enumerate()
+            .map(|(at, text)| {
+                let n = text.len();
+                if n + 2 > step {
+                    return (0, 0);
+                }
+                bytes[at * step..at * step + n].copy_from_slice(text);
+                (n, (1u64 << n) - 1)
+            })
+            .collect();
+        Packed { bytes, lens, step }
+    }
+}
+
+/// Past the members from `member` on that are written as `packed` spells
+/// them and hold a string with no escape and no line feed, each told by one
+/// register at its start: the spelling compared byte for byte, its value's
+/// opening quote, and the value's closing quote found in the same register.
+/// Where they are and the place of the first member that is not one, which
+/// the walk then reads as it reads every member: this tells only what the
+/// walk would tell of these, a name at its own place and a value that ends
+/// at its quote, so nothing about the row changes but where it is read.
+/// [`spelled_run`], compiled for AVX2 in a baseline x86-64 build, and for
+/// NEON on aarch64; out of the walk's loop, which leaves it its registers.
+///
+/// # Safety
+/// Holding a `Wide` is the proof the CPU has AVX2, or NEON on aarch64; nothing else is required.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        not(any(target_feature = "avx2", target_feature = "avx512bw"))
+    ),
+    target_feature(enable = "avx2,popcnt,bmi1")
+)]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+// Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
+// enables; the body is the safe `spelled_run`, so the feature is the only requirement.
+#[inline(never)]
+unsafe fn spelled_run_wide(
+    w: Wide,
+    data: &[u8],
+    pos: usize,
+    end: usize,
+    packed: &Packed,
+    member: usize,
+) -> (usize, usize) {
+    spelled_run(w, data, pos, end, packed, member)
+}
+
+#[inline(always)]
+fn spelled_run<S: Scan>(
+    scan: S,
+    data: &[u8],
+    mut pos: usize,
+    end: usize,
+    packed: &Packed,
+    mut member: usize,
+) -> (usize, usize) {
+    debug_assert!(S::WIDE && packed.step == S::STEP);
+    let end = end.min(data.len());
+    while let Some(&(n, bits)) = packed.lens.get(member) {
+        // The register at `pos` lies in the piece, its spelling's in `bytes`,
+        // and `n + 2 <= STEP` leaves the value's quote and a byte after it.
+        if n == 0 || pos + S::STEP > end {
+            break;
+        }
+        let differ = !scan.same(data, pos, &packed.bytes, member * S::STEP);
+        if differ & bits != 0 || data[pos + n] != b'"' {
+            break;
+        }
+        let stops =
+            (scan.hits(data, pos, b'"', b'\\') | scan.hits(data, pos, b'\n', b'\n')) >> (n + 1);
+        let close = if stops != 0 {
+            pos + n + 1 + stops.trailing_zeros() as usize
+        } else {
+            // The value runs past the register: the ones after, as far as
+            // the piece's last.
+            let mut at = pos + S::STEP;
+            loop {
+                if at + S::STEP > end {
+                    return (pos, member);
+                }
+                let stops = scan.hits(data, at, b'"', b'\\') | scan.hits(data, at, b'\n', b'\n');
+                if stops != 0 {
+                    break at + stops.trailing_zeros() as usize;
+                }
+                at += S::STEP;
+            }
+        };
+        if data[close] != b'"' {
+            break; // an escape or a line feed: the walk's
+        }
+        pos = close + 1;
+        member += 1;
+    }
+    (pos, member)
 }
 
 /// Each of the first object's members as the first row of `data[lo..end]`
