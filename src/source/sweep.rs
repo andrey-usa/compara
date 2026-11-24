@@ -34,6 +34,7 @@
 
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
+use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -269,6 +270,21 @@ fn remove_file_if_over(path: &Path, me: u32, now: SystemTime, settled: Duration)
     quiet && fs::remove_file(path).is_ok()
 }
 
+/// Whether `dir`, a directory a run has just made and opened, is one of
+/// this user's closed to every other: what a run made is, and what another
+/// user may have renamed onto its name in the meantime is not.
+pub(super) fn is_own_private_dir(dir: &File) -> bool {
+    dir.metadata()
+        .is_ok_and(|m| m.is_dir() && m.uid() == euid() && m.mode() & 0o077 == 0)
+}
+
+/// Where a test swaps the name of a temporary directory a run has made and
+/// holds open, before anything is written in it.
+#[cfg(test)]
+pub(super) fn made(path: &Path) {
+    tests::at(tests::Point::Made, path);
+}
+
 /// Opens `path`, a directory (`dir`) or a file by the look taken at it, or
 /// by its making, to see whether it is still the one looked at, or to lock
 /// it. Where anyone may rename in the temporary directory (no sticky bit),
@@ -363,16 +379,98 @@ fn modified(st: &libc::stat) -> Option<SystemTime> {
 /// An open directory, what is in it named relative to it: whatever becomes
 /// of the name it was opened by, every look, open and removal is in this
 /// one.
-struct Dir(File);
+#[derive(Debug)]
+pub(super) struct Dir(pub(super) File);
 
 impl Dir {
     fn fd(&self) -> std::ffi::c_int {
         self.0.as_raw_fd()
     }
 
+    /// `name` in it opened with `flags` (and `mode`, for one made), never
+    /// through a link at the name and closed on exec.
+    fn open_at(&self, name: &CStr, flags: std::ffi::c_int, mode: libc::c_uint) -> io::Result<File> {
+        // SAFETY: the name is NUL-terminated and `self.fd()` is open; the
+        // mode is passed as the unsigned int a variadic argument of type
+        // mode_t is promoted to, and read only with O_CREAT.
+        let fd = unsafe {
+            libc::openat(
+                self.fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat succeeded, so `fd` is a new descriptor no one else
+        // holds; the File closes it.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// Makes the file `name` in it, for this user alone (0600), and opens it
+    /// to write and read back: only where nothing is, so a file or a link
+    /// already at the name is not opened. Every file compara writes in a
+    /// temporary directory of its own is made here.
+    pub(super) fn create(&self, name: &CStr) -> io::Result<File> {
+        self.open_at(name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600)
+    }
+
+    /// The file `name` in it, to read; not through a link. What is in a
+    /// directory of this user's alone was put there by this user.
+    pub(super) fn open(&self, name: &CStr) -> io::Result<File> {
+        self.open_at(name, libc::O_RDONLY, 0)
+    }
+
+    /// Makes the directory `name` in it, for this user alone, and opens it.
+    pub(super) fn make_dir(&self, name: &CStr) -> io::Result<Dir> {
+        // SAFETY: the name is NUL-terminated and `self.fd()` is open.
+        if unsafe { libc::mkdirat(self.fd(), name.as_ptr(), 0o700) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.open_at(
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK,
+            0,
+        )
+        .map(Dir)
+    }
+
+    /// Moves `from` in it to `to` in it, in one step, replacing what is at
+    /// `to` (a link there is replaced, not followed).
+    pub(super) fn rename(&self, from: &CStr, to: &CStr) -> io::Result<()> {
+        // SAFETY: both names are NUL-terminated and `self.fd()` is open.
+        let done = unsafe { libc::renameat(self.fd(), from.as_ptr(), self.fd(), to.as_ptr()) };
+        if done != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Removes what is in it, and in the directories in it down to `depth`
+    /// levels, through it: never by a name outside it, never through a link.
+    pub(super) fn clear(&self, depth: usize) {
+        for name in self.names().unwrap_or_default() {
+            let is_dir = self
+                .stat(&name)
+                .is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
+            if is_dir {
+                if let Some(below) = depth.checked_sub(1)
+                    && let Some(sub) = self.open_dir(&name)
+                {
+                    sub.clear(below);
+                }
+                self.remove(&name, true);
+            } else {
+                self.remove(&name, false);
+            }
+        }
+    }
+
     /// The names in it, but `.` and `..`; `None` when they cannot all be
     /// read.
-    fn names(&self) -> Option<Vec<CString>> {
+    pub(super) fn names(&self) -> Option<Vec<CString>> {
         // A descriptor of the listing's own, which it reads from and closes:
         // this one keeps its place, and its lock.
         // SAFETY: the name is a NUL-terminated string; `self.fd()` is open
@@ -458,7 +556,7 @@ impl Dir {
 
     /// Removes `name` from it, a directory (`dir`) or a file; whether it
     /// went.
-    fn remove(&self, name: &CStr, dir: bool) -> bool {
+    pub(super) fn remove(&self, name: &CStr, dir: bool) -> bool {
         let flags = if dir { libc::AT_REMOVEDIR } else { 0 };
         // SAFETY: the name is NUL-terminated and `self.fd()` is open.
         unsafe { libc::unlinkat(self.fd(), name.as_ptr(), flags) == 0 }
@@ -546,6 +644,9 @@ mod tests {
         /// Once the directory at it has been opened and locked, before what
         /// is in it is read.
         Locked,
+        /// Once a new temporary directory has been made and opened, before
+        /// anything is written in it.
+        Made,
     }
 
     /// What a test does to a name at a point: what another user can do in a
@@ -899,6 +1000,155 @@ mod tests {
             got,
             [("pipe", Some(Some(true))), ("link", Some(Some(true)))]
         );
+    }
+
+    /// Where a swap below acts: the new directory's name, where its own
+    /// went, and the directory of someone else's it is swapped for.
+    static SWAPPED: Mutex<Option<(PathBuf, PathBuf, PathBuf)>> = Mutex::new(None);
+
+    /// Moves the new directory at `path` aside; where it went.
+    fn swap_aside(path: &Path) -> PathBuf {
+        let mut moved = path.as_os_str().to_owned();
+        moved.push(".moved");
+        fs::rename(path, &moved).unwrap();
+        let mut at = SWAPPED.lock().unwrap();
+        let theirs = at.take().unwrap().2;
+        *at = Some((path.to_path_buf(), PathBuf::from(&moved), theirs));
+        PathBuf::from(moved)
+    }
+
+    fn theirs() -> PathBuf {
+        SWAPPED.lock().unwrap().as_ref().unwrap().2.clone()
+    }
+
+    /// The name, once made, a link to their directory.
+    fn made_to_link(path: &Path) {
+        swap_aside(path);
+        symlink(theirs(), path).unwrap();
+    }
+
+    /// Their directory itself moved onto the name, as another user can
+    /// where the temporary directory is open to all without the sticky bit.
+    fn made_to_theirs(path: &Path) {
+        swap_aside(path);
+        fs::rename(theirs(), path).unwrap();
+    }
+
+    fn sorted_names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .map(|d| {
+                d.map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// Two files whose external sort spills runs and merges them back, and
+    /// their counts: changed, added, removed.
+    fn spilling_pair(scratch: &Scratch) -> (PathBuf, PathBuf, (i64, i64, i64)) {
+        use std::fmt::Write as _;
+        let pad = "x".repeat(40);
+        let (mut a, mut b) = (String::from("id,v,pad\n"), String::from("id,v,pad\n"));
+        let mut want = (0, 100, 0);
+        for id in 0..50_000 {
+            writeln!(a, "{id},{id},{pad}").unwrap();
+            if id % 11 == 0 {
+                want.2 += 1;
+                continue;
+            }
+            let v = if id % 7 == 0 { id + 1 } else { id };
+            want.0 += i64::from(id % 7 == 0);
+            writeln!(b, "{id},{v},{pad}").unwrap();
+        }
+        for id in 50_000..50_100 {
+            writeln!(b, "{id},{id},{pad}").unwrap();
+        }
+        let (pa, pb) = (scratch.0.join("a.csv"), scratch.0.join("b.csv"));
+        fs::write(&pa, a).unwrap();
+        fs::write(&pb, b).unwrap();
+        (pa, pb, want)
+    }
+
+    #[test]
+    fn what_a_run_writes_in_its_temporary_directory_goes_in_it_whatever_its_name_becomes() {
+        use crate::engine::sortmerge;
+        use crate::options::Options;
+        use std::io::{Read as _, Write as _};
+
+        super::super::sweep_once();
+        let scratch = Scratch::new("written");
+        let (a, b, want) = spilling_pair(&scratch);
+        let small = Scratch::new("written-small");
+        fs::write(small.0.join("a.csv"), "id,v\n1,a\n2,b\n").unwrap();
+        fs::write(small.0.join("b.csv"), "id,v\n2,c\n3,d\n").unwrap();
+        let (sa, sb) = (small.0.join("a.csv"), small.0.join("b.csv"));
+        // A budget whose batches are a megabyte: each file spills runs.
+        let mut spill = Options::with_key(["id"]);
+        spill.memory = Some(16 << 20);
+
+        let mut got = Vec::new();
+        for (writer, point, swap, how) in [
+            ("sortmerge", Point::Made, made_to_link as fn(&Path), "link"),
+            ("sortmerge", Point::Made, made_to_theirs, "theirs"),
+            ("export", Point::Made, made_to_link, "link"),
+            ("export", Point::Made, made_to_theirs, "theirs"),
+            ("out", Point::Made, made_to_link, "link"),
+            ("out", Point::Made, made_to_theirs, "theirs"),
+            ("out", Point::Open, made_to_theirs, "theirs before the lock"),
+        ] {
+            let theirs = scratch.0.join("theirs");
+            fs::create_dir(&theirs).unwrap();
+            fs::write(theirs.join("theirs.txt"), "theirs").unwrap();
+            fs::set_permissions(&theirs, fs::Permissions::from_mode(0o777)).unwrap();
+            *SWAPPED.lock().unwrap() = Some((PathBuf::new(), PathBuf::new(), theirs.clone()));
+            SWAP.set(Some((point, swap)));
+            // Whether the run did what it was asked, in a directory of its
+            // own.
+            let done = match writer {
+                "sortmerge" => sortmerge::compare(&a, &b, &spill)
+                    .is_ok_and(|r| (r.counts.changed, r.counts.added, r.counts.removed) == want),
+                "export" => {
+                    let dir = crate::source::TempDir::new("export").unwrap();
+                    let mut opt = Options::with_key(["id"]);
+                    opt.export_dir = Some(dir.path().to_string_lossy().into_owned());
+                    opt.export_staged = Some(dir.dir().clone());
+                    let ran = sortmerge::compare(&sa, &sb, &opt).is_ok();
+                    let mut names = dir.dir().names().unwrap();
+                    names.sort();
+                    ran && names == ["added.csv", "changed.csv", "removed.csv"]
+                }
+                _ => {
+                    let dir = crate::source::TempDir::new("out").unwrap();
+                    let mut file = dir.dir().create("output").unwrap();
+                    file.write_all(b"report").unwrap();
+                    drop(file);
+                    let mut back = String::new();
+                    dir.dir()
+                        .open("output")
+                        .unwrap()
+                        .read_to_string(&mut back)
+                        .unwrap();
+                    back == "report"
+                }
+            };
+            SWAP.set(None);
+            let (at, moved, _) = SWAPPED.lock().unwrap().take().unwrap();
+            // Their directory, at the name or where it was, as it was.
+            let kept = if fs::symlink_metadata(&theirs).is_ok() {
+                sorted_names(&theirs)
+            } else {
+                sorted_names(&at)
+            } == ["theirs.txt"];
+            got.push((writer, how, done, kept));
+            let _ = fs::remove_file(&at);
+            let _ = fs::remove_dir_all(&at);
+            let _ = fs::remove_dir_all(&moved);
+            let _ = fs::remove_dir_all(&theirs);
+        }
+        let want: Vec<_> = got.iter().map(|&(w, h, _, _)| (w, h, true, true)).collect();
+        assert_eq!(got, want);
     }
 
     #[test]

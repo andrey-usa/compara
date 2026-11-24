@@ -96,6 +96,12 @@ pub struct Options {
     pub engine: String,
     pub threads: Option<usize>,
     pub export_dir: Option<String>,
+    /// The directory `export_dir` names, held open, when it is compara's own
+    /// staging directory for an export bound for object storage: the files
+    /// are made in it through the directory, not by its name, which anyone
+    /// may swap in a shared temporary directory.
+    #[serde(skip)]
+    pub export_staged: Option<std::sync::Arc<crate::source::WorkDir>>,
 
     /// How much memory the comparison may count on, in bytes, or `None` to
     /// ask the machine (see [`crate::memory`]). For text it decides whether a
@@ -140,6 +146,7 @@ impl Default for Options {
             engine: Engine::Auto.label().to_string(),
             threads: None,
             export_dir: None,
+            export_staged: None,
             memory: None,
             row_lists: true,
         }

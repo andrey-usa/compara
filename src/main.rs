@@ -9,7 +9,7 @@
 //! with `--fail-on-dups`). That makes it a drop-in CI or pipeline gate.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -496,6 +496,7 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
         if compara::source::is_remote(v) {
             let dir = compara::source::TempDir::new("export")?;
             opt.export_dir = Some(dir.path().to_string_lossy().into_owned());
+            opt.export_staged = Some(dir.dir().clone());
             export_to = Some((v.to_string(), dir));
         } else {
             opt.export_dir = Some(v.to_string());
@@ -604,17 +605,11 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
         }
     }
     if let Some((dest, dir)) = &export_to {
-        let mut names: Vec<_> = fs::read_dir(dir.path())?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
+        let mut names = dir.dir().names()?;
         names.sort();
-        for path in names {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+        for name in names {
             let to = format!("{}/{name}", dest.trim_end_matches('/'));
-            compara::source::upload(&path, &to)?;
+            compara::source::upload(dir.dir().open(&name)?, &to)?;
         }
     }
 
@@ -762,9 +757,10 @@ fn same_file(a: &Path, b: &Path) -> bool {
 fn write_output(dest: &str, bytes: &[u8]) -> Result<()> {
     if compara::source::is_remote(dest) {
         let dir = compara::source::TempDir::new("out")?;
-        let local = dir.path().join("output");
-        fs::write(&local, bytes)?;
-        compara::source::upload(&local, dest)?;
+        let mut local = dir.dir().create("output")?;
+        local.write_all(bytes)?;
+        local.rewind()?;
+        compara::source::upload(local, dest)?;
         return Ok(());
     }
     compara::output::write(Path::new(dest), bytes)

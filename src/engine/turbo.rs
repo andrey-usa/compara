@@ -63,7 +63,7 @@ use crate::options::{Engine, Options};
 use crate::parallel;
 use crate::phases::Phases;
 use crate::rowstore::Joined;
-use crate::sections::{assemble, create_export_dir, export_file, export_headers, finish_export};
+use crate::sections::{ExportDir, assemble, export_headers, finish_export};
 
 /// Below this there is nothing to divide: finding the chunk boundaries would
 /// cost more than the parsing it splits.
@@ -3494,10 +3494,9 @@ where
     FA: Fn(i32) -> Result<Vec<Val>> + Sync,
     FB: Fn(i32) -> Result<Vec<Val>> + Sync,
 {
-    let dir = Path::new(opt.export_dir.as_deref().unwrap_or("."));
-    create_export_dir(dir)?;
+    let dir = ExportDir::of(opt)?;
     let (_, both) = export_headers(opt, sides.compared);
-    let mut out = export_file(&dir.join("changed.csv"), &both)?;
+    let mut out = dir.file("changed.csv", &both)?;
     let (key_size, nc) = (ctx.key_size, ctx.nc);
 
     // The keys, in pick order: one buffer, and a (start, length) per key
@@ -3578,7 +3577,7 @@ where
         cells.extend(rows.into_iter().filter_map(|(_, _, shown)| shown));
         at += block.len();
     }
-    finish_export(out, &dir.join("changed.csv"))?;
+    finish_export(out, &dir.path("changed.csv"))?;
     Ok(cells)
 }
 

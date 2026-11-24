@@ -21,9 +21,10 @@
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
+use crate::source::WorkDir;
 
 /// One output being written. `commit` puts it at its name; dropped without a
 /// commit, it leaves nothing behind.
@@ -41,6 +42,9 @@ pub struct Output {
     /// The file at `dest` was emptied to be written in place: dropped before
     /// `commit` finishes it, it is left incomplete.
     emptied: bool,
+    /// Written in a directory of compara's own, held open: the temporary's
+    /// name and the output's, in it.
+    staged: Option<(Arc<WorkDir>, String, String)>,
 }
 
 /// Files written in place whose run failed before they were complete.
@@ -136,6 +140,7 @@ impl Output {
                 checked: None,
                 file: Some(file),
                 emptied: false,
+                staged: None,
             });
         }
         refuse_link(dest)?;
@@ -160,6 +165,7 @@ impl Output {
                     checked: None,
                     file: Some(file),
                     emptied: false,
+                    staged: None,
                 });
             }
             Ok(meta) => {
@@ -221,6 +227,7 @@ impl Output {
                         checked,
                         file: Some(file),
                         emptied: false,
+                        staged: None,
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -242,6 +249,7 @@ impl Output {
                         checked: None,
                         file: Some(file),
                         emptied: true,
+                        staged: None,
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -267,6 +275,34 @@ impl Output {
         )))
     }
 
+    /// Opens `name` in `dir`, a temporary directory of compara's own, for
+    /// writing: made beside it under a temporary name and moved onto it, as
+    /// [`Output::create`] does, all through the directory held open.
+    pub fn create_in(dir: &Arc<WorkDir>, name: &str) -> Result<Output> {
+        let dest = dir.path().join(name);
+        for n in 0..16 {
+            let temp = format!(".compara-{}-{n}.part", std::process::id());
+            match dir.create(&temp) {
+                Ok(file) => {
+                    return Ok(Output {
+                        dest,
+                        temp: None,
+                        checked: None,
+                        file: Some(file),
+                        emptied: false,
+                        staged: Some((dir.clone(), temp, name.to_string())),
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(cannot(&dest, &e)),
+            }
+        }
+        Err(Error::new(format!(
+            "cannot write {}: no free temporary name beside it",
+            dest.display()
+        )))
+    }
+
     /// Puts the written file at its name, in one step where the name takes a
     /// rename.
     pub fn commit(mut self) -> Result<()> {
@@ -274,6 +310,12 @@ impl Output {
             file.flush().map_err(|e| cannot(&self.dest, &e))?;
         }
         self.emptied = false;
+        if let Some((dir, temp, name)) = self.staged.take() {
+            return dir.rename(&temp, &name).map_err(|e| {
+                let _ = dir.remove(&temp);
+                cannot(&self.dest, &e)
+            });
+        }
         if let Some((temp, mode)) = self.temp.take() {
             let moved = mode
                 .map_or(Ok(()), |m| fs::set_permissions(&temp, m))
@@ -355,6 +397,10 @@ impl Drop for Output {
         if let Some((temp, _)) = self.temp.take() {
             drop(self.file.take());
             let _ = fs::remove_file(temp);
+        }
+        if let Some((dir, temp, _)) = self.staged.take() {
+            drop(self.file.take());
+            let _ = dir.remove(&temp);
         }
     }
 }

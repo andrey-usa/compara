@@ -26,8 +26,8 @@
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::path::Path;
+use std::sync::{Arc, mpsc};
 
 use crate::columns::{compare_keys, differs, resolve};
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
@@ -35,7 +35,8 @@ use crate::error::{Error, Result};
 use crate::options::Options;
 use crate::phases::Phases;
 use crate::rowstore::{Joined, Packed};
-use crate::sections::{assemble, create_export_dir, export_file, export_headers, finish_export};
+use crate::sections::{ExportDir, assemble, export_headers, finish_export};
+use crate::source::WorkDir;
 
 /// How much memory a batch may occupy before it is spilled: its packed text,
 /// four bytes a cell and the sort's four bytes a row.
@@ -92,18 +93,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     // The runs hold every row of both files: the directory is this user's
     // alone, and goes with what is in it however the run ends.
     let guard = crate::source::TempDir::new("sortmerge")?;
-    let work = guard.path().to_path_buf();
+    let work = guard.dir();
 
     let mut phases = Phases::new("");
     let sort = |side: &str, path: &Path, header: &[String]| -> Result<Runs> {
-        stream_into(
-            &work.join(side),
-            path,
-            header,
-            &resolved.compared,
-            opt,
-            width,
-        )
+        stream_into(work, side, path, header, &resolved.compared, opt, width)
     };
     let sort_b = || sort("b", b_path, &b_header);
     let (a_runs, b_runs) = if opt.thread_budget() > 1 {
@@ -215,14 +209,15 @@ fn read_header(path: &Path, opt: &Options) -> Result<Vec<String>> {
 
 /// Streams a file into the sorter, projecting and normalising a row at a time.
 fn stream_into(
-    dir: &Path,
+    work: &WorkDir,
+    side: &str,
     path: &Path,
     header: &[String],
     compared: &[String],
     opt: &Options,
     width: usize,
 ) -> Result<Runs> {
-    std::fs::create_dir_all(dir)?;
+    let dir = Arc::new(work.make_dir(side)?);
     let index: Vec<Option<usize>> = opt
         .key
         .iter()
@@ -234,16 +229,16 @@ fn stream_into(
     let halves = room_halves(&index, opt.ignore_case);
 
     // Sorts a full batch and writes it as the run numbered `n`.
-    let spill = |batch: &Packed, n: usize, rowbuf: &mut Vec<u8>| -> Result<PathBuf> {
-        let path = dir.join(format!("run-{n}.bin"));
-        let mut w = BufWriter::with_capacity(1 << 16, File::create(&path)?);
+    let spill = |batch: &Packed, n: usize, rowbuf: &mut Vec<u8>| -> Result<String> {
+        let name = format!("run-{n}.bin");
+        let mut w = BufWriter::with_capacity(1 << 16, dir.create(&name)?);
         for row in sorted_order(batch, key_size) {
             write_row(&mut w, batch, row as usize, rowbuf)?;
         }
         w.flush()?;
         let file = w.into_inner().map_err(|e| Error::new(e.to_string()))?;
         crate::memory::write_out(&file);
-        Ok(path)
+        Ok(name)
     };
 
     // Full batches go to a thread that sorts and writes them while this one
@@ -254,7 +249,7 @@ fn stream_into(
     let (written, back) = mpsc::channel::<Packed>();
     std::thread::scope(|scope| {
         let spill = &spill;
-        let spiller = crate::parallel::spawn_scoped(scope, move || -> Result<Vec<PathBuf>> {
+        let spiller = crate::parallel::spawn_scoped(scope, move || -> Result<Vec<String>> {
             let mut spilled = Vec::new();
             let mut rowbuf: Vec<u8> = Vec::new();
             for batch in batches {
@@ -265,7 +260,7 @@ fn stream_into(
         });
         // A thread the OS refuses (a process limit, or a data limit its stack
         // counts against) leaves the batches to be written here, between reads.
-        let mut here: Option<(Vec<PathBuf>, Vec<u8>)> =
+        let mut here: Option<(Vec<String>, Vec<u8>)> =
             spiller.is_err().then(|| (Vec::new(), Vec::new()));
 
         let mut read = || -> Result<(Packed, i64)> {
@@ -363,7 +358,7 @@ fn stream_into(
         // Here rather than when the merge starts, so the two files' passes,
         // if they need any, run at once as their sorts did.
         let merge_budget = budget;
-        let spilled = merge_down(dir, spilled, width, key_size, merge_budget)?;
+        let spilled = merge_down(&dir, spilled, width, key_size, merge_budget)?;
         let order = if spilled.is_empty() {
             sorted_order(&last, key_size)
         } else {
@@ -372,6 +367,7 @@ fn stream_into(
         Ok(Runs {
             width,
             key_size,
+            dir: dir.clone(),
             spilled,
             last,
             order,
@@ -457,7 +453,9 @@ fn sorted_order(batch: &Packed, key_size: usize) -> Vec<u32> {
 struct Runs {
     width: usize,
     key_size: usize,
-    spilled: Vec<PathBuf>,
+    /// The directory the runs are in, held open.
+    dir: Arc<WorkDir>,
+    spilled: Vec<String>,
     last: Packed,
     order: Vec<u32>,
     rows: i64,
@@ -480,6 +478,7 @@ impl Runs {
             }));
         }
         Ok(Box::new(MergeCursor::open(
+            &self.dir,
             &self.spilled,
             self.width,
             self.key_size,
@@ -523,12 +522,12 @@ fn run_buffer(budget: usize, files: usize) -> usize {
 /// little of itself, not all of it. The groups are consecutive and the merge
 /// breaks equal keys by run, so a key's rows keep their order in the file.
 fn merge_down(
-    dir: &Path,
-    mut runs: Vec<PathBuf>,
+    dir: &WorkDir,
+    mut runs: Vec<String>,
     width: usize,
     key_size: usize,
     budget: usize,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<String>> {
     let fan_in = fan_in(budget);
     let mut pass = 0;
     while runs.len() > fan_in {
@@ -541,12 +540,12 @@ fn merge_down(
             if k < 2 {
                 break;
             }
-            let path = dir.join(format!("merge-{pass}-{}.bin", merged.len()));
-            merge_runs(&runs[at..at + k], &path, width, key_size, budget)?;
+            let name = format!("merge-{pass}-{}.bin", merged.len());
+            merge_runs(dir, &runs[at..at + k], &name, width, key_size, budget)?;
             for done in &runs[at..at + k] {
-                let _ = std::fs::remove_file(done);
+                let _ = dir.remove(done);
             }
-            merged.push(path);
+            merged.push(name);
             at += k;
             gone += k - 1;
         }
@@ -557,17 +556,18 @@ fn merge_down(
     Ok(runs)
 }
 
-/// Merges `runs` into one run at `path`.
+/// Merges `runs` into one run, `name`, in `dir`.
 fn merge_runs(
-    runs: &[PathBuf],
-    path: &Path,
+    dir: &WorkDir,
+    runs: &[String],
+    name: &str,
     width: usize,
     key_size: usize,
     budget: usize,
 ) -> Result<()> {
     let buffer = run_buffer(budget, runs.len() + 1);
-    let mut from = MergeCursor::open(runs, width, key_size, buffer)?;
-    let mut to = RunWriter::create(path, buffer)?;
+    let mut from = MergeCursor::open(dir, runs, width, key_size, buffer)?;
+    let mut to = RunWriter::create(dir.create(name)?, buffer)?;
     let mut rowbuf = Vec::new();
     while let Some((rows, row)) = from.peek() {
         write_row(&mut to, rows, row, &mut rowbuf)?;
@@ -605,11 +605,11 @@ struct RunReader {
 }
 
 impl RunReader {
-    fn open(path: &Path, size: usize) -> Result<Self> {
+    fn open(file: File, size: usize) -> Result<Self> {
         let mut buf = run_buffer_of(size)?;
         buf.resize(size, 0);
         Ok(RunReader {
-            file: File::open(path)?,
+            file,
             buf: buf.into_boxed_slice(),
             at: 0,
             end: 0,
@@ -679,12 +679,9 @@ struct RunWriter {
 }
 
 impl RunWriter {
-    fn create(path: &Path, size: usize) -> Result<Self> {
+    fn create(file: File, size: usize) -> Result<Self> {
         let buf = run_buffer_of(size)?;
-        Ok(RunWriter {
-            file: File::create(path)?,
-            buf,
-        })
+        Ok(RunWriter { file, buf })
     }
 
     fn finish(mut self) -> Result<File> {
@@ -922,8 +919,14 @@ struct MergeCursor {
 }
 
 impl MergeCursor {
-    /// The runs at `paths`, each read through `buffer` bytes.
-    fn open(paths: &[PathBuf], width: usize, key_size: usize, buffer: usize) -> Result<Self> {
+    /// The runs `names` in `dir`, each read through `buffer` bytes.
+    fn open(
+        dir: &WorkDir,
+        names: &[String],
+        width: usize,
+        key_size: usize,
+        buffer: usize,
+    ) -> Result<Self> {
         let mut c = Self {
             readers: Vec::new(),
             heads: Vec::new(),
@@ -935,7 +938,7 @@ impl MergeCursor {
         // Taken whole and checked: a thousand runs' heads are 80 KB, and
         // grown by doubling they were the allocation a heap near its limit
         // aborted on.
-        let n = paths.len();
+        let n = names.len();
         let each = std::mem::size_of::<RunReader>() + std::mem::size_of::<Packed>() + 8;
         if c.readers.try_reserve_exact(n).is_err()
             || c.heads.try_reserve_exact(n).is_err()
@@ -943,8 +946,8 @@ impl MergeCursor {
         {
             return Err(no_room_to_merge(n * each));
         }
-        for p in paths {
-            c.readers.push(RunReader::open(p, buffer)?);
+        for name in names {
+            c.readers.push(RunReader::open(dir.open(name)?, buffer)?);
             c.heads.push(Packed::new(width));
         }
         for run in 0..c.readers.len() {
@@ -1260,11 +1263,9 @@ fn merge_join(
     // The merge visits matched keys in key order, which is the order of the
     // file, so each changed row goes straight to it and is dropped.
     let mut changed_out = match (&opt.export_dir, exporting) {
-        (Some(dir), true) => {
-            let dir = std::path::Path::new(dir);
-            create_export_dir(dir)?;
+        (Some(_), true) => {
             let (_, both) = export_headers(opt, compared);
-            Some(export_file(&dir.join("changed.csv"), &both)?)
+            Some(ExportDir::of(opt)?.file("changed.csv", &both)?)
         }
         _ => None,
     };

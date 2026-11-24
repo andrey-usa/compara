@@ -29,6 +29,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -714,16 +715,16 @@ pub fn credential_sources() -> Vec<(&'static str, String)> {
     }
 }
 
-/// Writes the local file `from` to `dest`, an object storage or HTTP URL;
-/// the bytes written.
+/// Writes the file `from`, read from its start, to `dest`, an object
+/// storage or HTTP URL; the bytes written.
 #[cfg(feature = "cloud")]
-pub fn upload(from: &Path, dest: &str) -> Result<u64> {
+pub fn upload(from: File, dest: &str) -> Result<u64> {
     remote::upload(from, dest)
 }
 
-/// Writes the local file `from` to `dest`, an object storage or HTTP URL.
+/// Writes the file `from` to `dest`, an object storage or HTTP URL.
 #[cfg(not(feature = "cloud"))]
-pub fn upload(_from: &Path, dest: &str) -> Result<u64> {
+pub fn upload(_from: File, dest: &str) -> Result<u64> {
     Err(Error::new(format!(
         "{dest}: this build writes local files only (it was built without the `cloud` feature)"
     )))
@@ -737,9 +738,14 @@ pub fn upload(_from: &Path, dest: &str) -> Result<u64> {
 /// run makes removes those first. The directory is locked for as long as it
 /// is used, which is what tells that later run, in any pid namespace, that
 /// this one is not over, and its name ends `-locked` to say it is.
+///
+/// It is held open from its making, and what goes in it is made, read and
+/// removed through it ([`WorkDir`]): where anyone may rename in the
+/// temporary directory (no sticky bit), its name may be swapped at any time
+/// for a link or for someone else's directory, and a write by the name
+/// would land there.
 pub struct TempDir {
-    path: PathBuf,
-    _lock: Option<File>,
+    dir: Arc<WorkDir>,
 }
 
 impl TempDir {
@@ -749,37 +755,202 @@ impl TempDir {
         {
             let path = temp_dir(&format!("{tag}-{}", sweep::LOCKED))?;
             // Opened as the sweep opens a name it has looked at: where anyone
-            // may rename in the temporary directory, a pipe or a link may be
-            // at the name by now, and the open would wait on the one for a
-            // writer, or lock what the other points at.
-            let opened = sweep::reopen(&path, true).ok();
+            // may rename in the temporary directory, a pipe, a link or another
+            // user's directory may be at the name by now, and the open would
+            // wait on the one for a writer, or lock and write into what the
+            // others are.
+            let opened = sweep::reopen(&path, true)
+                .ok()
+                .filter(sweep::is_own_private_dir);
             if let Some(lock) = opened.filter(|f| f.try_lock().is_ok()) {
-                return Ok(TempDir {
-                    path,
-                    _lock: Some(lock),
-                });
+                return Ok(TempDir::held(path, lock));
             }
             // A name that says "locked" on a directory nothing locks would
             // let a later run take it for over a minute after it last
             // changed: where the lock cannot be taken (a filesystem without
             // locks) the directory is one of an unlocked run's instead.
             let _ = std::fs::remove_dir(&path);
+            let path = temp_dir(tag)?;
+            let opened = sweep::reopen(&path, true).and_then(|f| {
+                if sweep::is_own_private_dir(&f) {
+                    Ok(f)
+                } else {
+                    Err(std::io::Error::other("another directory took its name"))
+                }
+            });
+            match opened {
+                Ok(dir) => Ok(TempDir::held(path, dir)),
+                Err(e) => Err(no_temp("directory", &e)),
+            }
         }
+        #[cfg(not(unix))]
         Ok(TempDir {
-            path: temp_dir(tag)?,
-            _lock: None,
+            dir: Arc::new(WorkDir {
+                path: temp_dir(tag)?,
+            }),
         })
     }
 
+    #[cfg(unix)]
+    fn held(path: PathBuf, dir: File) -> TempDir {
+        #[cfg(test)]
+        sweep::made(&path);
+        TempDir {
+            dir: Arc::new(WorkDir {
+                path,
+                dir: sweep::Dir(dir),
+            }),
+        }
+    }
+
+    /// The name it was made at, for messages: what is in it is reached
+    /// through [`TempDir::dir`].
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.dir.path
+    }
+
+    /// The directory, held open.
+    pub fn dir(&self) -> &Arc<WorkDir> {
+        &self.dir
     }
 }
 
 impl Drop for TempDir {
     fn drop(&mut self) {
         // Before the lock goes with the fields.
-        let _ = std::fs::remove_dir_all(&self.path);
+        #[cfg(unix)]
+        {
+            // Through the directory, then the directory itself by its name in
+            // the temporary directory: what a swap can have put there is at
+            // most an empty directory to remove, or a link, which this fails
+            // on.
+            self.dir.dir.clear(1);
+            let _ = std::fs::remove_dir(&self.dir.path);
+        }
+        #[cfg(not(unix))]
+        let _ = std::fs::remove_dir_all(&self.dir.path);
+    }
+}
+
+/// A directory of this run's, held open: every file in it is made, read,
+/// moved and removed through it, by a name relative to it, whatever has
+/// become of the name it was made at. Elsewhere than on Unix, by the path.
+#[derive(Debug)]
+pub struct WorkDir {
+    path: PathBuf,
+    #[cfg(unix)]
+    dir: sweep::Dir,
+}
+
+/// The same directory: the one at the same name.
+impl PartialEq for WorkDir {
+    fn eq(&self, other: &WorkDir) -> bool {
+        self.path == other.path
+    }
+}
+
+#[cfg(unix)]
+fn c_name(name: &str) -> std::io::Result<std::ffi::CString> {
+    std::ffi::CString::new(name).map_err(|_| std::io::ErrorKind::InvalidInput.into())
+}
+
+impl WorkDir {
+    /// Where it was made, for messages.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Makes the file `name` in it, for this user alone, and opens it to
+    /// write and read back; only where nothing is, so a file or a link at
+    /// the name is not opened.
+    pub fn create(&self, name: &str) -> std::io::Result<File> {
+        #[cfg(unix)]
+        {
+            self.dir.create(&c_name(name)?)
+        }
+        #[cfg(not(unix))]
+        {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(self.path.join(name))
+        }
+    }
+
+    /// The file `name` in it, to read.
+    pub fn open(&self, name: &str) -> std::io::Result<File> {
+        #[cfg(unix)]
+        {
+            self.dir.open(&c_name(name)?)
+        }
+        #[cfg(not(unix))]
+        {
+            File::open(self.path.join(name))
+        }
+    }
+
+    /// Removes the file `name` from it.
+    pub fn remove(&self, name: &str) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            if self.dir.remove(&c_name(name)?, false) {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::remove_file(self.path.join(name))
+        }
+    }
+
+    /// Moves `from` in it to `to` in it, replacing what is there.
+    pub fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.dir.rename(&c_name(from)?, &c_name(to)?)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::rename(self.path.join(from), self.path.join(to))
+        }
+    }
+
+    /// Makes the directory `name` in it, for this user alone, held open.
+    pub fn make_dir(&self, name: &str) -> std::io::Result<WorkDir> {
+        let path = self.path.join(name);
+        #[cfg(unix)]
+        {
+            let dir = self.dir.make_dir(&c_name(name)?)?;
+            Ok(WorkDir { path, dir })
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir(&path)?;
+            Ok(WorkDir { path })
+        }
+    }
+
+    /// The names of what is in it, in no order.
+    pub fn names(&self) -> std::io::Result<Vec<String>> {
+        let not_text = || std::io::Error::new(std::io::ErrorKind::InvalidData, "a name not UTF-8");
+        #[cfg(unix)]
+        {
+            self.dir
+                .names()
+                .ok_or_else(|| std::io::Error::other("cannot list it"))?
+                .into_iter()
+                .map(|n| n.into_string().map_err(|_| not_text()))
+                .collect()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::read_dir(&self.path)?
+                .map(|e| e?.file_name().into_string().map_err(|_| not_text()))
+                .collect()
+        }
     }
 }
 

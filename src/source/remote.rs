@@ -690,12 +690,12 @@ async fn append_whole(
 /// ([`send_parts`]). A plain `https://` URL -- a presigned PUT -- takes the
 /// whole file in one PUT, read from the file as it is sent and watched
 /// ([`Sent`]).
-pub(super) fn upload(from: &std::path::Path, dest: &str) -> Result<u64> {
+pub(super) fn upload(from: std::fs::File, dest: &str) -> Result<u64> {
     let _quiet = QuietPipe::new();
     runtime("upload")?.block_on(upload_async(from, dest))
 }
 
-async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
+async fn upload_async(mut from: std::fs::File, dest: &str) -> Result<u64> {
     // Overridable so the multipart path can be tested on a small file.
     let env_size = |name: &str, default: u64| {
         std::env::var(name)
@@ -707,11 +707,11 @@ async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
     let one_shot = env_size("COMPARA_UPLOAD_ONE_SHOT", 32 << 20);
     let chunk = env_size("COMPARA_UPLOAD_PART", 16 << 20) as usize;
     let url = url::Url::parse(dest).map_err(|e| Error::new(format!("{dest}: not a URL: {e}")))?;
-    let size = std::fs::metadata(from)?.len();
+    let size = from.metadata()?.len();
     let plain = matches!(url.scheme(), "http" | "https") && !signable(&url);
     let fail = |e: String| Error::new(format!("cannot write {dest}: {e}"));
     if plain {
-        let file = std::fs::File::open(from)?;
+        let file = from;
         let sent = Arc::new(Sent::new(size, send_buffer_max()));
         let request = http_client(false)?
             .put(dest)
@@ -733,14 +733,15 @@ async fn upload_async(from: &std::path::Path, dest: &str) -> Result<u64> {
         unreachable!("store_signed returns a store");
     };
     if size <= one_shot {
-        let bytes = std::fs::read(from)?;
+        let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+        std::io::Read::read_to_end(&mut from, &mut bytes)?;
         store
             .put(&path, bytes.into())
             .await
             .map_err(|e| fail(explain(&e.to_string())))?;
         return Ok(size);
     }
-    let file = std::fs::File::open(from)?;
+    let file = from;
     let mut upload = store
         .put_multipart(&path)
         .await

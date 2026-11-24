@@ -53,7 +53,7 @@ use crate::parallel;
 use crate::parquet;
 use crate::phases::Phases;
 use crate::rowstore::Joined;
-use crate::sections::{create_export_dir, export_file, export_headers, sections};
+use crate::sections::{ExportDir, export_headers, sections};
 
 /// True when both paths are Parquet, so the caller knows to come here.
 pub fn is_parquet(path: &Path) -> bool {
@@ -1100,9 +1100,17 @@ impl Listed {
     /// the same writer with the same settings the header went through, and
     /// the blocks are written in order a wave at a time, which bounds what is
     /// held to one block per lane.
-    fn write(&self, path: &Path, header: &[String], cols: &[&Cells], threads: usize) -> Result<()> {
+    fn write(
+        &self,
+        dir: &ExportDir,
+        name: &str,
+        header: &[String],
+        cols: &[&Cells],
+        threads: usize,
+    ) -> Result<()> {
         const ROWS: usize = 8192;
-        let mut w = export_file(path, header)?;
+        let path = &dir.path(name);
+        let mut w = dir.file(name, header)?;
         w.flush()?;
         let mut file = w
             .into_inner()
@@ -2216,15 +2224,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             }
         }
 
-        let dir = Path::new(opt.export_dir.as_deref().unwrap_or_default());
-        create_export_dir(dir)?;
+        let dir = ExportDir::of(opt)?;
         let (plain, both) = export_headers(opt, compared);
         let added_cols: Vec<&Cells> = cols.iter().map(|c| &c.export_added).collect();
-        added_list.write(&dir.join("added.csv"), &plain, &added_cols, threads)?;
+        added_list.write(&dir, "added.csv", &plain, &added_cols, threads)?;
         let removed_cols: Vec<&Cells> = cols.iter().map(|c| &c.export_removed).collect();
-        removed_list.write(&dir.join("removed.csv"), &plain, &removed_cols, threads)?;
+        removed_list.write(&dir, "removed.csv", &plain, &removed_cols, threads)?;
         let changed_cols: Vec<&Cells> = sides.iter().flat_map(|(a, b)| [a, b]).collect();
-        changed_list.write(&dir.join("changed.csv"), &both, &changed_cols, threads)?;
+        changed_list.write(&dir, "changed.csv", &both, &changed_cols, threads)?;
         phases.mark("export write");
     }
     drop(export_lists);

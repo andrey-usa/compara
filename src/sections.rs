@@ -1,13 +1,15 @@
 //! Capping the report sections and writing the uncapped CSV exports.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::contract::{Cell, EngineMeta, EngineResult, Section, Val};
 use crate::error::{Error, Result};
 use crate::options::Options;
 use crate::output::Output;
 use crate::rowstore::Joined;
+use crate::source::WorkDir;
 
 /// Turns a completed join into the capped report sections, and writes the
 /// uncapped CSV exports when `--export-dir` is set.
@@ -19,8 +21,8 @@ pub fn assemble(
     opt: &Options,
     compared: &[String],
 ) -> Result<EngineResult> {
-    if let Some(dir) = &opt.export_dir {
-        export(Path::new(dir), &joined, opt, compared)?;
+    if opt.export_dir.is_some() {
+        export(&ExportDir::of(opt)?, &joined, opt, compared)?;
     }
     Ok(sections(meta, joined, dup_a, dup_b, opt, compared))
 }
@@ -72,6 +74,43 @@ pub fn create_export_dir(dir: &Path) -> Result<()> {
         .map_err(|e| Error::new(format!("cannot create export-dir {}: {e}", dir.display())))
 }
 
+/// Where the export files go: the directory `--export-dir` names, or
+/// compara's own staging directory for an export bound for object storage,
+/// held open, the files made through it.
+pub struct ExportDir {
+    path: PathBuf,
+    staged: Option<Arc<WorkDir>>,
+}
+
+impl ExportDir {
+    /// The export directory of `opt`, created if it is missing.
+    pub fn of(opt: &Options) -> Result<ExportDir> {
+        let path = PathBuf::from(opt.export_dir.as_deref().unwrap_or("."));
+        let staged = opt.export_staged.clone();
+        if staged.is_none() {
+            create_export_dir(&path)?;
+        }
+        Ok(ExportDir { path, staged })
+    }
+
+    /// The export file `name`, for messages.
+    pub fn path(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+
+    /// Opens the export file `name` and writes its header, as
+    /// [`export_file`] does.
+    pub fn file(&self, name: &str, header: &[String]) -> Result<csv::Writer<Output>> {
+        let out = match &self.staged {
+            Some(dir) => Output::create_in(dir, name)?,
+            None => Output::create(&self.path(name))?,
+        };
+        let mut w = csv::Writer::from_writer(out);
+        w.write_record(header)?;
+        Ok(w)
+    }
+}
+
 /// Opens one export file and writes its header. Every engine writes through
 /// this, so the files are quoted and terminated the same way whichever path
 /// produced them.
@@ -91,11 +130,10 @@ pub fn finish_export(w: csv::Writer<Output>, path: &Path) -> Result<()> {
         .commit()
 }
 
-fn export(dir: &Path, joined: &Joined, opt: &Options, compared: &[String]) -> Result<()> {
-    create_export_dir(dir)?;
+fn export(dir: &ExportDir, joined: &Joined, opt: &Options, compared: &[String]) -> Result<()> {
     let (cols, both) = export_headers(opt, compared);
-    write_cells(&dir.join("added.csv"), &cols, &joined.added)?;
-    write_cells(&dir.join("removed.csv"), &cols, &joined.removed)?;
+    write_cells(dir, "added.csv", &cols, &joined.added)?;
+    write_cells(dir, "removed.csv", &cols, &joined.removed)?;
 
     if joined.changed_written {
         return Ok(());
@@ -114,20 +152,20 @@ fn export(dir: &Path, joined: &Joined, opt: &Options, compared: &[String]) -> Re
             row
         })
         .collect();
-    write_rows(&dir.join("changed.csv"), &both, &rows)
+    write_rows(dir, "changed.csv", &both, &rows)
 }
 
-fn write_cells(path: &Path, header: &[String], rows: &[Vec<Cell>]) -> Result<()> {
+fn write_cells(dir: &ExportDir, name: &str, header: &[String], rows: &[Vec<Cell>]) -> Result<()> {
     let values: Vec<Vec<Val>> = rows
         .iter()
         .map(|row| row.iter().map(|c| c.value().map(str::to_string)).collect())
         .collect();
-    write_rows(path, header, &values)
+    write_rows(dir, name, header, &values)
 }
 
 /// Writes an uncapped export file from rows of values.
-fn write_rows(path: &Path, header: &[String], rows: &[Vec<Val>]) -> Result<()> {
-    let mut w = export_file(path, header)?;
+fn write_rows(dir: &ExportDir, name: &str, header: &[String], rows: &[Vec<Val>]) -> Result<()> {
+    let mut w = dir.file(name, header)?;
     let mut record: Vec<&str> = Vec::with_capacity(header.len());
     for row in rows {
         record.clear();
@@ -136,5 +174,5 @@ fn write_rows(path: &Path, header: &[String], rows: &[Vec<Val>]) -> Result<()> {
         }
         w.write_record(&record)?;
     }
-    finish_export(w, path)
+    finish_export(w, &dir.path(name))
 }
