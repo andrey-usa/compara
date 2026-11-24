@@ -277,15 +277,17 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
 }
 
 /// The least heap a named sortmerge is started with: below it the engine's
-/// threads, batches and read-ahead do not fit, and runs ended on signal 6
-/// (measured: 2M-row pair, up to 18.5 MB).
-const SORTMERGE_MIN: u64 = 24 << 20;
+/// threads, batches and read-ahead do not always fit. Runs there are refused
+/// mid-run (exit 2), where they once ended on signal 6; the 200k- and 2M-row
+/// pairs were refused at up to 17.5 MB, and answered at every limit from 18
+/// MB, as the 10M-row pair did from 20 MB.
+const SORTMERGE_MIN: u64 = 20 << 20;
 
 /// The heap below which a CSV pair that does not fit `turbo` is refused
 /// rather than handed to `sortmerge`. It was twice the named engine's least,
 /// to leave room for the merge's read buffers, one per run and so growing
 /// with the input; they are sized from the heap now, and the 2M- and 10M-row
-/// pairs fall back and answer from 24 MB up.
+/// pairs fall back and answer from the named engine's least up.
 pub(crate) const SORTMERGE_FLOOR: u64 = SORTMERGE_MIN;
 
 /// Turns [`Engine::Auto`] into a concrete backend.
