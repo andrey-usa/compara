@@ -674,7 +674,10 @@ pub(crate) struct Partitions<'a> {
 /// [`merge_footers`] for parts that carry `partitions` in their paths: each
 /// partition column the files do not already have is added to the schema as
 /// text, and to every row group as a chunk of one dictionary value -- two
-/// pages of a few bytes, handed to `place` to write and say where.
+/// pages of a few bytes, handed to `place` to write and say where. One the
+/// files have too is made the same text column in their place, its chunks
+/// the path's value: a Hive table's partition value is its directory's, as
+/// DuckDB and Polars read one, and as a CSV or JSON part is given it.
 pub(crate) fn merge_footers_with(
     parts: &[(u64, &[u8])],
     names: &[&str],
@@ -708,10 +711,19 @@ fn merge(
         whole
     };
     let schema0 = part_schema(&read_file_meta(&with_magic(first), names[0])?);
-    // The partition columns the files do not have themselves.
+    // The partition columns the files do not have themselves, and those they
+    // do, by their column's place.
     let extra: Vec<usize> = partitions.map_or(Vec::new(), |p| {
         (0..p.names.len())
             .filter(|&i| !schema0.iter().any(|c| c.0 == p.names[i]))
+            .collect()
+    });
+    let own: Vec<(usize, usize)> = partitions.map_or(Vec::new(), |p| {
+        (0..p.names.len())
+            .filter_map(|i| {
+                let column = schema0.iter().position(|c| c.0 == p.names[i])?;
+                Some((column, i))
+            })
             .collect()
     });
     let mut rows = 0i64;
@@ -739,28 +751,36 @@ fn merge(
                 4 => {
                     let (_, n) = t.list()?;
                     for _ in 0..n {
-                        let added: Vec<(&str, &str)> = extra
+                        let pt = partitions;
+                        let value = |i: usize| {
+                            let pt = pt.expect("partition columns come from partitions");
+                            (pt.names[i].as_str(), pt.values[p][i].as_str())
+                        };
+                        let added: Vec<(&str, &str)> = extra.iter().map(|&i| value(i)).collect();
+                        let replaced: Vec<(usize, &str, &str)> = own
                             .iter()
-                            .map(|&i| {
-                                let pt = partitions.expect("extra columns come from partitions");
-                                (pt.names[i].as_str(), pt.values[p][i].as_str())
+                            .map(|&(column, i)| {
+                                let (n, v) = value(i);
+                                (column, n, v)
                             })
                             .collect();
-                        merge_row_group(&mut t, &mut groups, base, name, &added, place)?;
+                        merge_row_group(&mut t, &mut groups, base, name, &added, &replaced, place)?;
                     }
                     group_count += n;
                 }
                 8 | 9 => return unsupported("encrypted parquet files are not read here", name),
                 // The schema, with the partition columns added after the
-                // file's own.
-                2 if p == 0 && !extra.is_empty() => {
-                    let pt = partitions.expect("extra columns come from partitions");
+                // file's own, and those it has made text.
+                2 if p == 0 && (!extra.is_empty() || !own.is_empty()) => {
+                    let pt = partitions.expect("partition columns come from partitions");
                     let added: Vec<&str> = extra.iter().map(|&i| pt.names[i].as_str()).collect();
-                    kept.push((id, ty, schema_with(&mut t, &added)?));
+                    let replaced: Vec<usize> = own.iter().map(|&(column, _)| column).collect();
+                    kept.push((id, ty, schema_with(&mut t, &added, &replaced)?));
                 }
                 // Column orders name every column; with columns added they
-                // would not, and nothing here reads them.
-                7 if !extra.is_empty() => t.skip(ty)?,
+                // would not, a replaced one's would be of its old type, and
+                // nothing here reads them.
+                7 if !extra.is_empty() || !own.is_empty() => t.skip(ty)?,
                 _ if p == 0 => {
                     let from = t.at;
                     t.skip(ty)?;
@@ -819,8 +839,9 @@ fn row_group_rows(t: &Thrift) -> Result<i64> {
 }
 
 /// The schema list with `added` text columns after the file's own, the root's
-/// child count raised to match.
-fn schema_with(t: &mut Thrift, added: &[&str]) -> Result<Vec<u8>> {
+/// child count raised to match, and the columns at the places `replaced`
+/// holds made text columns of their own names.
+fn schema_with(t: &mut Thrift, added: &[&str], replaced: &[usize]) -> Result<Vec<u8>> {
     let mut out = Out { b: Vec::new() };
     let (elem, n) = t.list()?;
     if n == 0 || elem != T_STRUCT {
@@ -843,26 +864,55 @@ fn schema_with(t: &mut Thrift, added: &[&str]) -> Result<Vec<u8>> {
             out.copy(t, id, &mut olast, ty)?;
         }
     }
-    let from = t.at;
-    for _ in 1..n {
-        t.skip(T_STRUCT)?;
+    // The columns: flat, as the reader takes them, so the column at place
+    // `c` is the schema's element `c + 1`.
+    for column in 0..n.saturating_sub(1) {
+        let from = t.at;
+        if replaced.contains(&column) {
+            let name = element_name(t)?;
+            text_element(&mut out, &name);
+        } else {
+            t.skip(T_STRUCT)?;
+            out.b.extend_from_slice(&t.d[from..t.at]);
+        }
     }
-    out.b.extend_from_slice(&t.d[from..t.at]);
     for name in added {
-        // type BYTE_ARRAY, REQUIRED, the name, converted type UTF8.
-        let mut last = 0i16;
-        out.field(1, &mut last, T_I32);
-        out.zigzag(TYPE_BYTE_ARRAY);
-        out.field(3, &mut last, T_I32);
-        out.zigzag(0);
-        out.field(4, &mut last, T_BINARY);
-        out.varint(name.len() as u64);
-        out.b.extend_from_slice(name.as_bytes());
-        out.field(6, &mut last, T_I32);
-        out.zigzag(0);
-        out.b.push(T_STOP);
+        text_element(&mut out, name.as_bytes());
     }
     Ok(out.b)
+}
+
+/// A schema element's name, the element read past.
+fn element_name(t: &mut Thrift) -> Result<Vec<u8>> {
+    let (mut id, mut last) = (0i16, 0i16);
+    let mut name = Vec::new();
+    loop {
+        let ty = t.field(&mut id, &mut last)?;
+        if ty == T_STOP {
+            return Ok(name);
+        }
+        if id == 4 && ty == T_BINARY {
+            name = t.binary()?.to_vec();
+        } else {
+            t.skip(ty)?;
+        }
+    }
+}
+
+/// A schema element of a text column: type BYTE_ARRAY, REQUIRED, the name,
+/// converted type UTF8.
+fn text_element(out: &mut Out, name: &[u8]) {
+    let mut last = 0i16;
+    out.field(1, &mut last, T_I32);
+    out.zigzag(TYPE_BYTE_ARRAY);
+    out.field(3, &mut last, T_I32);
+    out.zigzag(0);
+    out.field(4, &mut last, T_BINARY);
+    out.varint(name.len() as u64);
+    out.b.extend_from_slice(name);
+    out.field(6, &mut last, T_I32);
+    out.zigzag(0);
+    out.b.push(T_STOP);
 }
 
 /// One row group's chunk of a partition column: `rows` copies of `value`, as
@@ -956,15 +1006,17 @@ fn constant_chunk(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_row_group(
     t: &mut Thrift,
     out: &mut Out,
     base: u64,
     name: &str,
     added: &[(&str, &str)],
+    replaced: &[(usize, &str, &str)],
     place: &mut dyn FnMut(&[u8]) -> Result<u64>,
 ) -> Result<()> {
-    let rows = if added.is_empty() {
+    let rows = if added.is_empty() && replaced.is_empty() {
         0
     } else {
         row_group_rows(t)?
@@ -981,8 +1033,14 @@ fn merge_row_group(
                 let (elem, n) = t.list()?;
                 out.field(1, &mut olast, T_LIST);
                 out.list(elem, n + added.len());
-                for _ in 0..n {
-                    merge_chunk(t, out, base, name)?;
+                for c in 0..n {
+                    match replaced.iter().find(|r| r.0 == c) {
+                        Some(&(_, column, value)) => {
+                            t.skip(T_STRUCT)?;
+                            constant_chunk(out, column, value, rows, place)?;
+                        }
+                        None => merge_chunk(t, out, base, name)?,
+                    }
                 }
                 for (column, value) in added {
                     constant_chunk(out, column, value, rows, place)?;

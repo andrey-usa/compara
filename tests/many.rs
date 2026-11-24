@@ -320,6 +320,78 @@ fn partition_values_go_into_a_json_row_and_nowhere_inside_it() {
     }
 }
 
+/// A partition column the rows hold too takes the path's value in every row,
+/// as DuckDB reads a Hive table of CSV, JSON or Parquet parts and Polars one
+/// of Parquet parts. compara kept the part's own value, and a JSON part
+/// decided by its first row for all of them: the path's value overwrote a
+/// later row's own where the first row had none, and a later row without
+/// one got nothing where the first row had one. Every format, either first
+/// row, is now the flat file with the path's value.
+#[test]
+fn a_partition_column_the_rows_hold_too_takes_the_path_value() {
+    let d = scratch("own-partition");
+    // 250 rows a part, so the Parquet parts have several row groups.
+    let ids = |day: u32| (0..250u32).map(move |i| day * 1000 + i);
+    let own = |id: u32| match id % 3 {
+        0 => None,
+        1 => Some(String::new()),
+        _ => Some(format!("own{id}")),
+    };
+    let mut flat = String::from("id,v,day\n");
+    for day in [1u32, 2] {
+        let dir = |fmt: &str| {
+            let dir = d.0.join(fmt).join(format!("day={day}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        let (mut csv, mut lacks, mut has) =
+            (String::from("id,day,v\n"), String::new(), String::new());
+        let mut w = Writer::create(
+            &dir("parquet").join("part-0.parquet"),
+            &["id", "day", "v"],
+            Compression::None,
+            100,
+        )
+        .unwrap();
+        for id in ids(day) {
+            let v = format!("v{id}");
+            flat.push_str(&format!("{id},{v},{day}\n"));
+            let mine = own(id).unwrap_or_default();
+            csv.push_str(&format!("{id},{mine},{v}\n"));
+            w.write_row([id.to_string().as_str(), mine.as_str(), v.as_str()].into_iter())
+                .unwrap();
+            // The first row decides nothing: one part's first row lacks the
+            // column, the other's has it.
+            let member = |first_has: bool| match own(id) {
+                Some(m) => format!("{{\"id\":{id},\"day\":\"{m}\",\"v\":\"{v}\"}}\n"),
+                None if first_has && id % 1000 == 0 => {
+                    format!("{{\"id\":{id},\"day\":\"x\",\"v\":\"{v}\"}}\n")
+                }
+                None => format!("{{\"id\":{id},\"v\":\"{v}\"}}\n"),
+            };
+            lacks.push_str(&member(false));
+            has.push_str(&member(true));
+        }
+        w.finish().unwrap();
+        std::fs::write(dir("csv").join("part-0.csv"), csv).unwrap();
+        std::fs::write(dir("lacks").join("part-0.json"), lacks).unwrap();
+        std::fs::write(dir("has").join("part-0.json"), has).unwrap();
+    }
+    let flat_path = d.0.join("flat.csv");
+    std::fs::write(&flat_path, flat).unwrap();
+    let flat_path = flat_path.to_string_lossy().into_owned();
+    for layout in ["csv", "parquet", "lacks", "has"] {
+        let got = compare(
+            &d.0.join(layout).to_string_lossy(),
+            &flat_path,
+            &["-k", "id,day"],
+        );
+        assert_eq!(got.0, 0, "{layout}: {}", got.1);
+        assert!(got.2.contains("\"matched\":500"), "{layout}: {}", got.2);
+        assert!(got.2.contains("\"changed\":0"), "{layout}: {}", got.2);
+    }
+}
+
 /// `name=value` directories are columns: keyed on one, rows that repeat a key
 /// in different partitions are different rows, and the answer is the one a
 /// flat file holding the column gives -- for Parquet, CSV and JSON parts,

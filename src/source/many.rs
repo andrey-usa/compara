@@ -456,8 +456,6 @@ pub(crate) struct Combined {
     pub(crate) parts: usize,
     /// The table's partition columns, from its paths.
     partitions: Vec<String>,
-    /// Which of them a text part gets: those its header does not have.
-    text_partitions: Option<Vec<usize>>,
 }
 
 impl Combined {
@@ -475,7 +473,6 @@ impl Combined {
             footers: Vec::new(),
             parts: 0,
             partitions: Vec::new(),
-            text_partitions: None,
         };
         Ok((combined, temp))
     }
@@ -533,9 +530,7 @@ impl Combined {
                     )));
                 }
             };
-            let written = self
-                .with_partitions(reader, out, base, values)
-                .map_err(|e| Error::new(format!("cannot read {name}: {e}")))?;
+            let written = self.with_partitions(name, reader, out, base, values)?;
             self.end = base + written;
             return self.placed(name, base, written, false, values);
         }
@@ -566,15 +561,26 @@ impl Combined {
     /// Copies a text part to `out` at `base`, each row given the partition
     /// values as fields of its own -- the header the names -- minding quoted
     /// fields that hold newlines; a JSON row gets them as its last members
-    /// (see [`JsonRows`]). Columns the first part already has are left as
-    /// they are. The bytes written.
+    /// (see [`JsonRows`]). The bytes written.
+    ///
+    /// A partition column the part's rows hold as well takes the path's
+    /// value in every row, as DuckDB 2.0.1 reads a Hive table of CSV, JSON or
+    /// Parquet parts and Polars 2.2.0 one of Parquet parts: a CSV part's own
+    /// field is replaced, a JSON row's own member is followed by the path's,
+    /// and of a name repeated in one object the last is the value (as
+    /// `Combined::finish` gives a Parquet part's own column chunk the path's
+    /// value). Before, the part's own value stayed, and a JSON part decided
+    /// by its first row for all of them, so a row of its own with the column
+    /// lost it to the path's when the first row had none.
     fn with_partitions(
         &mut self,
+        name: &str,
         input: Box<dyn Read>,
         out: File,
         base: u64,
         values: &[String],
-    ) -> std::io::Result<u64> {
+    ) -> Result<u64> {
+        let cannot = |e: std::io::Error| Error::new(format!("cannot read {name}: {e}"));
         let mut input = std::io::BufReader::with_capacity(1 << 20, input);
         let mut w =
             std::io::BufWriter::with_capacity(1 << 20, crate::memory::WriteBehind::at(out, base));
@@ -584,18 +590,24 @@ impl Combined {
         let mut quoted = false;
         let mut delimiter = b',';
         let mut json = false;
+        // CSV: the partition columns the header lacks, appended to each row,
+        // and those it has, by their place in it, replaced in each row.
         let mut take: Vec<usize> = Vec::new();
+        let mut replace: Vec<(usize, usize)> = Vec::new();
+        // CSV with a column to replace: the record read so far, which a
+        // quoted field can carry across lines.
+        let mut record: Vec<u8> = Vec::new();
         let mut rows = JsonRows::default();
         let mut closes: Vec<(usize, bool)> = Vec::new();
-        // What a JSON row gets before its closing brace, once `take` is known.
-        let mut members: Option<Vec<u8>> = None;
+        // What a JSON row gets before its closing brace.
+        let members = json_members(&self.partitions, values);
         let mut put = |w: &mut dyn Write, bytes: &[u8]| -> std::io::Result<()> {
             written += bytes.len() as u64;
             w.write_all(bytes)
         };
         loop {
             line.clear();
-            if std::io::BufRead::read_until(&mut input, b'\n', &mut line)? == 0 {
+            if std::io::BufRead::read_until(&mut input, b'\n', &mut line).map_err(cannot)? == 0 {
                 break;
             }
             let body_end = line.len()
@@ -610,25 +622,22 @@ impl Combined {
                 json = trimmed.starts_with('{');
                 if !json {
                     delimiter = crate::columns::detect_delimiter(&text);
-                    let partitions = &self.partitions;
-                    let has = |n: &str| {
-                        text.split(delimiter as char)
-                            .any(|c| c.trim().trim_matches('"') == n)
-                    };
-                    take = self
-                        .text_partitions
-                        .get_or_insert_with(|| {
-                            (0..partitions.len())
-                                .filter(|&i| !has(&partitions[i]))
-                                .collect()
-                        })
-                        .clone();
-                    put(&mut w, body)?;
-                    for &i in &take {
-                        put(&mut w, &[delimiter])?;
-                        put(&mut w, &field(&self.partitions[i], delimiter))?;
+                    let header: Vec<&str> = field_spans(text.as_bytes(), delimiter)
+                        .into_iter()
+                        .map(|(from, to)| text[from..to].trim().trim_matches('"'))
+                        .collect();
+                    for (i, column) in self.partitions.iter().enumerate() {
+                        match header.iter().position(|c| c == column) {
+                            Some(at) => replace.push((at, i)),
+                            None => take.push(i),
+                        }
                     }
-                    put(&mut w, ending)?;
+                    put(&mut w, body).map_err(cannot)?;
+                    for &i in &take {
+                        put(&mut w, &[delimiter]).map_err(cannot)?;
+                        put(&mut w, &field(&self.partitions[i], delimiter)).map_err(cannot)?;
+                    }
+                    put(&mut w, ending).map_err(cannot)?;
                     continue;
                 }
             }
@@ -639,44 +648,58 @@ impl Combined {
                 let mut from = 0;
                 rows.walk(body, &mut closes);
                 for &(at, filled) in &closes {
-                    if members.is_none() {
-                        // The first row is read: the columns it has are the
-                        // part's, as a CSV part's header is.
-                        let partitions = &self.partitions;
-                        let names = &rows.names;
-                        let take = self.text_partitions.get_or_insert_with(|| {
-                            (0..partitions.len())
-                                .filter(|&i| !names.contains(&partitions[i]))
-                                .collect()
-                        });
-                        members = Some(json_members(partitions, take, values));
-                    }
-                    let members = members.as_deref().unwrap_or_default();
-                    put(&mut w, &body[from..at])?;
+                    put(&mut w, &body[from..at]).map_err(cannot)?;
                     if !members.is_empty() {
                         if filled {
-                            put(&mut w, b",")?;
+                            put(&mut w, b",").map_err(cannot)?;
                         }
-                        put(&mut w, members)?;
+                        put(&mut w, &members).map_err(cannot)?;
                     }
                     from = at;
                 }
-                put(&mut w, &body[from..])?;
+                put(&mut w, &body[from..]).map_err(cannot)?;
+                put(&mut w, ending).map_err(cannot)?;
+                continue;
+            }
+            quoted ^= body.iter().filter(|&&b| b == b'"').count() % 2 == 1;
+            // A row ends where a line ends outside quotes; a blank line is
+            // not a row and gets nothing.
+            let row_ends = !quoted && !body.is_empty() && body != b"\r";
+            if replace.is_empty() {
+                put(&mut w, body).map_err(cannot)?;
+            } else if quoted {
+                // The record goes on past this line.
+                record.extend_from_slice(body);
+                record.extend_from_slice(ending);
+                continue;
             } else {
-                put(&mut w, body)?;
-                quoted ^= body.iter().filter(|&&b| b == b'"').count() % 2 == 1;
-                // A row ends where a line ends outside quotes; a blank line is
-                // not a row and gets nothing.
-                if !quoted && !body.is_empty() && body != b"\r" {
-                    for &i in &take {
-                        put(&mut w, &[delimiter])?;
-                        put(&mut w, &field(&values[i], delimiter))?;
-                    }
+                record.extend_from_slice(body);
+                if row_ends {
+                    put_replaced(
+                        &mut |b| put(&mut w, b),
+                        &record,
+                        delimiter,
+                        &replace,
+                        values,
+                    )
+                    .map_err(cannot)?;
+                } else {
+                    put(&mut w, &record).map_err(cannot)?;
+                }
+                record.clear();
+            }
+            if row_ends {
+                for &i in &take {
+                    put(&mut w, &[delimiter]).map_err(cannot)?;
+                    put(&mut w, &field(&values[i], delimiter)).map_err(cannot)?;
                 }
             }
-            put(&mut w, ending)?;
+            put(&mut w, ending).map_err(cannot)?;
         }
-        w.flush()?;
+        // A quote left open at the end: copied as it is, for the reader to
+        // refuse with its line.
+        put(&mut w, &record).map_err(cannot)?;
+        w.flush().map_err(cannot)?;
         Ok(written)
     }
 
@@ -885,19 +908,66 @@ fn json_string(value: &str) -> Vec<u8> {
     serde_json::to_vec(value).unwrap_or_else(|_| b"\"\"".to_vec())
 }
 
-/// The partition columns `take` names as JSON members, `"date":"2026-10-01"`,
+/// The partition columns as JSON members, `"date":"2026-10-01"`,
 /// comma-separated.
-fn json_members(names: &[String], take: &[usize], values: &[String]) -> Vec<u8> {
+fn json_members(names: &[String], values: &[String]) -> Vec<u8> {
     let mut out = Vec::new();
-    for (k, &i) in take.iter().enumerate() {
+    for (k, (name, value)) in names.iter().zip(values).enumerate() {
         if k > 0 {
             out.push(b',');
         }
-        out.extend(json_string(&names[i]));
+        out.extend(json_string(name));
         out.push(b':');
-        out.extend(json_string(&values[i]));
+        out.extend(json_string(value));
     }
     out
+}
+
+/// Where each field of a CSV record starts and ends, its quotes kept: a
+/// delimiter inside quotes is text.
+fn field_spans(record: &[u8], delimiter: u8) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let (mut from, mut quoted) = (0, false);
+    for (at, &b) in record.iter().enumerate() {
+        if b == b'"' {
+            quoted = !quoted;
+        } else if b == delimiter && !quoted {
+            spans.push((from, at));
+            from = at + 1;
+        }
+    }
+    spans.push((from, record.len()));
+    spans
+}
+
+/// A CSV record with the fields `replace` places, `(column, partition)`,
+/// holding the partition's value instead; a short record is given empty
+/// fields up to them.
+fn put_replaced(
+    put: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    record: &[u8],
+    delimiter: u8,
+    replace: &[(usize, usize)],
+    values: &[String],
+) -> std::io::Result<()> {
+    let spans = field_spans(record, delimiter);
+    let width = replace
+        .iter()
+        .map(|&(at, _)| at + 1)
+        .max()
+        .unwrap_or(0)
+        .max(spans.len());
+    for column in 0..width {
+        if column > 0 {
+            put(&[delimiter])?;
+        }
+        if let Some(&(_, i)) = replace.iter().find(|&&(at, _)| at == column) {
+            put(&field(&values[i], delimiter))?;
+        } else if let Some(&(from, to)) = spans.get(column) {
+            put(&record[from..to])?;
+        }
+    }
+    Ok(())
 }
 
 /// A stream of JSON objects read a line at a time, for where its rows close.
@@ -908,10 +978,7 @@ fn json_members(names: &[String], take: &[usize], values: &[String]) -> Vec<u8> 
 /// line too, and the values went into every such object as well; of several
 /// rows on a line, the first alone got them. Only the depth tells a row from
 /// an object inside one, and only a walk from the start of the part knows
-/// it: brackets, braces and strings, across lines. The values go in before
-/// a row's closing brace, where the walk has seen the row's members, so
-/// that the first row's names, which decide the columns a part already has,
-/// are known by then.
+/// it: brackets, braces and strings, across lines.
 #[derive(Default)]
 struct JsonRows {
     depth: u32,
@@ -923,22 +990,6 @@ struct JsonRows {
     opened: bool,
     /// The row being read has a member, so what is added follows a comma.
     filled: bool,
-    /// Reading the first row: its member names are kept.
-    first: Option<FirstRow>,
-    first_done: bool,
-    /// The first row's member names, its escapes undone, once it has closed.
-    names: Vec<String>,
-}
-
-/// The first row's member names as written, quotes included, while it is
-/// read.
-#[derive(Default)]
-struct FirstRow {
-    names: Vec<Vec<u8>>,
-    /// The name being read.
-    name: Option<Vec<u8>>,
-    /// Outside any value: the next string is a member's name.
-    name_next: bool,
 }
 
 /// Whether `bytes` hold no bracket, brace or backslash, and their quotes in
@@ -980,7 +1031,7 @@ impl JsonRows {
     /// member: the offset of its closing brace.
     fn walk(&mut self, line: &[u8], closes: &mut Vec<(usize, bool)>) {
         self.escape = false;
-        if self.first_done && !self.string && self.settled(line, closes) {
+        if !self.string && self.settled(line, closes) {
             return;
         }
         let mut at = 0;
@@ -988,30 +1039,19 @@ impl JsonRows {
             if self.string {
                 if self.escape {
                     self.escape = false;
-                    self.keep_name(line[at]);
                     at += 1;
                     continue;
                 }
-                let stop = if self.first.is_some() {
-                    at
-                } else {
-                    match line[at..].iter().position(|&b| b == b'"' || b == b'\\') {
-                        Some(k) => at + k,
-                        None => return,
-                    }
+                let stop = match line[at..].iter().position(|&b| b == b'"' || b == b'\\') {
+                    Some(k) => at + k,
+                    None => return,
                 };
                 let b = line[stop];
-                self.keep_name(b);
                 at = stop + 1;
                 if b == b'\\' {
                     self.escape = true;
-                } else if b == b'"' {
+                } else {
                     self.string = false;
-                    if let Some(first) = &mut self.first
-                        && let Some(name) = first.name.take()
-                    {
-                        first.names.push(name);
-                    }
                 }
                 continue;
             }
@@ -1023,19 +1063,7 @@ impl JsonRows {
                 self.opened = false;
                 self.filled = line[at] != b'}';
             }
-            let b = line[at];
-            if self.depth == 1
-                && let Some(first) = &mut self.first
-            {
-                // The first row's members, a byte at a time: a string after
-                // the brace or a comma is a name.
-                match b {
-                    b'"' if first.name_next => first.name = Some(Vec::new()),
-                    b',' => first.name_next = true,
-                    _ if b.is_ascii_whitespace() => {}
-                    _ => first.name_next = false,
-                }
-            } else if !STRUCTURE[b as usize] {
+            if !STRUCTURE[line[at] as usize] {
                 match line[at..].iter().position(|&b| STRUCTURE[b as usize]) {
                     Some(k) => at += k,
                     None => return,
@@ -1043,19 +1071,10 @@ impl JsonRows {
                 continue;
             }
             match line[at] {
-                b'"' => {
-                    self.string = true;
-                    self.keep_name(b'"');
-                }
+                b'"' => self.string = true,
                 b'{' | b'[' => {
                     if self.depth == 0 {
                         self.opened = true;
-                        if !self.first_done {
-                            self.first = Some(FirstRow {
-                                name_next: true,
-                                ..FirstRow::default()
-                            });
-                        }
                     }
                     self.depth += 1;
                 }
@@ -1065,14 +1084,6 @@ impl JsonRows {
                     0 => {}
                     1 => {
                         self.depth = 0;
-                        if let Some(first) = self.first.take() {
-                            self.first_done = true;
-                            self.names = first
-                                .names
-                                .iter()
-                                .filter_map(|n| serde_json::from_slice::<String>(n).ok())
-                                .collect();
-                        }
                         closes.push((at, self.filled));
                     }
                     _ => self.depth -= 1,
@@ -1112,13 +1123,6 @@ impl JsonRows {
             self.filled = true;
         }
         true
-    }
-
-    /// Keeps a byte of the first row's member name being read.
-    fn keep_name(&mut self, b: u8) {
-        if let Some(name) = self.first.as_mut().and_then(|f| f.name.as_mut()) {
-            name.push(b);
-        }
     }
 }
 
@@ -1238,7 +1242,7 @@ mod tests {
     }
 
     /// Each line's row closes, as (line, offset, the row had a member).
-    fn closes(text: &str) -> (Vec<(usize, usize, bool)>, Vec<String>) {
+    fn closes(text: &str) -> Vec<(usize, usize, bool)> {
         let mut rows = JsonRows::default();
         let mut out = Vec::new();
         for (n, line) in text.split('\n').enumerate() {
@@ -1246,7 +1250,7 @@ mod tests {
             rows.walk(line.as_bytes(), &mut at);
             out.extend(at.into_iter().map(|(i, filled)| (n, i, filled)));
         }
-        (out, rows.names)
+        out
     }
 
     #[test]
@@ -1255,14 +1259,12 @@ mod tests {
         // own; a brace in a string, escaped quote and all, is text.
         let pretty =
             "{\n  \"d\\u0061y\": 1,\n  \"t\": [\n    {\n      \"x\": \"}\\\"{\"\n    }\n  ]\n}\n{}";
-        let (got, names) = closes(pretty);
+        let got = closes(pretty);
         assert_eq!(got, vec![(7, 0, true), (8, 1, false)]);
-        // The first row's names, escapes undone: `day` is a column it has.
-        assert_eq!(names, vec!["day".to_string(), "t".to_string()]);
         // Newline-delimited, several on a line, and a nested one: each row's
         // own closing brace, whichever way the line is settled.
         let lines = "{\"a\":1}\n{\"a\":2} {\"a\":{\"b\":3}}\n {\"a\":\"[\"} \n{\"a\":\"\\\\\"}";
-        let (got, names) = closes(lines);
+        let got = closes(lines);
         assert_eq!(
             got,
             vec![
@@ -1273,10 +1275,23 @@ mod tests {
                 (3, 9, true)
             ]
         );
-        assert_eq!(names, vec!["a".to_string()]);
         // A backslash that ends a line escapes the line feed, not the next
         // line's first byte.
-        let (got, _) = closes("{\"a\":\"x\\\n\"}\n{\"a\":1}");
+        let got = closes("{\"a\":\"x\\\n\"}\n{\"a\":1}");
         assert_eq!(got, vec![(1, 1, true), (2, 6, true)]);
+    }
+
+    #[test]
+    fn a_csv_record_has_its_partition_field_replaced() {
+        let mut out = Vec::new();
+        let values = ["2026".to_string(), "a,b".to_string()];
+        let mut put = |b: &[u8]| {
+            out.extend_from_slice(b);
+            Ok(())
+        };
+        // `d` is the second field; a quoted field holds the delimiter.
+        put_replaced(&mut put, b"1,own,\"x,y\"", b',', &[(1, 0)], &values).expect("written");
+        put_replaced(&mut put, b"|2", b',', &[(1, 0), (3, 1)], &values).expect("written");
+        assert_eq!(out, b"1,2026,\"x,y\"|2,2026,,\"a,b\"");
     }
 }

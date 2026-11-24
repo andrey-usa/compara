@@ -45,7 +45,9 @@ aws s3 cp s3://bucket/a.ndjson - | compara compare - b.ndjson -k id --json -
   reads them. Hive partitions are columns: under `orders/`, the parts of
   `date=2026-10-01/region=eu/` carry `date` and `region` (as text), so
   `-k date,order_id` keys a table whose ids repeat from day to day, and a
-  partitioned table compares with a flat export that has those columns.
+  partitioned table compares with a flat export that has those columns. A
+  part whose rows hold such a column too takes the directory's value in
+  every row, as DuckDB and Polars read the table.
   Names starting with `.` or `_` (`_SUCCESS`, `.crc`) are passed over.
 - **A Delta table is read at a version**: `s3://lake/orders/` is its latest
   version, `s3://lake/orders@v41` the forty-first: the files its log
