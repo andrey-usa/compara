@@ -2646,11 +2646,18 @@ impl RowParser {
         pos += 1;
 
         loop {
-            // Compact ndjson separates members with a bare `,"`, which goes
-            // straight to the next key; the general path takes the comma, loops
-            // back and skips space twice to get there.
+            // Compact ndjson separates members with a bare `,"`, and
+            // json.dumps by default with `, "`: either goes straight to the
+            // next key; the general path takes the comma, loops back and
+            // skips space twice to get there.
             if pos + 1 < end && data[pos] == b',' && data[pos + 1] == b'"' {
                 pos += 1;
+            } else if pos + 2 < end
+                && data[pos] == b','
+                && data[pos + 1] == b' '
+                && data[pos + 2] == b'"'
+            {
+                pos += 2;
             } else {
                 while pos < end && json_space(data[pos]) {
                     pos += 1;
@@ -2679,9 +2686,16 @@ impl RowParser {
             }
             let key = &data[key_from..key_end - 1];
             pos = key_end;
-            // And `":"` between a key and a string value, likewise.
+            // And `":"` between a key and a string value, likewise, and
+            // json.dumps' `": "` before any value.
             if pos + 1 < end && data[pos] == b':' && data[pos + 1] == b'"' {
                 pos += 1;
+            } else if pos + 2 < end
+                && data[pos] == b':'
+                && data[pos + 1] == b' '
+                && !json_space(data[pos + 2])
+            {
+                pos += 2;
             } else {
                 while pos < end && json_space(data[pos]) {
                     pos += 1;
