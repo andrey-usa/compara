@@ -391,19 +391,26 @@ fn mb(n: usize) -> String {
     }
 }
 
-/// `data.starts_with(text)` for a `text` of a few bytes, as two loads of eight
-/// that overlap rather than a call: it is asked once a member of every row.
+/// `data.starts_with(text)` for a `text` of a few bytes, as loads that overlap
+/// (two of four bytes, or two or four of eight, up to 32) rather than a call:
+/// it is asked once a member of every row.
 #[inline(always)]
 fn starts_with_short(data: &[u8], text: &[u8]) -> bool {
     let n = text.len();
     if data.len() < n {
         return false;
     }
-    if !(8..=16).contains(&n) {
+    if !(4..=32).contains(&n) {
         return data[..n] == *text;
     }
+    if n < 8 {
+        let word = |s: &[u8], at: usize| u32::from_le_bytes(s[at..at + 4].try_into().unwrap());
+        return word(data, 0) == word(text, 0) && word(data, n - 4) == word(text, n - 4);
+    }
     let word = |s: &[u8], at: usize| u64::from_le_bytes(s[at..at + 8].try_into().unwrap());
-    word(data, 0) == word(text, 0) && word(data, n - 8) == word(text, n - 8)
+    word(data, 0) == word(text, 0)
+        && word(data, n - 8) == word(text, n - 8)
+        && (n <= 16 || (word(data, 8) == word(text, 8) && word(data, n - 16) == word(text, n - 16)))
 }
 
 /// The keys that objects in `data[lo..hi]` carry and `known` does not hold,
@@ -544,31 +551,9 @@ fn later_keys<const LINES: bool>(
         let mut lost = false;
         let mut member = 0usize; // the place of this key in the first object
         loop {
-            // Compact ndjson separates members with a bare `,"`, which goes
-            // straight to the next key, as it does in the row parser.
-            if pos + 1 < end && data[pos] == b',' && data[pos + 1] == b'"' {
-                pos += 1;
-            } else {
-                while pos < end {
-                    match data[pos] {
-                        b',' | b' ' | b'\t' | b'\r' => {}
-                        b'\n' => lines = true,
-                        _ => break,
-                    }
-                    pos += 1;
-                }
-            }
-            if pos >= end {
-                break;
-            }
-            if data[pos] == b'}' {
-                pos += 1;
-                closed = true;
-                break;
-            }
-            if data[pos] != b'"' {
-                break; // malformed: the comparison stops reading the object here too
-            }
+            // The common member: the comma before it, its name and its
+            // colon written as this piece's first row writes them, spaces
+            // and all (`spellings`), which go straight to its value.
             if let Some(text) = spelled.get(member)
                 && !text.is_empty()
                 && pos + text.len() < end
@@ -588,6 +573,25 @@ fn later_keys<const LINES: bool>(
                     break;
                 }
                 continue;
+            }
+            while pos < end {
+                match data[pos] {
+                    b',' | b' ' | b'\t' | b'\r' => {}
+                    b'\n' => lines = true,
+                    _ => break,
+                }
+                pos += 1;
+            }
+            if pos >= end {
+                break;
+            }
+            if data[pos] == b'}' {
+                pos += 1;
+                closed = true;
+                break;
+            }
+            if data[pos] != b'"' {
+                break; // malformed: the comparison stops reading the object here too
             }
             let key_from = pos + 1;
             let (key_end, escaped) = later_string::<_, LINES>(scan, data, pos, end, &mut lines);
@@ -763,12 +767,16 @@ fn later_keys<const LINES: bool>(
     })
 }
 
-/// Each of the first object's members as a compact writer spells it,
-/// `"name":`, unless the first row of `data[lo..end]` writes it with escapes
-/// at its own place (Python's `json.dumps` writes `café` as `caf\u00e9`, and
-/// in every row): then as that row spells it. A name that needs an escape and
-/// is not written so there has no spelling and takes the walk. Out of line:
-/// once a piece.
+/// Each of the first object's members as the first row of `data[lo..end]`
+/// writes it at its own place: the comma before it (none before the first),
+/// the space around that comma and the colon, the name with the escapes it
+/// carries (Python's `json.dumps` writes `café` as `café`, and in every
+/// row), and the colon. A row that writes those bytes is told by them alone,
+/// a name, its separators and where its value starts, as the walk would
+/// read them. A member the first row does not give so is spelled as the
+/// row spaces the ones it gives (`json.dumps` by default writes `, ` and
+/// `: `; compact writers neither), unless its name needs an escape: then it
+/// has no spelling and takes the walk. Out of line: once a piece.
 #[inline(never)]
 fn spellings<const LINES: bool>(
     slab: &Slab,
@@ -778,19 +786,11 @@ fn spellings<const LINES: bool>(
     known: &[String],
 ) -> Vec<Vec<u8>> {
     let data = slab.data();
-    let mut spelled: Vec<Vec<u8>> = known
-        .iter()
-        .map(|name| {
-            if name.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20) {
-                return Vec::new();
-            }
-            let mut text = Vec::with_capacity(name.len() + 3);
-            text.push(b'"');
-            text.extend_from_slice(name.as_bytes());
-            text.extend_from_slice(b"\":");
-            text
-        })
-        .collect();
+    let mut spelled: Vec<Vec<u8>> = vec![Vec::new(); known.len()];
+    #[cfg(test)]
+    if NO_SPELLINGS.with(std::cell::Cell::get) {
+        return spelled;
+    }
     let mut at = lo;
     while at < end && json_space(data[at]) {
         at += 1;
@@ -798,75 +798,112 @@ fn spellings<const LINES: bool>(
     if open == Some(at) {
         at += 1;
     }
-    escaped_spellings::<LINES>(slab, at, end, known, &mut spelled);
+    let (comma, colon) = first_row_spellings::<LINES>(slab, at, end, known, &mut spelled);
+    for (place, (name, text)) in known.iter().zip(spelled.iter_mut()).enumerate() {
+        if !text.is_empty() || name.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20) {
+            continue;
+        }
+        if place > 0 {
+            text.extend_from_slice(comma);
+        }
+        text.push(b'"');
+        text.extend_from_slice(name.as_bytes());
+        text.push(b'"');
+        text.extend_from_slice(colon);
+    }
     spelled
 }
 
-/// The spellings the object at `data[at]` gives, with escapes, to the first
-/// object's names it writes at their own places, each followed by its colon,
-/// in place of `spelled`'s: those bytes spell that name wherever they stand,
-/// so a row that writes them is told by them as a plain name is. Read up to
-/// the first member that is not one: anything this does not follow is left
-/// to the walk, which says what is wrong with it.
-#[cold]
+#[cfg(test)]
+thread_local! {
+    /// No member spelled: the walk tells every name as it reads it, the
+    /// reference its spellings are tested against.
+    static NO_SPELLINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The spellings the object at `data[at]` gives the first object's names it
+/// writes at their own places, from the comma before each to the start of
+/// its value, into `spelled`; and how it spaces them, the comma's part and
+/// the colon's (`,` and `:` where it gives none). Read up to the first
+/// member that is not one: anything this does not follow is left to the
+/// walk, which says what is wrong with it. Only spaces are taken between
+/// tokens, so a spelling holds no line feed.
 #[inline(never)]
-fn escaped_spellings<const LINES: bool>(
-    slab: &Slab,
+fn first_row_spellings<'d, const LINES: bool>(
+    slab: &'d Slab,
     mut at: usize,
     end: usize,
     known: &[String],
     spelled: &mut [Vec<u8>],
-) {
+) -> (&'d [u8], &'d [u8]) {
     let data = slab.data();
     let scan = Swar;
+    let (mut comma, mut colon): (&[u8], &[u8]) = (b",", b":");
     let (mut lines, mut lost) = (false, false);
-    while at < end && json_space(data[at]) {
-        at += 1;
-    }
-    if at >= end || data[at] != b'{' {
-        return;
-    }
-    at += 1;
-    for (name, text) in known.iter().zip(spelled.iter_mut()) {
-        while at < end && matches!(data[at], b',' | b' ' | b'\t' | b'\r') {
+    let spaces = |mut at: usize| {
+        while at < end && data[at] == b' ' {
             at += 1;
         }
+        at
+    };
+    if at >= end || data[at] != b'{' {
+        return (comma, colon);
+    }
+    at += 1;
+    for (place, (name, text)) in known.iter().zip(spelled.iter_mut()).enumerate() {
+        let from = at;
+        if place > 0 {
+            if at >= end || data[at] != b',' {
+                break;
+            }
+            at += 1;
+        }
+        at = spaces(at);
         if at >= end || data[at] != b'"' {
-            return;
+            break;
         }
         let key_from = at + 1;
         let (key_end, escaped) = later_string::<_, LINES>(scan, data, at, end, &mut lines);
         // A name holding a raw line feed is the line-read walk's to refuse,
         // and one that is not UTF-8 the walk's too.
-        if lines || key_end > end || key_end <= key_from || data.get(key_end) != Some(&b':') {
-            return;
+        if lines || key_end > end || key_end <= key_from {
+            break;
         }
         let key = &data[key_from..key_end - 1];
+        let after = spaces(key_end);
+        if after >= end || data[after] != b':' {
+            break;
+        }
+        let value = spaces(after + 1);
+        if value >= end || json_space(data[value]) {
+            break;
+        }
         if escaped {
             if std::str::from_utf8(key).is_err() {
-                return;
+                break;
             }
             let spells = text_of(
                 slab,
                 pack(key_from as u64, (key_end - 1 - key_from) as u64, true),
             );
             if spells != *name {
-                return;
+                break;
             }
-            text.clear();
-            text.extend_from_slice(&data[key_from - 1..=key_end]);
         } else if key != name.as_bytes() {
-            return;
+            break;
         }
-        at = key_end + 1;
-        while at < end && json_space(data[at]) {
-            at += 1;
+        text.clear();
+        text.extend_from_slice(&data[from..value]);
+        if place > 0 {
+            comma = &data[from..key_from - 1];
         }
-        at = later_value_end::<_, LINES>(scan, data, at, end, &mut lines, &mut lost);
+        colon = &data[key_end..value];
+        at = later_value_end::<_, LINES>(scan, data, value, end, &mut lines, &mut lost);
         if lines || lost {
-            return;
+            break;
         }
     }
+    (comma, colon)
 }
 
 /// What [`json_later_keys`] found in its rows.
@@ -4344,11 +4381,12 @@ mod tests {
         assert!(!found.repeats);
     }
 
-    /// A piece's first row teaches the spelling it escapes a name with at
-    /// the name's own place, followed by its colon, and nothing past the
-    /// first member that is not so: a name out of its place, one spaced from
-    /// its colon, one holding a raw line feed (line-read) or bytes that are
-    /// not UTF-8, or one that spells another name.
+    /// A piece's first row teaches the spelling it gives a name at the
+    /// name's own place, escapes, comma and spaces included, from the comma
+    /// before it to its value; and nothing past the first member that is not
+    /// so: a name out of its place, one holding a raw line feed (line-read)
+    /// or bytes that are not UTF-8, or one that spells another name. The
+    /// rest are spelled plainly, spaced as the row spaces the ones it gives.
     #[test]
     fn the_first_row_teaches_the_spellings_it_escapes() {
         let known: Vec<String> = ["k", "caf\u{e9}", "a/b", "\u{1f600}", "v"]
@@ -4364,10 +4402,10 @@ mod tests {
         };
         let plain = [
             "\"k\":",
-            "\"caf\u{e9}\":",
-            "\"a/b\":",
-            "\"\u{1f600}\":",
-            "\"v\":",
+            ",\"caf\u{e9}\":",
+            ",\"a/b\":",
+            ",\"\u{1f600}\":",
+            ",\"v\":",
         ];
         assert_eq!(
             taught(
@@ -4375,24 +4413,48 @@ mod tests {
             ),
             [
                 "\"k\":",
-                "\"caf\\u00e9\":",
-                "\"a\\/b\":",
-                "\"\\ud83d\\ude00\":",
-                "\"v\":"
+                ", \"caf\\u00e9\":",
+                ",\"a\\/b\":",
+                ",\"\\ud83d\\ude00\":",
+                ",\"v\":"
+            ]
+        );
+        // Spaced from its colon, and json.dumps' default: what the row does
+        // not give is spaced as it spaces the rest.
+        assert_eq!(
+            taught("{\"k\":1,\"caf\\u00e9\" :2}\n"),
+            [
+                "\"k\":",
+                ",\"caf\\u00e9\" :",
+                ",\"a/b\" :",
+                ",\"\u{1f600}\" :",
+                ",\"v\" :"
+            ]
+        );
+        assert_eq!(
+            taught("{ \"k\": 1, \"caf\\u00e9\": \"x\", \"v\": 3}\n"),
+            [
+                " \"k\": ",
+                ", \"caf\\u00e9\": ",
+                ", \"a/b\": ",
+                ", \"\u{1f600}\": ",
+                ", \"v\": "
             ]
         );
         for row in [
             "{\"caf\\u00e9\":1,\"k\":2}\n",
-            "{\"k\":1,\"caf\\u00e9\" :2}\n",
             "{\"k\":1,\"caf\\u00e8\":2}\n",
             "{\"k\":1,\"caf\\u00e9\\n\":2}\n",
             "[{\"k\":1,\"caf\\u00e9\":2}]\n",
+            // Space other than spaces between tokens is the walk's.
+            "{\"k\":\t1,\"caf\\u00e9\":2}\n",
+            "{\"k\":1,\t\"caf\\u00e9\":2}\n",
         ] {
             assert_eq!(taught(row), plain, "{row}");
         }
         // Up to the member that is not one, and not past it.
         let row = "{\"k\":1,\"caf\\u00e9\":2,\"x\\u0041\":3,\"\\ud83d\\ude00\":4}\n";
-        assert_eq!(taught(row)[1], "\"caf\\u00e9\":");
+        assert_eq!(taught(row)[1], ",\"caf\\u00e9\":");
         assert_eq!(taught(row)[3], plain[3]);
         // A raw line feed in the name, and bytes that are not UTF-8.
         let mut bytes = b"{\"k\":1,\"caf\\u00e9\n\":2}\n".to_vec();
@@ -4412,7 +4474,208 @@ mod tests {
         let slab = json_slab(text);
         assert_eq!(
             spellings::<false>(&slab, 0, text.len(), Some(0), &known)[1],
-            b"\"caf\\u00e9\":"
+            b",\"caf\\u00e9\":"
+        );
+    }
+
+    /// `starts_with_short` is `starts_with` at every length it takes words
+    /// for and past them, whichever byte differs.
+    #[test]
+    fn starts_with_short_is_starts_with() {
+        for n in 0..40usize {
+            let text: Vec<u8> = (0..n as u8).map(|i| b'a' + i % 26).collect();
+            for extra in [0, 1, 9] {
+                let mut data = text.clone();
+                data.extend(std::iter::repeat_n(b'z', extra));
+                assert!(starts_with_short(&data, &text), "{n} {extra}");
+                for at in 0..n {
+                    let mut other = data.clone();
+                    other[at] ^= 0x20;
+                    assert!(!starts_with_short(&other, &text), "{n} {extra} {at}");
+                }
+                if n > 0 {
+                    assert!(!starts_with_short(&text[..n - 1], &text), "{n}");
+                }
+            }
+        }
+    }
+
+    /// The key walk's spellings and the row parser's spaced separators
+    /// against the walk with no spellings and the row written compactly, on
+    /// random rows: members spaced as json.dumps spaces them, or any other
+    /// way, names escaped, left out, out of place, new or repeated, values
+    /// of every kind, now and then a line feed between tokens, read a line
+    /// at a time or framed, from the first row or from a later one, as a
+    /// piece of the file is.
+    #[test]
+    fn spaced_members_are_told_as_the_walk_tells_them() {
+        // As written, and as the parser is asked for it.
+        let names = [
+            ("k", "k"),
+            ("v", "v"),
+            ("caf\\u00e9", "caf\u{e9}"),
+            ("caf\u{e9}", "caf\u{e9}"),
+            ("a\\/b", "a/b"),
+            ("\\u006b", "k"),
+            ("ab", "ab"),
+            ("twenty_one_bytes_long", "twenty_one_bytes_long"),
+            ("twenty_ONE_bytes_long", "twenty_ONE_bytes_long"),
+            (
+                "a_name_well_past_thirty_two_bytes_long",
+                "a_name_well_past_thirty_two_bytes_long",
+            ),
+        ];
+        let values = [
+            "1",
+            "\"s\"",
+            "\"a\\\"b\"",
+            "null",
+            "true",
+            "[1, 2]",
+            "{\"k\": 3}",
+            "\"\"",
+            "-0.5e3",
+            "\"x y\"",
+        ];
+        let commas = [",", ", ", " ,", " , ", ",  ", ",\t", ",,", ", \n"];
+        let colons = [":", ": ", " :", " : ", ":  ", ":\t", ": \n"];
+        let wanted: Vec<Option<String>> = ["k", "v", "caf\u{e9}", "a/b", "ab"]
+            .iter()
+            .map(|n| Some(n.to_string()))
+            .collect();
+        let mut seed = 0x3c6e_f372_fe94_f82bu64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let (mut walks, mut refused, mut parsed) = (0, 0, 0);
+        for case in 0..6_000 {
+            // Most rows are spaced as the file's writer spaces them, and
+            // list the first row's names in its order.
+            let (comma, colon) = (next(6), next(5));
+            let order: Vec<usize> = (0..1 + next(5)).map(|_| next(names.len())).collect();
+            let framed = case % 4 == 3;
+            let rows: Vec<(String, String)> = (0..1 + next(6))
+                .map(|_| {
+                    let mut members: Vec<usize> = if next(4) > 0 {
+                        order.clone()
+                    } else {
+                        (0..next(6)).map(|_| next(names.len())).collect()
+                    };
+                    if !members.is_empty() && next(8) == 0 {
+                        members.remove(next(members.len()));
+                    }
+                    let lead = [""; 6].iter().chain(&[" ", "  "]).nth(next(8)).unwrap();
+                    let (mut spaced, mut compact) = (format!("{{{lead}"), "{".to_string());
+                    for (i, &m) in members.iter().enumerate() {
+                        let pick = |n: usize, mine: usize, of: &[&'static str]| {
+                            let all = of.len() - 1; // the last holds a line feed
+                            if n < 12 {
+                                of[mine]
+                            } else if n < 15 {
+                                of[n % all]
+                            } else {
+                                of[all]
+                            }
+                        };
+                        let c = pick(next(16), comma, &commas);
+                        let k = pick(next(16), colon, &colons);
+                        let v = values[next(values.len())];
+                        if i > 0 {
+                            spaced.push_str(c);
+                            compact.push(',');
+                        }
+                        spaced.push_str(&format!("\"{}\"{k}{v}", names[m].0));
+                        compact.push_str(&format!("\"{}\":{v}", names[m].0));
+                    }
+                    spaced.push_str(["}", "}", " }"][next(3)]);
+                    compact.push('}');
+                    (spaced, compact)
+                })
+                .collect();
+            let joined = |pick: fn(&(String, String)) -> &String| {
+                let rows: Vec<&String> = rows.iter().map(pick).collect();
+                if framed {
+                    let rows: Vec<&str> = rows.iter().map(|r| r.as_str()).collect();
+                    format!("[{}]\n", rows.join(",\n"))
+                } else {
+                    rows.iter().map(|r| format!("{r}\n")).collect()
+                }
+            };
+            let text = joined(|r| &r.0);
+            let slab = json_slab(&text);
+            let Ok(first) = json_header(&slab, Path::new("x")) else {
+                continue;
+            };
+            // From the first row, or from a later one as a piece starts.
+            let starts: Vec<usize> = (0..text.len())
+                .filter(|&at| {
+                    text.as_bytes()[at] == b'{'
+                        && (at == 0 || matches!(text.as_bytes()[at - 1], b'\n' | b'['))
+                })
+                .collect();
+            let lo = if next(3) == 0 {
+                starts[next(starts.len())]
+            } else {
+                0
+            };
+            let walk = |plain: bool| {
+                NO_SPELLINGS.with(|c| c.set(plain));
+                let got = json_later_keys(
+                    &slab,
+                    lo,
+                    text.len(),
+                    framed,
+                    &first,
+                    usize::MAX,
+                    &KeyBudget::new(None, None),
+                );
+                NO_SPELLINGS.with(|c| c.set(false));
+                match got {
+                    Ok(k) => Ok((k.names, k.rows, k.repeats)),
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+            let spelled = walk(false);
+            assert_eq!(spelled, walk(true), "{text:?} from {lo}");
+            walks += 1;
+            let Ok(_) = spelled else {
+                refused += 1;
+                continue;
+            };
+            // The parser reads each row as it reads the row written
+            // compactly, scan by scan.
+            let plain = joined(|r| &r.1);
+            let plain_slab = json_slab(&plain);
+            let read = |slab: &Slab, wide: bool| {
+                let parser = RowParser::json(wanted.clone(), 1, framed);
+                let (data, end) = (slab.data(), slab.data().len());
+                let mut out = vec![ABSENT; wanted.len()];
+                let (mut at, mut got) = (0, Vec::new());
+                while at < end {
+                    at = if wide {
+                        parser.parse(data, at, end, &mut out)
+                    } else {
+                        parser.parse_with(Swar, data, at, end, &mut out)
+                    };
+                    got.push(
+                        out.iter()
+                            .map(|&f| slab.raw(f).to_vec())
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                got
+            };
+            for wide in [false, true] {
+                assert_eq!(read(&slab, wide), read(&plain_slab, wide), "{text:?}");
+            }
+            parsed += 1;
+        }
+        assert!(
+            walks > 5_000 && refused > 500 && parsed > 3_000,
+            "{walks} {refused} {parsed}"
         );
     }
 
