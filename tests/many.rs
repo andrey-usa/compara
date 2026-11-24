@@ -392,6 +392,40 @@ fn a_partition_column_the_rows_hold_too_takes_the_path_value() {
     }
 }
 
+/// A JSON part that ends inside a row -- a brace missing, a string left open
+/// -- is refused with the part and the line the row opens on. The row never
+/// closed, so it and the rows after it were given no partition values, and
+/// the reader of the parts joined found the fault in a later part, quoting
+/// a line with a value the copy had added.
+#[test]
+fn a_json_part_that_ends_inside_a_row_is_refused_with_its_line() {
+    let d = scratch("unclosed-part");
+    for (part, text) in [
+        (
+            "brace",
+            "{\"id\":0}\n{\"id\":1,\"v\":{\"a\":1}\n{\"id\":2}\n",
+        ),
+        ("string", "{\"id\":0}\n{\"id\":1,\"v\":\"ab}\n"),
+    ] {
+        for day in [1, 2] {
+            let dir = d.0.join(part).join(format!("day={day}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let text = if day == 1 { text } else { "{\"id\":9}\n" };
+            std::fs::write(dir.join("part-0.json"), text).unwrap();
+        }
+        let side = d.0.join(part).to_string_lossy().into_owned();
+        let got = compare(&side, &side, &["-k", "id"]);
+        assert_eq!(got.0, 2, "{part}: {}", got.1);
+        assert!(
+            got.1
+                .contains("day=1/part-0.json: line 2 (\"{\\\"id\\\":1,")
+                && got.1.contains("opens a row that the part ends inside"),
+            "{part}: {}",
+            got.1
+        );
+    }
+}
+
 /// `name=value` directories are columns: keyed on one, rows that repeat a key
 /// in different partitions are different rows, and the answer is the one a
 /// flat file holding the column gives -- for Parquet, CSV and JSON parts,

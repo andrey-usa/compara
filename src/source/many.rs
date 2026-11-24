@@ -699,6 +699,12 @@ impl Combined {
         // A quote left open at the end: copied as it is, for the reader to
         // refuse with its line.
         put(&mut w, &record).map_err(cannot)?;
+        if let Some((line, text)) = rows.unclosed() {
+            return Err(Error::input(format!(
+                "{name}: line {line} ({text:?}) opens a row that the part ends inside: a brace \
+                 or bracket is missing, or a string is left open; check it with jq empty {name}"
+            )));
+        }
         w.flush().map_err(cannot)?;
         Ok(written)
     }
@@ -990,6 +996,12 @@ struct JsonRows {
     opened: bool,
     /// The row being read has a member, so what is added follows a comma.
     filled: bool,
+    /// The lines walked.
+    line: usize,
+    /// The line the open row opened on, and up to 32 bytes of it from its
+    /// brace: what a part that ends inside the row is refused with.
+    opened_on: usize,
+    opened_text: Vec<u8>,
 }
 
 /// Whether `bytes` hold no bracket, brace or backslash, and their quotes in
@@ -1031,6 +1043,7 @@ impl JsonRows {
     /// member: the offset of its closing brace.
     fn walk(&mut self, line: &[u8], closes: &mut Vec<(usize, bool)>) {
         self.escape = false;
+        self.line += 1;
         if !self.string && self.settled(line, closes) {
             return;
         }
@@ -1071,10 +1084,22 @@ impl JsonRows {
                 continue;
             }
             match line[at] {
-                b'"' => self.string = true,
+                b'"' => {
+                    self.string = true;
+                    if self.depth == 0 {
+                        self.opened_on = self.line;
+                        self.opened_text.clear();
+                        self.opened_text
+                            .extend_from_slice(&line[at..line.len().min(at + 32)]);
+                    }
+                }
                 b'{' | b'[' => {
                     if self.depth == 0 {
                         self.opened = true;
+                        self.opened_on = self.line;
+                        self.opened_text.clear();
+                        self.opened_text
+                            .extend_from_slice(&line[at..line.len().min(at + 32)]);
                     }
                     self.depth += 1;
                 }
@@ -1092,6 +1117,19 @@ impl JsonRows {
             }
             at += 1;
         }
+    }
+
+    /// The row the part ended inside, if it did: the line it opened on and
+    /// the start of its text. Its brace never closed, so the walk never gave
+    /// it the partition values, and the rows after it, read as inside it,
+    /// had none either.
+    fn unclosed(&self) -> Option<(usize, String)> {
+        (self.depth > 0 || self.string).then(|| {
+            (
+                self.opened_on,
+                String::from_utf8_lossy(&self.opened_text).into_owned(),
+            )
+        })
     }
 
     /// The two lines a stream mostly has, settled without a walk: a whole
@@ -1241,8 +1279,12 @@ mod tests {
         assert_eq!(bare_header(b"\xEF\xBB\xBFa,b\r\n"), b"a,b");
     }
 
-    /// Each line's row closes, as (line, offset, the row had a member).
-    fn closes(text: &str) -> Vec<(usize, usize, bool)> {
+    /// The line a row the text ends inside opened on, and its text.
+    type Unclosed = Option<(usize, String)>;
+
+    /// Each line's row closes, as (line, offset, the row had a member), and
+    /// the row the text ends inside.
+    fn closes(text: &str) -> (Vec<(usize, usize, bool)>, Unclosed) {
         let mut rows = JsonRows::default();
         let mut out = Vec::new();
         for (n, line) in text.split('\n').enumerate() {
@@ -1250,7 +1292,7 @@ mod tests {
             rows.walk(line.as_bytes(), &mut at);
             out.extend(at.into_iter().map(|(i, filled)| (n, i, filled)));
         }
-        out
+        (out, rows.unclosed())
     }
 
     #[test]
@@ -1259,12 +1301,13 @@ mod tests {
         // own; a brace in a string, escaped quote and all, is text.
         let pretty =
             "{\n  \"d\\u0061y\": 1,\n  \"t\": [\n    {\n      \"x\": \"}\\\"{\"\n    }\n  ]\n}\n{}";
-        let got = closes(pretty);
+        let (got, open) = closes(pretty);
         assert_eq!(got, vec![(7, 0, true), (8, 1, false)]);
+        assert_eq!(open, None);
         // Newline-delimited, several on a line, and a nested one: each row's
         // own closing brace, whichever way the line is settled.
         let lines = "{\"a\":1}\n{\"a\":2} {\"a\":{\"b\":3}}\n {\"a\":\"[\"} \n{\"a\":\"\\\\\"}";
-        let got = closes(lines);
+        let (got, open) = closes(lines);
         assert_eq!(
             got,
             vec![
@@ -1275,10 +1318,25 @@ mod tests {
                 (3, 9, true)
             ]
         );
+        assert_eq!(open, None);
         // A backslash that ends a line escapes the line feed, not the next
         // line's first byte.
-        let got = closes("{\"a\":\"x\\\n\"}\n{\"a\":1}");
+        let (got, _) = closes("{\"a\":\"x\\\n\"}\n{\"a\":1}");
         assert_eq!(got, vec![(1, 1, true), (2, 6, true)]);
+    }
+
+    #[test]
+    fn a_row_the_part_ends_inside_is_told_by_the_line_it_opened_on() {
+        // A brace missing: the rows after it read as inside it, none closes.
+        let (got, open) = closes("{\"id\":0}\n{\"id\":1,\"v\":{\"a\":1}\n{\"id\":2}\n");
+        assert_eq!(got, vec![(0, 7, true)]);
+        assert_eq!(open, Some((2, "{\"id\":1,\"v\":{\"a\":1}".to_string())));
+        // A string left open.
+        let (_, open) = closes("{\"id\":1,\"v\":\"ab}\n");
+        assert_eq!(open, Some((1, "{\"id\":1,\"v\":\"ab}".to_string())));
+        // A pretty-printed row cut short, told by its first line.
+        let (_, open) = closes("{\n  \"a\": [\n    1,\n");
+        assert_eq!(open, Some((1, "{".to_string())));
     }
 
     #[test]
