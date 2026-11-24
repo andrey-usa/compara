@@ -360,6 +360,12 @@ fn stream_into(
                 .unwrap_or_else(|_| Err(Error::new("spilling a sorted run panicked")))?,
             Err(_) => here.map(|(spilled, _)| spilled).unwrap_or_default(),
         };
+        // The batches the spiller gave back are not filled again, and the
+        // channel holding them lives as long as this call: they go now, not
+        // after the passes below, which would otherwise find two batches'
+        // room taken (the 2M-row pair was refused a run's buffer at 13-20 MB
+        // of heap with them held).
+        while back.try_recv().is_ok() {}
         let (last, rows) = got?;
         // Here rather than when the merge starts, so the two files' passes,
         // if they need any, run at once as their sorts did.
