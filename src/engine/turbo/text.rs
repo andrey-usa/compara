@@ -849,34 +849,45 @@ fn later_keys<S: Scan, const LINES: bool>(
 }
 
 /// The first object's member spellings (`spellings`) laid out for a
-/// register compare: member `i`'s bytes from `step * i`, the rest of its
-/// register zero. A spelling that leaves no room in its register for the
-/// value's opening quote and a byte after it has none (length 0), nor has
-/// a member without one.
+/// register compare, one record a member: its bytes, the rest of the
+/// register zero. A spelling that leaves no room in a register of `step`
+/// bytes for the value's opening quote and a byte after it has none (length
+/// 0), nor has a member without one.
 #[derive(Default)]
 struct Packed {
-    bytes: Vec<u8>,
-    /// Each member's spelling length, and a bit for each of its bytes.
-    lens: Vec<(usize, u64)>,
+    spells: Vec<Spell>,
     step: usize,
+}
+
+/// One member's spelling in [`Packed`]: its bytes, as many as the widest
+/// register holds; its length; and a bit for each of its bytes.
+struct Spell {
+    bytes: [u8; 64],
+    n: usize,
+    bits: u64,
 }
 
 impl Packed {
     fn new(spelled: &[Vec<u8>], step: usize) -> Packed {
-        let mut bytes = vec![0u8; spelled.len() * step];
-        let lens = spelled
+        debug_assert!(step <= 64);
+        let spells = spelled
             .iter()
-            .enumerate()
-            .map(|(at, text)| {
+            .map(|text| {
+                let mut spell = Spell {
+                    bytes: [0; 64],
+                    n: 0,
+                    bits: 0,
+                };
                 let n = text.len();
-                if n + 2 > step {
-                    return (0, 0);
+                if n + 2 <= step {
+                    spell.bytes[..n].copy_from_slice(text);
+                    spell.n = n;
+                    spell.bits = (1u64 << n) - 1;
                 }
-                bytes[at * step..at * step + n].copy_from_slice(text);
-                (n, (1u64 << n) - 1)
+                spell
             })
             .collect();
-        Packed { bytes, lens, step }
+        Packed { spells, step }
     }
 }
 
@@ -926,39 +937,66 @@ fn spelled_run<S: Scan>(
 ) -> (usize, usize) {
     debug_assert!(S::WIDE && packed.step == S::STEP);
     let end = end.min(data.len());
-    while let Some(&(n, bits)) = packed.lens.get(member) {
+    for spell in packed.spells.get(member..).unwrap_or_default() {
+        let (n, bits) = (spell.n, spell.bits);
         // The register at `pos` lies in the piece, its spelling's in `bytes`,
         // and `n + 2 <= STEP` leaves the value's quote and a byte after it.
         if n == 0 || pos + S::STEP > end {
             break;
         }
-        let differ = !scan.same(data, pos, &packed.bytes, member * S::STEP);
-        if differ & bits != 0 || data[pos + n] != b'"' {
+        let differ = !scan.same(data, pos, &spell.bytes, 0);
+        if differ & bits != 0 {
             break;
         }
-        let stops =
-            (scan.hits(data, pos, b'"', b'\\') | scan.hits(data, pos, b'\n', b'\n')) >> (n + 1);
-        let close = if stops != 0 {
-            pos + n + 1 + stops.trailing_zeros() as usize
-        } else {
-            // The value runs past the register: the ones after, as far as
-            // the piece's last.
-            let mut at = pos + S::STEP;
-            loop {
-                if at + S::STEP > end {
-                    return (pos, member);
+        if data[pos + n] == b'"' {
+            let stops =
+                (scan.hits(data, pos, b'"', b'\\') | scan.hits(data, pos, b'\n', b'\n')) >> (n + 1);
+            let close = if stops != 0 {
+                pos + n + 1 + stops.trailing_zeros() as usize
+            } else {
+                // The value runs past the register: the ones after, as far as
+                // the piece's last.
+                let mut at = pos + S::STEP;
+                loop {
+                    if at + S::STEP > end {
+                        return (pos, member);
+                    }
+                    let stops =
+                        scan.hits(data, at, b'"', b'\\') | scan.hits(data, at, b'\n', b'\n');
+                    if stops != 0 {
+                        break at + stops.trailing_zeros() as usize;
+                    }
+                    at += S::STEP;
                 }
-                let stops = scan.hits(data, at, b'"', b'\\') | scan.hits(data, at, b'\n', b'\n');
-                if stops != 0 {
-                    break at + stops.trailing_zeros() as usize;
-                }
-                at += S::STEP;
+            };
+            if data[close] != b'"' {
+                break; // an escape or a line feed: the walk's
             }
-        };
-        if data[close] != b'"' {
-            break; // an escape or a line feed: the walk's
+            pos = close + 1;
+            member += 1;
+            continue;
         }
-        pos = close + 1;
+        // A number or a literal ends at the first byte the walk stops a
+        // scalar at (`later_value_end`); asked here of more bytes than
+        // that, it is taken only where it is a comma or a closing brace,
+        // which the walk stops at too and before which it stopped at none.
+        if matches!(data[pos + n], b'{' | b'[') {
+            break;
+        }
+        let stops = (scan.hits(data, pos, b',', b'}')
+            | scan.hits(data, pos, b']', b'\n')
+            | scan.hits(data, pos, b' ', b'\t')
+            | scan.hits(data, pos, b'\r', b'{')
+            | scan.hits(data, pos, b'"', b'"'))
+            >> n;
+        if stops == 0 {
+            break;
+        }
+        let to = pos + n + stops.trailing_zeros() as usize;
+        if !matches!(data[to], b',' | b'}') {
+            break;
+        }
+        pos = to;
         member += 1;
     }
     (pos, member)
@@ -5227,6 +5265,10 @@ mod tests {
             "{\"k\": \"y\"}",
             "12345678901234567890123456789012345",
         ];
+        // Scalars the walk stops at something other than a comma or a
+        // closing brace: space, a bracket, a line feed; framed, a brace or a
+        // quote it cannot follow; and none at all.
+        let odd = ["7 ", "1\t", "2]", "3\n", "4{5", "nu\"ll", ""];
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move |n: usize| {
             seed ^= seed << 13;
@@ -5240,7 +5282,10 @@ mod tests {
             let (comma, colon) = [(",", ":"), (", ", ": ")][next(2)];
             let order: Vec<usize> = (0..1 + next(6)).map(|_| next(names.len())).collect();
             let value = |next: &mut dyn FnMut(usize) -> usize| {
-                if next(5) == 0 {
+                if next(40) == 0 {
+                    return odd[next(odd.len())].to_string();
+                }
+                if next(3) == 0 {
                     return others[next(others.len())].to_string();
                 }
                 // Lengths about a register: most values close in the one
@@ -5321,15 +5366,14 @@ mod tests {
                     Err(e) => Err(e.to_string()),
                 }
             };
-            let reference = walk(true, true);
-            for (plain, narrow) in [(false, false), (false, true), (true, false)] {
-                assert_eq!(
-                    walk(plain, narrow),
-                    reference,
-                    "{text:?} {lo}..{hi} spelled {} narrow {narrow}",
-                    !plain
-                );
-            }
+            // Each width against the eight-byte walk with the same spellings.
+            // A member of no value at its own place says `repeats` to the
+            // walk without spellings and not to the walk with them, so those
+            // two are held together where every member has a value
+            // (`spaced_members_are_told_as_the_walk_tells_them`), not here.
+            let reference = walk(false, true);
+            assert_eq!(walk(false, false), reference, "{text:?} {lo}..{hi}");
+            assert_eq!(walk(true, false), walk(true, true), "{text:?} {lo}..{hi}");
             walks += 1;
             refused += usize::from(reference.is_err());
         }
