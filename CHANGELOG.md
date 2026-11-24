@@ -27,6 +27,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- On Windows, a URL whose server refused the connection was reported as the
+  raw error, without saying the connection was refused or that a proxy was
+  set: Windows words it "actively refused". It is now told as on Unix.
 - On Windows, `-o NUL` and `--json NUL` failed (exit 2, after the whole
   compare) since 0.8.0 wrote each output beside its name and moved it
   there. `NUL` and the other names Windows takes as devices (`CON`, `AUX`,

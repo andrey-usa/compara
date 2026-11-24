@@ -2751,6 +2751,12 @@ impl reqwest::dns::Resolve for NoMetadata {
     }
 }
 
+/// Whether an error's text (lower case) says the connection was refused:
+/// "connection refused" on Unix, "... actively refused it" on Windows.
+fn refused(lower: &str) -> bool {
+    lower.contains("connection refused") || lower.contains("actively refused")
+}
+
 /// An HTTP error in plain words, with what caused it (a refused redirect
 /// says why only there).
 ///
@@ -2787,7 +2793,7 @@ fn said(e: &reqwest::Error) -> String {
     .any(|m| lower.contains(m))
     {
         Some("the host name does not resolve")
-    } else if lower.contains("connection refused") {
+    } else if refused(&lower) {
         Some("connection refused (nothing answers on that port)")
     } else if e.is_connect() && (e.is_timeout() || lower.contains("timed out")) {
         Some("no answer within 30 s")
@@ -3419,6 +3425,20 @@ fn ini_section(text: &str, name: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows words a refused connection its own way; both are told as
+    /// refused, so the message names the cause (and a proxy, if one is set).
+    #[test]
+    fn a_refused_connection_is_told_in_the_words_of_each_system() {
+        let unix = "error sending request: client error (connect): tcp connect error: \
+                    connection refused (os error 111)";
+        let windows = "error sending request: client error (connect): tcp connect error: no \
+                       connection could be made because the target machine actively refused it. \
+                       (os error 10061)";
+        assert!(refused(unix));
+        assert!(refused(windows));
+        assert!(!refused("error sending request: operation timed out"));
+    }
 
     #[test]
     fn a_part_is_never_under_64_kb() {
