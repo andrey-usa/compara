@@ -533,7 +533,7 @@ unsafe fn later_keys_wide<const LINES: bool>(
 ) -> Result<LaterKeys> {
     // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
     let run = |data: &[u8], pos, end, packed: &Packed, member| unsafe {
-        spelled_run_wide(w, data, pos, end, packed, member)
+        spelled_run_wide::<LINES>(w, data, pos, end, packed, member)
     };
     later_keys::<_, LINES>(w, run, slab, lo, hi, known, max_rows, budget)
 }
@@ -891,6 +891,75 @@ impl Packed {
     }
 }
 
+/// Where a string's scan stops (a quote, a backslash, a line feed) in the
+/// 64-byte blocks from `base`, one bit a byte: from the block a row starts in
+/// to the first that holds a line feed past its start (a line-read row's end;
+/// framed, a closing brace too, where the row most likely ends), sixteen at
+/// most. The blocks are read at fixed places before
+/// the members are, so finding a value's end is a load from these, a shift
+/// and a count, which the next member waits on, where a register's load and
+/// compare at the value made each member wait on those.
+struct RowStops {
+    base: usize,
+    /// One more than the blocks read, the last zero, so a window of two
+    /// always lies in it.
+    stops: [u64; 17],
+    blocks: usize,
+}
+
+impl RowStops {
+    #[inline(always)]
+    fn new<S: Scan, const LINES: bool>(scan: S, data: &[u8], from: usize, end: usize) -> RowStops {
+        let base = from & !63;
+        let mut stops = [0u64; 17];
+        let mut blocks = 0;
+        // Not what lies before the row in its first block.
+        let mut past = u64::MAX << (from & 63);
+        while blocks < 16 && base + 64 * (blocks + 1) <= end {
+            let block = base + 64 * blocks;
+            let (mut found, mut last) = (0u64, 0u64);
+            for half in 0..64 / S::STEP {
+                let at = block + half * S::STEP;
+                let feeds = scan.hits(data, at, b'\n', b'\n');
+                found |= (scan.hits(data, at, b'"', b'\\') | feeds) << (half * S::STEP);
+                // A line-read row ends at its line feed; a framed one is
+                // likeliest to at a closing brace.
+                let ends = if LINES {
+                    feeds
+                } else {
+                    scan.hits(data, at, b'\n', b'}')
+                };
+                last |= ends << (half * S::STEP);
+            }
+            stops[blocks] = found;
+            blocks += 1;
+            if last & past != 0 {
+                break;
+            }
+            past = u64::MAX;
+        }
+        RowStops {
+            base,
+            stops,
+            blocks,
+        }
+    }
+
+    /// The first stop at or after `from` and within 64 bytes of it, of the
+    /// blocks read; `None` where there is none.
+    #[inline(always)]
+    fn next(&self, from: usize) -> Option<usize> {
+        let i = (from - self.base) >> 6;
+        if i >= self.blocks {
+            return None;
+        }
+        // `blocks` is 16 at most, so `i` is below it and `i + 1` in `stops`.
+        let (i, shift) = (i & 15, from & 63);
+        let window = (self.stops[i] >> shift) | (self.stops[i + 1] << 1 << (63 - shift));
+        (window != 0).then(|| from + window.trailing_zeros() as usize)
+    }
+}
+
 /// Past the members from `member` on that are written as `packed` spells
 /// them and hold a string with no escape and no line feed, each told by one
 /// register at its start: the spelling compared byte for byte, its value's
@@ -915,7 +984,7 @@ impl Packed {
 // Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
 // enables; the body is the safe `spelled_run`, so the feature is the only requirement.
 #[inline(never)]
-unsafe fn spelled_run_wide(
+unsafe fn spelled_run_wide<const LINES: bool>(
     w: Wide,
     data: &[u8],
     pos: usize,
@@ -923,11 +992,11 @@ unsafe fn spelled_run_wide(
     packed: &Packed,
     member: usize,
 ) -> (usize, usize) {
-    spelled_run(w, data, pos, end, packed, member)
+    spelled_run::<_, LINES>(w, data, pos, end, packed, member)
 }
 
 #[inline(always)]
-fn spelled_run<S: Scan>(
+fn spelled_run<S: Scan, const LINES: bool>(
     scan: S,
     data: &[u8],
     mut pos: usize,
@@ -937,6 +1006,7 @@ fn spelled_run<S: Scan>(
 ) -> (usize, usize) {
     debug_assert!(S::WIDE && packed.step == S::STEP);
     let end = end.min(data.len());
+    let row = RowStops::new::<_, LINES>(scan, data, pos, end);
     for spell in packed.spells.get(member..).unwrap_or_default() {
         let (n, bits) = (spell.n, spell.bits);
         // The register at `pos` lies in the piece, its spelling's in `bytes`,
@@ -949,25 +1019,11 @@ fn spelled_run<S: Scan>(
             break;
         }
         if data[pos + n] == b'"' {
-            let stops =
-                (scan.hits(data, pos, b'"', b'\\') | scan.hits(data, pos, b'\n', b'\n')) >> (n + 1);
-            let close = if stops != 0 {
-                pos + n + 1 + stops.trailing_zeros() as usize
-            } else {
-                // The value runs past the register: the ones after, as far as
-                // the piece's last.
-                let mut at = pos + S::STEP;
-                loop {
-                    if at + S::STEP > end {
-                        return (pos, member);
-                    }
-                    let stops =
-                        scan.hits(data, at, b'"', b'\\') | scan.hits(data, at, b'\n', b'\n');
-                    if stops != 0 {
-                        break at + stops.trailing_zeros() as usize;
-                    }
-                    at += S::STEP;
-                }
+            // The value's closing quote from the stops of the 64-byte blocks
+            // it lies in: their loads are at fixed places, so the next member
+            // waits on a shift and a count, not on a load and a compare.
+            let Some(close) = row.next(pos + n + 1) else {
+                break;
             };
             if data[close] != b'"' {
                 break; // an escape or a line feed: the walk's
@@ -5381,5 +5437,63 @@ mod tests {
             walks > 2_500 && refused > 200 && refused < walks / 2,
             "{walks} {refused}"
         );
+    }
+
+    #[test]
+    fn a_row_s_stops_are_the_first_quote_backslash_or_line_feed_after_a_place() {
+        let Some(w) = Wide::detect() else {
+            return;
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let bytes = b"\"\\\n}x y,:";
+        for _ in 0..2_000 {
+            let len = next(1_200);
+            // Sparse and dense stops, and stretches of none longer than a block.
+            let density = [3, 9, 40, 200][next(4)];
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    if next(density) == 0 {
+                        bytes[next(4)]
+                    } else {
+                        bytes[4 + next(bytes.len() - 4)]
+                    }
+                })
+                .collect();
+            let end = next(len + 1);
+            let from = next(end + 1);
+            for lines in [true, false] {
+                let row = if lines {
+                    RowStops::new::<_, true>(w, &data, from, end)
+                } else {
+                    RowStops::new::<_, false>(w, &data, from, end)
+                };
+                assert!(row.base <= from && row.base + 64 * row.blocks <= end);
+                for at in from..end {
+                    let first = data[at..]
+                        .iter()
+                        .position(|b| matches!(b, b'"' | b'\\' | b'\n'))
+                        .map(|n| at + n);
+                    match row.next(at) {
+                        Some(stop) => assert_eq!(Some(stop), first, "{at} in {data:?}"),
+                        // Only past the blocks read, or with none in 64 bytes.
+                        None => {
+                            assert!(
+                                at >= row.base + 64 * row.blocks
+                                    || first.is_none_or(
+                                        |f| f >= at + 64 || f >= row.base + 64 * row.blocks
+                                    ),
+                                "{at} {first:?}"
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
