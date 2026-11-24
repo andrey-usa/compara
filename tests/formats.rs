@@ -841,6 +841,30 @@ fn the_same_records_written_pretty_and_compact_are_the_same_table() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// Two nested values that differ in a lone surrogate, which a JSON escape can
+/// name and UTF-8 cannot hold, are compared different, and the report showed
+/// both as U+FFFD: alike, and under `--trim`, which compares their text,
+/// equal. The report shows each as its escape.
+#[test]
+fn a_lone_surrogate_in_a_nested_value_is_shown_as_its_escape() {
+    let dir = std::env::temp_dir().join(format!("compara-surrogate-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("a temp dir");
+    let a = dir.join("a.ndjson");
+    let b = dir.join("b.ndjson");
+    fs::write(&a, "{\"id\":1,\"v\":[\"\\ud800\",\"\\ud83d\\ude00\"]}\n").unwrap();
+    fs::write(&b, "{\"id\":1,\"v\":[\"\\uD801\",\"\\ud83d\\ude00\"]}\n").unwrap();
+    for trim in [false, true] {
+        let mut opt = options(&["id"]);
+        opt.trim = trim;
+        let result = run(&a, &b, &mut opt);
+        assert_eq!(result.counts.changed, 1, "{}", answer(&result));
+        let shown = whole(&result);
+        assert!(shown.contains(r#"[\"\\ud800\",\"😀\"]"#), "{shown}");
+        assert!(shown.contains(r#"[\"\\ud801\",\"😀\"]"#), "{shown}");
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
 /// A member name is the name its escapes spell. Python's `json.dumps` writes
 /// every non-ASCII name escaped by default, a character past U+FFFF as a
 /// surrogate pair, and PHP escapes `/`. Such a name was looked up as written

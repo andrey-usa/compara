@@ -12,6 +12,7 @@
 //! they cannot come to different conclusions about the same value — the property
 //! whose absence produced two silently wrong answers in the Java port.
 
+use std::fmt::Write as _;
 use std::fs::File;
 use std::path::Path;
 
@@ -570,16 +571,59 @@ fn same_escaped(a: &Slab, x: Field, b: &Slab, y: Field) -> bool {
     a.logical(x).eq(b.logical(y))
 }
 
+/// Decoded bytes as text: UTF-8 as it is, and a lone surrogate as the
+/// `\uXXXX` escape that names it.
+///
+/// A JSON escape can name half of a surrogate pair alone, which UTF-8 cannot
+/// hold; the decoder keeps it as its three bytes (see [`LogicalBytes::hold`])
+/// and compares it so, but as text they were three U+FFFD, the same for every
+/// lone surrogate: `["\ud800"]` and `["\ud801"]`, two different values, read
+/// alike in the report and the export. In a nested value's text a backslash
+/// of its own is always escaped, so the escape cannot be mistaken for one.
+/// Any other byte that is not UTF-8 is U+FFFD, as before.
+fn shown(bytes: Vec<u8>) -> String {
+    let bytes = match String::from_utf8(bytes) {
+        Ok(s) => return s,
+        Err(e) => e.into_bytes(),
+    };
+    let mut out = String::with_capacity(bytes.len() + 8);
+    let mut rest = &bytes[..];
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                return out;
+            }
+            Err(e) => {
+                let (good, bad) = rest.split_at(e.valid_up_to());
+                out.push_str(&String::from_utf8_lossy(good));
+                if let [0xED, b1 @ 0xA0..=0xBF, b2 @ 0x80..=0xBF, ..] = *bad {
+                    let cp = 0xD000 | (u32::from(b1 & 0x3F) << 6) | u32::from(b2 & 0x3F);
+                    let _ = write!(out, "\\u{cp:04x}");
+                    rest = &bad[3..];
+                } else {
+                    out.push('\u{FFFD}');
+                    rest = &bad[e.error_len().unwrap_or(bad.len())..];
+                }
+            }
+        }
+    }
+}
+
 /// The field decoded. Only the report sections and the normalising paths call
 /// this; the fast path never builds a string for a cell at all.
 pub(super) fn text_of(slab: &Slab, f: Field) -> String {
     // Asked of the field word, not of a `LogicalBytes` built to answer it: a
     // plain field, every column name the key walk reads among them, is the
     // common case.
-    if slab.mode(f) == Mode::Raw {
+    let mode = slab.mode(f);
+    if mode == Mode::Raw {
         return String::from_utf8_lossy(slab.raw(f)).into_owned();
     }
     let bytes: Vec<u8> = slab.logical(f).collect();
+    if mode == Mode::Nested {
+        return shown(bytes);
+    }
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -591,7 +635,8 @@ pub(super) fn text_of(slab: &Slab, f: Field) -> String {
 /// would be paid ten million times to report a failure that cannot happen,
 /// because nothing of that size is being held.
 pub(super) fn text_of_checked(slab: &Slab, f: Field, what: &str) -> crate::Result<String> {
-    if slab.mode(f) == Mode::Raw {
+    let mode = slab.mode(f);
+    if mode == Mode::Raw {
         return match std::str::from_utf8(slab.raw(f)) {
             Ok(s) => crate::alloc::string(s, what),
             // Lossy replacement allocates its own string; it is reached only by
@@ -602,6 +647,9 @@ pub(super) fn text_of_checked(slab: &Slab, f: Field, what: &str) -> crate::Resul
     }
     let mut bytes: Vec<u8> = crate::alloc::sized(f_len_hint(f), what)?;
     bytes.extend(slab.logical(f));
+    if mode == Mode::Nested {
+        return Ok(shown(bytes));
+    }
     match String::from_utf8(bytes) {
         Ok(s) => Ok(s),
         Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
@@ -722,6 +770,28 @@ mod tests {
         let slab = Slab::owned(text.to_vec(), Dialect::Json);
         let f = pack(6, (text.len() - 8) as u64, true);
         assert_eq!(text_of(&slab, f), r#"{"a": 1}"#);
+    }
+
+    #[test]
+    fn a_lone_surrogate_is_shown_as_its_escape() {
+        assert_eq!(
+            nested_shown(r#"["\ud800", "\uDBFF", "\udc00x"]"#),
+            r#"["\ud800","\udbff","\udc00x"]"#
+        );
+        assert_eq!(nested_shown(r#"["😀"]"#), "[\"\u{1f600}\"]");
+        assert_eq!(
+            shown(b"a\xffb\xed\xa0".to_vec()),
+            "a\u{fffd}b\u{fffd}\u{fffd}"
+        );
+    }
+
+    fn nested_shown(value: &str) -> String {
+        let (slab, f) = member(value);
+        assert_eq!(
+            text_of(&slab, f),
+            text_of_checked(&slab, f, "a test").expect("room")
+        );
+        text_of(&slab, f)
     }
 
     /// What this process has resident of its mappings of `path`, in KB, from
