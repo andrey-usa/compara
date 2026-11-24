@@ -269,12 +269,13 @@ fn remove_file_if_over(path: &Path, me: u32, now: SystemTime, settled: Duration)
     quiet && fs::remove_file(path).is_ok()
 }
 
-/// Opens `path`, a directory (`dir`) or a file by the look taken at it, to
-/// see whether it is still the one looked at. Where anyone may rename in
-/// the temporary directory (no sticky bit), the name may have been swapped
-/// since: a link put there is not followed, and a pipe is not waited on for
-/// a writer; the open fails, or what it opens is not the one looked at.
-fn reopen(path: &Path, dir: bool) -> std::io::Result<File> {
+/// Opens `path`, a directory (`dir`) or a file by the look taken at it, or
+/// by its making, to see whether it is still the one looked at, or to lock
+/// it. Where anyone may rename in the temporary directory (no sticky bit),
+/// the name may have been swapped since: a link put there is not followed,
+/// and a pipe is not waited on for a writer; the open fails, or what it
+/// opens is not the one looked at.
+pub(super) fn reopen(path: &Path, dir: bool) -> std::io::Result<File> {
     #[cfg(test)]
     tests::at(tests::Point::Open, path);
     let mut flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
@@ -535,12 +536,12 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::mpsc;
+    use std::sync::{Mutex, mpsc};
 
     /// Where a test swaps a name.
     #[derive(Clone, Copy, PartialEq)]
     pub(super) enum Point {
-        /// Once it has been looked at, before it is opened.
+        /// Once it has been looked at (or made), before it is opened.
         Open,
         /// Once the directory at it has been opened and locked, before what
         /// is in it is read.
@@ -823,6 +824,80 @@ mod tests {
                 ("sortmerge", "theirs kept", true),
                 ("sortmerge", "its own emptied", true),
             ]
+        );
+    }
+
+    /// Where the swaps below put a pipe or a link, for the test to open the
+    /// pipe's other end and to clear up.
+    static MADE_AT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    /// Moves a new directory aside, beside it under a name the sweep does
+    /// not take; that name.
+    fn new_aside(path: &Path) -> PathBuf {
+        let mut moved = path.as_os_str().to_owned();
+        moved.push(".moved");
+        fs::rename(path, &moved).unwrap();
+        *MADE_AT.lock().unwrap() = Some(path.to_path_buf());
+        PathBuf::from(moved)
+    }
+
+    fn new_to_pipe(path: &Path) {
+        new_aside(path);
+        let made = Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+    }
+
+    fn new_to_link(path: &Path) {
+        let moved = new_aside(path);
+        symlink(moved.file_name().unwrap(), path).unwrap();
+    }
+
+    #[test]
+    fn a_new_temporary_directory_swapped_before_it_is_locked_is_not_waited_on_or_followed() {
+        let mut got = Vec::new();
+        for (what, swap) in [
+            ("pipe", new_to_pipe as fn(&Path)),
+            ("link", new_to_link as fn(&Path)),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let run = std::thread::spawn(move || {
+                // Done before the swap is set: the sweep opens names too.
+                super::super::sweep_once();
+                SWAP.set(Some((Point::Open, swap)));
+                // Whether what it hands back is a directory, not what was
+                // swapped in.
+                let made = crate::source::TempDir::new("probe")
+                    .ok()
+                    .map(|d| fs::symlink_metadata(d.path()).is_ok_and(|m| m.file_type().is_dir()));
+                SWAP.set(None);
+                let _ = tx.send(made);
+            });
+            let made = rx.recv_timeout(Duration::from_secs(10)).ok();
+            let at = MADE_AT.lock().unwrap().take();
+            if made.is_none()
+                && let Some(at) = &at
+            {
+                let _ = fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(at);
+            }
+            run.join().unwrap();
+            if let Some(at) = at {
+                let _ = fs::remove_file(&at);
+                let mut moved = at.into_os_string();
+                moved.push(".moved");
+                let _ = fs::remove_dir(moved);
+            }
+            got.push((what, made));
+        }
+        assert_eq!(
+            got,
+            [("pipe", Some(Some(true))), ("link", Some(Some(true)))]
         );
     }
 

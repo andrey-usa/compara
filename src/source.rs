@@ -748,7 +748,12 @@ impl TempDir {
         #[cfg(unix)]
         {
             let path = temp_dir(&format!("{tag}-{}", sweep::LOCKED))?;
-            if let Some(lock) = File::open(&path).ok().filter(|f| f.try_lock().is_ok()) {
+            // Opened as the sweep opens a name it has looked at: where anyone
+            // may rename in the temporary directory, a pipe or a link may be
+            // at the name by now, and the open would wait on the one for a
+            // writer, or lock what the other points at.
+            let opened = sweep::reopen(&path, true).ok();
+            if let Some(lock) = opened.filter(|f| f.try_lock().is_ok()) {
                 return Ok(TempDir {
                     path,
                     _lock: Some(lock),
