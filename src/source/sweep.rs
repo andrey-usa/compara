@@ -32,10 +32,13 @@
 //! is an error. A process id the system has handed on again reads as a live
 //! run and keeps its directory until that process ends too.
 
+use std::ffi::{CStr, CString};
 use std::fs::{self, File};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How long a directory a run locks must have been left unchanged before it
 /// is removed.
@@ -190,24 +193,40 @@ fn remove_if_over(path: &Path, tag: Tag, me: u32, now: SystemTime, settled: Dura
     if !same || dir.try_lock().is_err() {
         return false;
     }
-    let Some((files, subdirs, newest)) = contents(path, tag) else {
+    #[cfg(test)]
+    tests::at(tests::Point::Locked, path);
+    // From here on the directory is the one opened, this user's and closed
+    // to every other, and what is in it is read and removed through it. Its
+    // name may have been swapped since, for a link to a directory of
+    // someone else's: by the name, what is in that one would be removed.
+    let dir = Dir(dir);
+    let Some(held) = contents(&dir, tag) else {
         return false;
     };
     let quiet = meta
         .modified()
         .ok()
-        .map(|t| newest.map_or(t, |n| n.max(t)))
+        .map(|t| held.newest.map_or(t, |n| n.max(t)))
         .and_then(|t| now.duration_since(t).ok())
         .is_some_and(|age| age >= settled);
     if !quiet {
         return false;
     }
-    for file in &files {
-        let _ = fs::remove_file(file);
+    for (_, sub, files) in &held.subdirs {
+        for file in files {
+            sub.remove(file, false);
+        }
     }
-    for sub in &subdirs {
-        let _ = fs::remove_dir(sub);
+    for file in &held.files {
+        dir.remove(file, false);
     }
+    for (name, _, _) in &held.subdirs {
+        dir.remove(name, true);
+    }
+    // The directory itself by its name, in the temporary directory: what a
+    // swap can have put there is at most an empty directory to remove, or a
+    // link, which is not followed and which this fails on; anyone who can
+    // swap the name may remove either already.
     fs::remove_dir(path).is_ok()
 }
 
@@ -245,6 +264,8 @@ fn remove_file_if_over(path: &Path, me: u32, now: SystemTime, settled: Duration)
         .ok()
         .and_then(|t| now.duration_since(t).ok())
         .is_some_and(|age| age >= settled);
+    // By its name, in the temporary directory: a link swapped in is not
+    // followed, and anyone who can swap the name may remove what is there.
     quiet && fs::remove_file(path).is_ok()
 }
 
@@ -255,7 +276,7 @@ fn remove_file_if_over(path: &Path, me: u32, now: SystemTime, settled: Duration)
 /// a writer; the open fails, or what it opens is not the one looked at.
 fn reopen(path: &Path, dir: bool) -> std::io::Result<File> {
     #[cfg(test)]
-    tests::between(path);
+    tests::at(tests::Point::Open, path);
     let mut flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
     if dir {
         flags |= libc::O_DIRECTORY;
@@ -266,50 +287,220 @@ fn reopen(path: &Path, dir: bool) -> std::io::Result<File> {
         .open(path)
 }
 
-/// What a directory's contents are: its files, its subdirectories, and the
-/// last time any of them changed.
-type Contents = (Vec<PathBuf>, Vec<PathBuf>, Option<SystemTime>);
+/// What a directory of `tag`'s holds, read through it: the names of its
+/// files, its subdirectories (opened) with the names of theirs, and the last
+/// time any of them changed.
+struct Contents {
+    files: Vec<CString>,
+    subdirs: Vec<(CString, Dir, Vec<CString>)>,
+    newest: Option<SystemTime>,
+}
 
-/// The files and subdirectories of a directory of `tag`'s, when it holds
-/// nothing compara does not write there, and when the last of them changed.
-/// Types and times are read without following links, so a link is never
-/// taken for what it points at.
-fn contents(path: &Path, tag: Tag) -> Option<Contents> {
-    let mut files = Vec::new();
-    let mut subdirs = Vec::new();
-    let mut newest: Option<SystemTime> = None;
-    let mut saw = |entry: &fs::DirEntry| -> Option<()> {
-        let changed = entry.metadata().ok()?.modified().ok()?;
-        newest = Some(newest.map_or(changed, |t| t.max(changed)));
+/// What a directory of `tag`'s holds, when it is nothing compara does not
+/// write there. Types and times are read without following links, so a
+/// link is never taken for what it points at.
+fn contents(dir: &Dir, tag: Tag) -> Option<Contents> {
+    let mut held = Contents {
+        files: Vec::new(),
+        subdirs: Vec::new(),
+        newest: None,
+    };
+    let mut saw = |st: &libc::stat| -> Option<()> {
+        let changed = modified(st)?;
+        held.newest = Some(held.newest.map_or(changed, |t| t.max(changed)));
         Some(())
     };
-    for entry in fs::read_dir(path).ok()? {
-        let entry = entry.ok()?;
-        let kind = entry.file_type().ok()?;
-        let name = entry.file_name();
-        let name = name.to_str()?;
-        if kind.is_dir() && tag == Tag::Sortmerge && matches!(name, "a" | "b") {
-            for inner in fs::read_dir(entry.path()).ok()? {
-                let inner = inner.ok()?;
-                let inner_name = inner.file_name();
-                if !inner.file_type().ok()?.is_file()
-                    || !ours(tag, Some(name), inner_name.to_str()?)
+    let mut files = Vec::new();
+    let mut subdirs = Vec::new();
+    for name in dir.names()? {
+        let st = dir.stat(&name)?;
+        let kind = st.st_mode & libc::S_IFMT;
+        let text = name.to_str().ok()?;
+        if kind == libc::S_IFDIR && tag == Tag::Sortmerge && matches!(text, "a" | "b") {
+            // Opened without following a link: it has to be the one looked at.
+            let sub = dir.open_dir(&name)?;
+            let opened = sub.stat(c".")?;
+            if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino) {
+                return None;
+            }
+            let mut inner_files = Vec::new();
+            for inner in sub.names()? {
+                let inner_st = sub.stat(&inner)?;
+                if inner_st.st_mode & libc::S_IFMT != libc::S_IFREG
+                    || !ours(tag, Some(text), inner.to_str().ok()?)
                 {
                     return None;
                 }
-                saw(&inner)?;
-                files.push(inner.path());
+                saw(&inner_st)?;
+                inner_files.push(inner);
             }
-            saw(&entry)?;
-            subdirs.push(entry.path());
-        } else if kind.is_file() && ours(tag, None, name) {
-            saw(&entry)?;
-            files.push(entry.path());
+            saw(&st)?;
+            subdirs.push((name, sub, inner_files));
+        } else if kind == libc::S_IFREG && ours(tag, None, text) {
+            saw(&st)?;
+            files.push(name);
         } else {
             return None;
         }
     }
-    Some((files, subdirs, newest))
+    held.files = files;
+    held.subdirs = subdirs;
+    Some(held)
+}
+
+/// When what `st` describes last changed, as `Metadata::modified` reads it.
+fn modified(st: &libc::stat) -> Option<SystemTime> {
+    let nanos = Duration::from_nanos(u64::try_from(st.st_mtime_nsec).ok()?);
+    let secs = st.st_mtime;
+    match u64::try_from(secs) {
+        Ok(after) => UNIX_EPOCH.checked_add(Duration::from_secs(after)),
+        Err(_) => UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs())),
+    }?
+    .checked_add(nanos)
+}
+
+/// An open directory, what is in it named relative to it: whatever becomes
+/// of the name it was opened by, every look, open and removal is in this
+/// one.
+struct Dir(File);
+
+impl Dir {
+    fn fd(&self) -> std::ffi::c_int {
+        self.0.as_raw_fd()
+    }
+
+    /// The names in it, but `.` and `..`; `None` when they cannot all be
+    /// read.
+    fn names(&self) -> Option<Vec<CString>> {
+        // A descriptor of the listing's own, which it reads from and closes:
+        // this one keeps its place, and its lock.
+        // SAFETY: the name is a NUL-terminated string; `self.fd()` is open
+        // for as long as `self` lives.
+        let fd = unsafe {
+            libc::openat(
+                self.fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `fd` is an open directory no one else holds; from here the
+        // stream owns it, and `closedir` below closes both.
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            // SAFETY: fdopendir failed, so `fd` is still this function's.
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        let mut names = Vec::new();
+        let complete = loop {
+            // The end of the listing leaves errno as it was, an error sets
+            // it: it is cleared first to tell the two apart.
+            set_errno(0);
+            // SAFETY: `stream` is open until the `closedir` below.
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                break std::io::Error::last_os_error().raw_os_error() == Some(0);
+            }
+            // SAFETY: readdir returned an entry, whose name is NUL-terminated
+            // and valid until the next readdir or closedir on `stream`; it is
+            // copied before either.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name != c"." && name != c".." {
+                names.push(name.to_owned());
+            }
+        };
+        // SAFETY: `stream` came from fdopendir and is closed once, here.
+        unsafe { libc::closedir(stream) };
+        complete.then_some(names)
+    }
+
+    /// What `name` in it is, itself and not what a link points at (`.`:
+    /// this directory).
+    fn stat(&self, name: &CStr) -> Option<libc::stat> {
+        let mut st = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the name is NUL-terminated, `st` has room for a stat, and
+        // `self.fd()` is open.
+        let done = unsafe {
+            libc::fstatat(
+                self.fd(),
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        // SAFETY: fstatat succeeded, so it filled `st` in.
+        (done == 0).then(|| unsafe { st.assume_init() })
+    }
+
+    /// The directory `name` in it, as `reopen` opens one: not through a
+    /// link, not waiting on a pipe.
+    fn open_dir(&self, name: &CStr) -> Option<Dir> {
+        // SAFETY: the name is NUL-terminated and `self.fd()` is open.
+        let fd = unsafe {
+            libc::openat(
+                self.fd(),
+                name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+            )
+        };
+        // SAFETY: openat succeeded, so `fd` is a new descriptor no one else
+        // holds; the File closes it.
+        (fd >= 0).then(|| Dir(unsafe { File::from_raw_fd(fd) }))
+    }
+
+    /// Removes `name` from it, a directory (`dir`) or a file; whether it
+    /// went.
+    fn remove(&self, name: &CStr, dir: bool) -> bool {
+        let flags = if dir { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: the name is NUL-terminated and `self.fd()` is open.
+        unsafe { libc::unlinkat(self.fd(), name.as_ptr(), flags) == 0 }
+    }
+}
+
+/// Sets this thread's errno.
+fn set_errno(value: std::ffi::c_int) {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "hurd",
+        target_os = "dragonfly",
+        target_os = "emscripten"
+    ))]
+    // SAFETY: the address of this thread's errno, valid while it lives.
+    unsafe {
+        *libc::__errno_location() = value;
+    }
+    #[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+    // SAFETY: the same.
+    unsafe {
+        *libc::__errno() = value;
+    }
+    #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+    // SAFETY: the same.
+    unsafe {
+        *libc::__error() = value;
+    }
+    // Elsewhere errno is left as it is: a listing ends with what an earlier
+    // call left there, when that was an error, read as one, and nothing in
+    // the directory is removed.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "hurd",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "android",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    )))]
+    let _ = value;
 }
 
 unsafe extern "C" {
@@ -340,19 +531,35 @@ fn alive(pid: i32) -> bool {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::PathBuf;
     use std::process::Command;
     use std::sync::mpsc;
 
-    thread_local! {
-        /// What a test does to a name once the sweep has looked at it and
-        /// before it opens it: what another user can do in a temporary
-        /// directory open to all without the sticky bit.
-        static SWAP: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
+    /// Where a test swaps a name.
+    #[derive(Clone, Copy, PartialEq)]
+    pub(super) enum Point {
+        /// Once it has been looked at, before it is opened.
+        Open,
+        /// Once the directory at it has been opened and locked, before what
+        /// is in it is read.
+        Locked,
     }
 
-    pub(super) fn between(path: &Path) {
-        if let Some(swap) = SWAP.take() {
+    /// What a test does to a name at a point: what another user can do in a
+    /// temporary directory open to all without the sticky bit.
+    type Swap = (Point, fn(&Path));
+
+    thread_local! {
+        static SWAP: Cell<Option<Swap>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn at(point: Point, path: &Path) {
+        if let Some((at, swap)) = SWAP.get()
+            && at == point
+        {
+            SWAP.set(None);
             swap(path);
         }
     }
@@ -386,7 +593,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let on = path.to_path_buf();
         let run = std::thread::spawn(move || {
-            SWAP.set(Some(swap));
+            SWAP.set(Some((Point::Open, swap)));
             let _ = tx.send(remove(&on));
         });
         let got = rx.recv_timeout(Duration::from_secs(10)).ok();
@@ -500,6 +707,171 @@ mod tests {
                 ("its file left", Some(true)),
             ]
         );
+    }
+
+    fn remove_sortmerge(path: &Path) -> bool {
+        remove_if_over(path, Tag::Sortmerge, euid(), SystemTime::now(), SETTLED)
+    }
+
+    /// Sets when what is at each of `paths` last changed to long ago, in
+    /// order: a directory's after what is made in it.
+    fn age(paths: &[PathBuf]) {
+        for at in paths {
+            File::open(at)
+                .unwrap()
+                .set_modified(SystemTime::now() - OLD)
+                .unwrap();
+        }
+    }
+
+    /// A dead run's sortmerge directory, both sides holding a run, quiet for
+    /// long enough to be removed.
+    fn sortmerge_at(scratch: &Scratch) -> PathBuf {
+        let path = scratch.0.join("compara-41-0badc0de-0-sortmerge-locked");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut made = Vec::new();
+        for (side, run) in [("a", "run-1.bin"), ("b", "merge-0-1.bin")] {
+            fs::create_dir(path.join(side)).unwrap();
+            fs::write(path.join(side).join(run), "rows").unwrap();
+            made.push(path.join(side).join(run));
+            made.push(path.join(side));
+        }
+        made.push(path.clone());
+        age(&made);
+        path
+    }
+
+    /// Puts at `path`, once its directory is locked, a link to `elsewhere`
+    /// beside it, and moves the directory aside.
+    fn to_elsewhere(path: &Path) {
+        aside(path);
+        symlink("elsewhere", path).unwrap();
+    }
+
+    /// A directory of someone else's beside the run's, holding what the
+    /// run's would hold, as old: by the name, it would be swept instead.
+    fn elsewhere(scratch: &Scratch, files: &[&str]) -> PathBuf {
+        let dir = scratch.0.join("elsewhere");
+        fs::create_dir(&dir).unwrap();
+        let mut made = Vec::new();
+        for file in files {
+            let at = dir.join(file);
+            if let Some(sub) = at.parent().filter(|p| *p != dir) {
+                fs::create_dir_all(sub).unwrap();
+            }
+            fs::write(&at, "theirs").unwrap();
+            made.push(at);
+        }
+        for file in files {
+            if let Some(sub) = dir.join(file).parent().filter(|p| *p != dir) {
+                made.push(sub.to_path_buf());
+            }
+        }
+        made.push(dir.clone());
+        age(&made);
+        dir
+    }
+
+    #[test]
+    fn what_a_locked_directory_holds_is_removed_through_it_not_by_its_name() {
+        // Left alone, each goes, sortmerge's sides and all.
+        let scratch = Scratch::new("held-alone");
+        assert!(remove_dir(&dir_at(&scratch)));
+        let path = sortmerge_at(&scratch);
+        assert!(remove_sortmerge(&path));
+        assert!(!path.exists());
+
+        let mut got = Vec::new();
+        for (what, remove, make, files) in [
+            (
+                "export",
+                remove_dir as fn(&Path) -> bool,
+                dir_at as fn(&Scratch) -> PathBuf,
+                &["added.csv"][..],
+            ),
+            (
+                "sortmerge",
+                remove_sortmerge,
+                sortmerge_at,
+                &["a/run-1.bin", "b/merge-0-1.bin"][..],
+            ),
+        ] {
+            let scratch = Scratch::new(&format!("held-{what}"));
+            let path = make(&scratch);
+            let theirs = elsewhere(&scratch, files);
+            SWAP.set(Some((Point::Locked, to_elsewhere)));
+            let removed = remove(&path);
+            SWAP.set(None);
+            let left = |root: &Path| files.iter().filter(|f| root.join(f).exists()).count();
+            // The name is a link now and is kept; what it points at is kept
+            // whole; the run's own directory, moved aside, is emptied.
+            got.push((what, "removed", removed));
+            got.push((what, "link kept", fs::symlink_metadata(&path).is_ok()));
+            got.push((what, "theirs kept", left(&theirs) == files.len()));
+            got.push((what, "its own emptied", left(&scratch.0.join("moved")) == 0));
+        }
+        assert_eq!(
+            got,
+            [
+                ("export", "removed", false),
+                ("export", "link kept", true),
+                ("export", "theirs kept", true),
+                ("export", "its own emptied", true),
+                ("sortmerge", "removed", false),
+                ("sortmerge", "link kept", true),
+                ("sortmerge", "theirs kept", true),
+                ("sortmerge", "its own emptied", true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_listing_through_the_descriptor_is_the_listing_by_name() {
+        let scratch = Scratch::new("names");
+        let mut want: Vec<Vec<u8>> = (0..300)
+            .map(|n| format!("file-{n:03}-{}", "x".repeat(n % 40)).into_bytes())
+            .collect();
+        for name in &want {
+            fs::write(scratch.0.join(std::ffi::OsStr::from_bytes(name)), "").unwrap();
+        }
+        fs::create_dir(scratch.0.join("sub")).unwrap();
+        symlink("nowhere", scratch.0.join("link")).unwrap();
+        want.push(b"sub".to_vec());
+        want.push(b"link".to_vec());
+        want.sort();
+        let by_name = || -> Vec<Vec<u8>> {
+            let mut v: Vec<_> = fs::read_dir(&scratch.0)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_vec())
+                .collect();
+            v.sort();
+            v
+        };
+        let dir = Dir(reopen(&scratch.0, true).unwrap());
+        // Twice: a listing does not move the descriptor's place.
+        for _ in 0..2 {
+            let mut got: Vec<Vec<u8>> = dir
+                .names()
+                .unwrap()
+                .into_iter()
+                .map(CString::into_bytes)
+                .collect();
+            got.sort();
+            assert_eq!(got, by_name());
+            assert_eq!(got, want);
+        }
+        let st = dir.stat(c"sub").unwrap();
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        let st = dir.stat(c"link").unwrap();
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFLNK);
+        let st = dir.stat(c"file-007-xxxxxxx").unwrap();
+        let by_path = fs::symlink_metadata(scratch.0.join("file-007-xxxxxxx")).unwrap();
+        assert_eq!(modified(&st), by_path.modified().ok());
+        assert!(dir.open_dir(c"link").is_none() && dir.open_dir(c"sub").is_some());
+        assert!(dir.remove(c"link", false) && dir.remove(c"sub", true));
+        assert!(!dir.remove(c"sub", true));
+        assert!(dir.stat(c"sub").is_none());
     }
 
     #[test]
