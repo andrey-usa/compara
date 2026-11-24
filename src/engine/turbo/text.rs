@@ -463,20 +463,73 @@ pub(super) fn json_later_keys(
     // One walk for each framing rather than one asking a flag: the
     // line-read walk asks every string for a line feed too, and the framed
     // one checks what lies between rows, neither of which the other pays.
-    if array {
-        later_keys::<false>(slab, lo, hi, known, max_rows, budget)
-    } else {
-        later_keys::<true>(slab, lo, hi, known, max_rows, budget)
+    // The values' strings are found a vector register at a time where the
+    // CPU has one: a value is mostly shorter than a register, so it takes one
+    // load and compare where eight bytes at a time took two or three words.
+    let wide = Wide::detect();
+    #[cfg(test)]
+    let wide = wide.filter(|_| !NARROW_WALK.with(std::cell::Cell::get));
+    match (wide, array) {
+        // Safety: `w` proves the CPU has AVX2, or NEON on aarch64.
+        (Some(w), false) => unsafe {
+            later_keys_wide::<true>(w, slab, lo, hi, known, max_rows, budget)
+        },
+        (Some(w), true) => unsafe {
+            later_keys_wide::<false>(w, slab, lo, hi, known, max_rows, budget)
+        },
+        (None, false) => later_keys_swar::<true>(slab, lo, hi, known, max_rows, budget),
+        (None, true) => later_keys_swar::<false>(slab, lo, hi, known, max_rows, budget),
     }
 }
 
-/// [`json_later_keys`] for a file read a line at a time (`LINES`) or framed
-/// by its braces.
+/// [`later_keys`] eight bytes at a time, on any CPU.
 // Out of line, each on its own: inlined together into one function, the
 // two walks held the data pointer on the stack, and plain NDJSON took 0.4%
 // more instructions.
 #[inline(never)]
-fn later_keys<const LINES: bool>(
+fn later_keys_swar<const LINES: bool>(
+    slab: &Slab,
+    lo: usize,
+    hi: usize,
+    known: &[String],
+    max_rows: usize,
+    budget: &KeyBudget,
+) -> Result<LaterKeys> {
+    later_keys::<_, LINES>(Swar, slab, lo, hi, known, max_rows, budget)
+}
+
+/// [`later_keys`], compiled for AVX2 in a baseline x86-64 build, and for NEON on aarch64.
+///
+/// # Safety
+/// Holding a `Wide` is the proof the CPU has AVX2, or NEON on aarch64; nothing else is required.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        not(any(target_feature = "avx2", target_feature = "avx512bw"))
+    ),
+    target_feature(enable = "avx2,popcnt,bmi1")
+)]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+// Safety: `w: Wide` proves the CPU has AVX2, BMI1 and POPCNT on x86-64, or NEON on aarch64, which this fn's `target_feature`
+// enables; the body is the safe `later_keys`, so the feature is the only requirement.
+#[inline(never)]
+unsafe fn later_keys_wide<const LINES: bool>(
+    w: Wide,
+    slab: &Slab,
+    lo: usize,
+    hi: usize,
+    known: &[String],
+    max_rows: usize,
+    budget: &KeyBudget,
+) -> Result<LaterKeys> {
+    later_keys::<_, LINES>(w, slab, lo, hi, known, max_rows, budget)
+}
+
+/// [`json_later_keys`] for a file read a line at a time (`LINES`) or framed
+/// by its braces, scanning `scan`'s width.
+#[inline(always)]
+fn later_keys<S: Scan, const LINES: bool>(
+    scan: S,
     slab: &Slab,
     lo: usize,
     hi: usize,
@@ -486,7 +539,6 @@ fn later_keys<const LINES: bool>(
 ) -> Result<LaterKeys> {
     let array = !LINES;
     let data = slab.data();
-    let scan = Swar;
     let end = hi.min(data.len());
     // A framed file's opening `[`, where it has one: the only `[` that is
     // not inside a row, and the only file whose rows a `]` may close.
@@ -819,6 +871,9 @@ thread_local! {
     /// No member spelled: the walk tells every name as it reads it, the
     /// reference its spellings are tested against.
     static NO_SPELLINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The walk eight bytes at a time on any CPU, the reference its vector
+    /// scans are tested against.
+    static NARROW_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The spellings the object at `data[at]` gives the first object's names it
@@ -4997,5 +5052,145 @@ mod tests {
         assert_eq!(slab.raw(out[0]), b"2");
         assert_eq!(slab.raw(out[1]), b"a");
         assert_eq!(out[2], ABSENT);
+    }
+
+    #[test]
+    fn the_walk_a_register_at_a_time_is_the_walk_a_byte_at_a_time() {
+        // Spellings that leave a register room for the value's quote and a
+        // byte, that just do, and that do not (`,"` + name + `":` against 32).
+        let names = [
+            "k",
+            "v",
+            "mid_length",
+            "twenty_six_bytes_long_name",
+            "twenty_seven_bytes_long_nam",
+            "a_name_well_past_one_register_of_bytes",
+            "caf\\u00e9",
+        ];
+        // String pieces: plain, multi-byte, escapes, a raw line feed (the
+        // line-read walk refuses it), other control bytes and NUL (a
+        // spelling's register is padded with zeros).
+        let bits = [
+            "a", "b", " ", "é", "\\\"", "\\\\", "\\n", "\n", "\t", "\u{0}", "\u{1}", ",", "}", ":",
+        ];
+        let others = [
+            "1",
+            "-0.5e3",
+            "null",
+            "true",
+            "[1, \"x\"]",
+            "{\"k\": \"y\"}",
+            "12345678901234567890123456789012345",
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let (mut walks, mut refused) = (0, 0);
+        for case in 0..3_000 {
+            let framed = case % 3 == 2;
+            let (comma, colon) = [(",", ":"), (", ", ": ")][next(2)];
+            let order: Vec<usize> = (0..1 + next(6)).map(|_| next(names.len())).collect();
+            let value = |next: &mut dyn FnMut(usize) -> usize| {
+                if next(5) == 0 {
+                    return others[next(others.len())].to_string();
+                }
+                // Lengths about a register: most values close in the one
+                // their spelling starts, some at its edge, some past it.
+                let len = [next(8), 20 + next(16), next(80)][next(3)];
+                let mut v = String::from("\"");
+                for _ in 0..len {
+                    v.push_str(if next(6) == 0 {
+                        bits[next(bits.len())]
+                    } else {
+                        "x"
+                    });
+                }
+                v.push('"');
+                v
+            };
+            let rows: Vec<String> = (0..1 + next(8))
+                .map(|_| {
+                    let mut members = order.clone();
+                    match next(10) {
+                        0 => members.push(next(names.len())),
+                        1 if !members.is_empty() => {
+                            members.remove(next(members.len()));
+                        }
+                        2 => members.reverse(),
+                        _ => {}
+                    }
+                    let mut row = String::from("{");
+                    for (i, &m) in members.iter().enumerate() {
+                        if i > 0 {
+                            row.push_str(if next(30) == 0 { " ," } else { comma });
+                        }
+                        let colon = if next(30) == 0 { " :" } else { colon };
+                        row.push_str(&format!("\"{}\"{colon}{}", names[m], value(&mut next)));
+                    }
+                    row.push('}');
+                    row
+                })
+                .collect();
+            let text = if framed {
+                format!("[{}]\n", rows.join(",\n"))
+            } else {
+                rows.iter().map(|r| format!("{r}\n")).collect()
+            };
+            let slab = json_slab(&text);
+            let Ok(first) = json_header(&slab, Path::new("x")) else {
+                continue;
+            };
+            // A piece from any row to any later one, as the splits cut them.
+            let starts: Vec<usize> = (0..text.len())
+                .filter(|&at| {
+                    text.as_bytes()[at] == b'{'
+                        && (at == 0 || matches!(text.as_bytes()[at - 1], b'\n' | b'['))
+                })
+                .chain([text.len()])
+                .collect();
+            let from = next(starts.len() - 1);
+            let (lo, hi) = (
+                starts[from],
+                starts[from + 1 + next(starts.len() - 1 - from)],
+            );
+            let walk = |plain: bool, narrow: bool| {
+                NO_SPELLINGS.with(|c| c.set(plain));
+                NARROW_WALK.with(|c| c.set(narrow));
+                let got = json_later_keys(
+                    &slab,
+                    lo,
+                    hi,
+                    framed,
+                    &first,
+                    usize::MAX,
+                    &KeyBudget::new(None, None),
+                );
+                NO_SPELLINGS.with(|c| c.set(false));
+                NARROW_WALK.with(|c| c.set(false));
+                match got {
+                    Ok(k) => Ok((k.names, k.rows, k.repeats)),
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+            let reference = walk(true, true);
+            for (plain, narrow) in [(false, false), (false, true), (true, false)] {
+                assert_eq!(
+                    walk(plain, narrow),
+                    reference,
+                    "{text:?} {lo}..{hi} spelled {} narrow {narrow}",
+                    !plain
+                );
+            }
+            walks += 1;
+            refused += usize::from(reference.is_err());
+        }
+        assert!(
+            walks > 2_500 && refused > 200 && refused < walks / 2,
+            "{walks} {refused}"
+        );
     }
 }
