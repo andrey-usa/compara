@@ -25,7 +25,7 @@
 
 use std::cmp::Ordering;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, mpsc};
 
@@ -228,15 +228,18 @@ fn stream_into(
     let budget = batch_bytes(opt);
     let halves = room_halves(&index, opt.ignore_case);
 
-    // Sorts a full batch and writes it as the run numbered `n`.
+    // Sorts a full batch and writes it as the run numbered `n`. The order and
+    // the write buffer are asked for with a refusal: under a heap limit they
+    // were what a sort aborted on (`ulimit -d` 8-17 MB, the 200k- and 2M-row
+    // pairs).
     let spill = |batch: &Packed, n: usize, rowbuf: &mut Vec<u8>| -> Result<String> {
         let name = format!("run-{n}.bin");
-        let mut w = BufWriter::with_capacity(1 << 16, dir.create(&name)?);
-        for row in sorted_order(batch, key_size) {
+        let order = sorted_order(batch, key_size)?;
+        let mut w = RunWriter::create(dir.create(&name)?, RUN_BUFFER_MAX, SPILL_BUFFER)?;
+        for row in order {
             write_row(&mut w, batch, row as usize, rowbuf)?;
         }
-        w.flush()?;
-        let file = w.into_inner().map_err(|e| Error::new(e.to_string()))?;
+        let file = w.finish()?;
         crate::memory::write_out(&file);
         Ok(name)
     };
@@ -253,7 +256,8 @@ fn stream_into(
             let mut spilled = Vec::new();
             let mut rowbuf: Vec<u8> = Vec::new();
             for batch in batches {
-                spilled.push(spill(&batch, spilled.len(), &mut rowbuf)?);
+                let name = spill(&batch, spilled.len(), &mut rowbuf)?;
+                crate::alloc::push(&mut spilled, name, RUN_NAMES)?;
                 let _ = written.send(batch);
             }
             Ok(spilled)
@@ -283,7 +287,8 @@ fn stream_into(
                 let full = std::mem::replace(batch, next);
                 batch.clear();
                 if let Some((spilled, rowbuf)) = here.as_mut() {
-                    spilled.push(spill(&full, spilled.len(), rowbuf)?);
+                    let name = spill(&full, spilled.len(), rowbuf)?;
+                    crate::alloc::push(spilled, name, RUN_NAMES)?;
                     *batch = full;
                     batch.clear();
                 } else if to_spill.send(full).is_err() {
@@ -339,7 +344,8 @@ fn stream_into(
             if sent && !batch.is_empty() {
                 let rest = std::mem::replace(&mut batch, Packed::new(width));
                 if let Some((spilled, rowbuf)) = here.as_mut() {
-                    spilled.push(spill(&rest, spilled.len(), rowbuf)?);
+                    let name = spill(&rest, spilled.len(), rowbuf)?;
+                    crate::alloc::push(spilled, name, RUN_NAMES)?;
                 } else {
                     let _ = to_spill.send(rest);
                 }
@@ -360,7 +366,7 @@ fn stream_into(
         let merge_budget = budget;
         let spilled = merge_down(&dir, spilled, width, key_size, merge_budget)?;
         let order = if spilled.is_empty() {
-            sorted_order(&last, key_size)
+            sorted_order(&last, key_size)?
         } else {
             Vec::new()
         };
@@ -393,25 +399,37 @@ fn room_halves(index: &[Option<usize>], ignore_case: bool) -> usize {
 // External sort
 // ---------------------------------------------------------------------------
 
-/// A batch's rows in key order. Stable, so equal keys keep file order: batches
-/// are filled in file order and the merge breaks equal keys by run number, so
-/// the first row carrying a key is still the first row the join sees -- which
-/// is what makes first-occurrence-wins mean the same thing here as in every
-/// other engine.
-fn sorted_order(batch: &Packed, key_size: usize) -> Vec<u32> {
+/// A batch's rows in key order. Equal keys keep file order: batches are
+/// filled in file order and the merge breaks equal keys by run number, so the
+/// first row carrying a key is still the first row the join sees -- which is
+/// what makes first-occurrence-wins mean the same thing here as in every other
+/// engine.
+///
+/// Equal keys are ordered by row number, so the sort is the stable one
+/// without being a stable sort: the standard library's takes a scratch copy
+/// of what it sorts from the allocator, with no way to refuse it, and under a
+/// heap limit that copy was the allocation the process aborted on ("memory
+/// allocation of 79040 bytes failed", the 200k- and 2M-row pairs at 8-17 MB).
+/// What is held here is asked for with a refusal instead.
+fn sorted_order(batch: &Packed, key_size: usize) -> Result<Vec<u32>> {
     let n = batch.len();
+    let mut order: Vec<u32> = crate::alloc::sized(n, SORT_ORDER)?;
     if key_size == 0 || n < 2 {
-        let mut order: Vec<u32> = (0..n as u32).collect();
-        order.sort_by(|&x, &y| batch.key_order(x as usize, batch, y as usize, key_size));
-        return order;
+        order.extend(0..n as u32);
+        order.sort_unstable_by(|&x, &y| {
+            batch
+                .key_order(x as usize, batch, y as usize, key_size)
+                .then(x.cmp(&y))
+        });
+        return Ok(order);
     }
     // The first key cell's bytes after what every row in the batch shares
-    // (ids that all begin `ACC-0000`), eight of them, as a big-endian number:
-    // comparing two is one instruction and reads nothing from the batch's text,
-    // which is where a sort on 144 thousand rows spends its time (a cache miss
-    // for each cell of each comparison). A tie, or an absent cell, is settled by
-    // the full comparison, so the order is the one `key_order` gives and, the
-    // sort being stable, equal keys keep file order.
+    // (ids that all begin `ACC-0000`), eight of them, as a big-endian number,
+    // above the row's number: the rows are sorted as plain integers, which
+    // reads nothing from the batch's text, where a sort on 144 thousand rows
+    // spent its time (a cache miss for each cell of each comparison). Rows
+    // whose eight bytes tie, or whose cell is absent, come out in file order,
+    // and are then put in the order `key_order` gives, equal keys by row.
     let mut shared = usize::MAX;
     let first = (0..n).find_map(|r| batch.cell_bytes(r, 0));
     if let Some(first) = first {
@@ -426,27 +444,50 @@ fn sorted_order(batch: &Packed, key_size: usize) -> Vec<u32> {
         }
     }
     let shared = if shared == usize::MAX { 0 } else { shared };
-    let mut rows: Vec<(u64, u32)> = (0..n as u32)
-        .map(|r| {
-            let prefix = match batch.cell_bytes(r as usize, 0) {
-                None => u64::MAX,
-                Some(c) => {
-                    let mut word = [0u8; 8];
-                    let rest = c.get(shared..).unwrap_or(&[]);
-                    let k = rest.len().min(8);
-                    word[..k].copy_from_slice(&rest[..k]);
-                    u64::from_be_bytes(word)
-                }
-            };
-            (prefix, r)
-        })
-        .collect();
-    rows.sort_by(|x, y| {
-        x.0.cmp(&y.0)
-            .then_with(|| batch.key_order(x.1 as usize, batch, y.1 as usize, key_size))
-    });
-    rows.into_iter().map(|(_, r)| r).collect()
+    let mut rows: Vec<u128> = crate::alloc::sized(n, SORT_ORDER)?;
+    rows.extend((0..n as u32).map(|r| {
+        let prefix = match batch.cell_bytes(r as usize, 0) {
+            None => u64::MAX,
+            Some(c) => {
+                let mut word = [0u8; 8];
+                let rest = c.get(shared..).unwrap_or(&[]);
+                let k = rest.len().min(8);
+                word[..k].copy_from_slice(&rest[..k]);
+                u64::from_be_bytes(word)
+            }
+        };
+        u128::from(prefix) << 32 | u128::from(r)
+    }));
+    rows.sort_unstable();
+    let row = |x: u128| x as u32 as usize;
+    let mut at = 0;
+    while at < n {
+        let prefix = rows[at] >> 32;
+        let tied = rows[at + 1..]
+            .iter()
+            .take_while(|&&x| x >> 32 == prefix)
+            .count();
+        if tied > 0 {
+            rows[at..=at + tied].sort_unstable_by(|&x, &y| {
+                batch
+                    .key_order(row(x), batch, row(y), key_size)
+                    .then(x.cmp(&y))
+            });
+        }
+        at += tied + 1;
+    }
+    order.extend(rows.iter().map(|&x| row(x) as u32));
+    Ok(order)
 }
+
+/// The list of a file's spilled runs, in a refusal: a batch that cannot grow
+/// is spilled early, so under a tight heap a file spills thousands of runs,
+/// and the list growing by doubling was another allocation the sort aborted
+/// on ("memory allocation of 98304 bytes failed", the 2M-row pair at 8 MB).
+const RUN_NAMES: &str = "the list of sorted runs";
+
+/// What [`sorted_order`] holds, in a refusal.
+const SORT_ORDER: &str = "the sort order of a batch of rows";
 
 /// One file, sorted: the runs spilled to disk, or the one batch it took and
 /// that batch's order.
@@ -567,7 +608,7 @@ fn merge_runs(
 ) -> Result<()> {
     let buffer = run_buffer(budget, runs.len() + 1);
     let mut from = MergeCursor::open(dir, runs, width, key_size, buffer)?;
-    let mut to = RunWriter::create(dir.create(name)?, buffer)?;
+    let mut to = RunWriter::create(dir.create(name)?, buffer, MERGE_BUFFER)?;
     let mut rowbuf = Vec::new();
     while let Some((rows, row)) = from.peek() {
         write_row(&mut to, rows, row, &mut rowbuf)?;
@@ -581,16 +622,28 @@ fn merge_runs(
 /// The refusal of a run's buffer: the merge reads its runs through buffers
 /// sized to fit, so only a heap that is full already gets here.
 fn no_room_to_merge(bytes: usize) -> Error {
-    crate::alloc::refuse("a sorted run's buffer for the merge", bytes)
+    no_room_for(MERGE_BUFFER, bytes)
+}
+
+/// What a run's read buffer is, in a refusal.
+const MERGE_BUFFER: &str = "a sorted run's buffer for the merge";
+
+/// What a sorted batch is written through, in a refusal.
+const SPILL_BUFFER: &str = "the buffer a sorted run is written through";
+
+/// The refusal of a buffer, a row or a table the sort or the merge needs:
+/// they are sized to fit, so only a heap that is full already gets here.
+fn no_room_for(what: &str, bytes: usize) -> Error {
+    crate::alloc::refuse(what, bytes)
         .without_hint()
         .context_after(what_to_do(""))
 }
 
-/// A buffer for a run, from the allocator, or the refusal.
-fn run_buffer_of(size: usize) -> Result<Vec<u8>> {
+/// A buffer for a run, from the allocator, or the refusal naming `what`.
+fn run_buffer_of(size: usize, what: &str) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     buf.try_reserve_exact(size)
-        .map_err(|_| no_room_to_merge(size))?;
+        .map_err(|_| no_room_for(what, size))?;
     Ok(buf)
 }
 
@@ -606,7 +659,7 @@ struct RunReader {
 
 impl RunReader {
     fn open(file: File, size: usize) -> Result<Self> {
-        let mut buf = run_buffer_of(size)?;
+        let mut buf = run_buffer_of(size, MERGE_BUFFER)?;
         buf.resize(size, 0);
         Ok(RunReader {
             file,
@@ -672,15 +725,16 @@ impl BufRead for RunReader {
     }
 }
 
-/// A run written by a merge pass, through a buffer taken as [`RunReader`]'s is.
+/// A run written by the sort or a merge pass, through a buffer taken as
+/// [`RunReader`]'s is.
 struct RunWriter {
     file: File,
     buf: Vec<u8>,
 }
 
 impl RunWriter {
-    fn create(file: File, size: usize) -> Result<Self> {
-        let buf = run_buffer_of(size)?;
+    fn create(file: File, size: usize, what: &str) -> Result<Self> {
+        let buf = run_buffer_of(size, what)?;
         Ok(RunWriter { file, buf })
     }
 
@@ -691,6 +745,7 @@ impl RunWriter {
 }
 
 impl Write for RunWriter {
+    #[inline]
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         if self.buf.len() + data.len() > self.buf.capacity() {
             self.flush()?;
@@ -702,9 +757,35 @@ impl Write for RunWriter {
         Ok(data.len())
     }
 
+    /// What fits is copied without the loop the default runs, as
+    /// `BufWriter`'s does: a row is written as two of these.
+    #[inline]
+    fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        if self.buf.capacity() - self.buf.len() >= data.len() {
+            self.buf.extend_from_slice(data);
+            return Ok(());
+        }
+        self.write_all_past(data)
+    }
+
     fn flush(&mut self) -> std::io::Result<()> {
         self.file.write_all(&self.buf)?;
         self.buf.clear();
+        Ok(())
+    }
+}
+
+impl RunWriter {
+    /// [`Write::write_all`] for what does not fit: the buffer is written
+    /// out first, and what is as large as the buffer goes straight through.
+    #[cold]
+    #[inline(never)]
+    fn write_all_past(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.flush()?;
+        if data.len() >= self.buf.capacity() {
+            return self.file.write_all(data);
+        }
+        self.buf.extend_from_slice(data);
         Ok(())
     }
 }
@@ -1079,6 +1160,9 @@ fn read_row<R: BufRead>(
     let len = u32::from_le_bytes(head) as usize;
     scratch.clear();
     if len <= 1 << 20 {
+        if scratch.capacity() < len {
+            room_to_read(scratch, len)?;
+        }
         scratch.resize(len, 0);
         r.read_exact(&mut scratch[..]).map_err(short)?;
     } else {
@@ -1125,8 +1209,25 @@ fn read_row<R: BufRead>(
     if scratch.len() - at != end || end >= Packed::ABSENT_FLAG as usize {
         return Err(corrupt());
     }
-    into.push_raw(ends, &scratch[at..])
+    // A head row longer than the one before it grows its store: near a heap
+    // limit that small allocation was another the merge aborted on.
+    if !into.push_raw(ends, &scratch[at..])? {
+        return Err(no_room_for(RUN_ROW, end + width * 4 + 8));
+    }
+    Ok(())
 }
+
+/// Room for `len` bytes in the buffer [`read_row`] reads a row into, which
+/// grows only for a row longer than any before it, or the refusal.
+#[cold]
+#[inline(never)]
+fn room_to_read(v: &mut Vec<u8>, len: usize) -> Result<()> {
+    v.try_reserve(len.saturating_sub(v.len()))
+        .map_err(|_| no_room_for(RUN_ROW, len))
+}
+
+/// What [`read_row`] holds, in a refusal.
+const RUN_ROW: &str = "a row read back from a sorted run";
 
 /// The spill record: what is written reads back, and a damaged run is an
 /// error, not a panic or a wrong row.
@@ -1625,7 +1726,7 @@ mod tests {
                     batch.push(cells.iter().map(|c| c.as_deref())).unwrap();
                 }
                 assert_eq!(
-                    sorted_order(&batch, key_size),
+                    sorted_order(&batch, key_size).unwrap(),
                     reference(&batch, key_size),
                     "key_size {key_size} round {round}"
                 );

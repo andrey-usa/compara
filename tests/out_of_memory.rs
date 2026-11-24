@@ -690,6 +690,81 @@ fn a_sortmerge_with_more_runs_than_buffers_answers_rather_than_aborting() {
     assert!(answered > 0, "no limit was enough to answer");
 }
 
+/// A batch filled to the heap limit is sorted with a refusal, not an abort.
+/// The sort took a scratch copy of the batch's order and the run's write
+/// buffer from the allocator with no way to refuse them, and near the limit
+/// one of them was the allocation the process aborted on ("memory allocation
+/// of 79040 bytes failed", the 2M-row pair below 14 MB of heap). A batch that
+/// may grow as far as the heap lets it reaches that at any limit: every run
+/// here ended on signal 6.
+#[test]
+fn a_batch_sorted_at_the_heap_limit_refuses_rather_than_aborting() {
+    let dir = std::env::temp_dir().join(format!("compara-oom-sort-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let made = Command::new(env!("CARGO_BIN_EXE_compara-gen-data"))
+        .args(["--rows", "200k", "--prefix", "s", "--out-dir"])
+        .arg(&dir)
+        .output()
+        .expect("gen-data");
+    assert!(made.status.success(), "{made:?}");
+    let (a, b) = (dir.join("s_a.csv"), dir.join("s_b.csv"));
+    let run = |limit_kb: Option<usize>| {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(format!(
+            "{} exec {} compare {} {} -k account_id,txn_id -i updated_at,note \
+             --engine sortmerge --threads 4",
+            limit_kb
+                .map(|kb| format!("ulimit -d {kb};"))
+                .unwrap_or_default(),
+            env!("CARGO_BIN_EXE_compara"),
+            a.display(),
+            b.display(),
+        ));
+        cmd.env("RUST_BACKTRACE", "1")
+            .env_remove("COMPARA_BACKTRACE")
+            .env_remove("COMPARA_MEMORY")
+            // A batch larger than any of these heaps: it grows until the
+            // allocator says no, and is sorted there.
+            .env("COMPARA_SORTMERGE_BATCH_BYTES", "1073741824");
+        let out = cmd.output().expect("bash");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let counts = stdout
+            .rsplit_once(" | ")
+            .map(|(c, _)| c.to_string())
+            .unwrap_or(stdout);
+        use std::os::unix::process::ExitStatusExt;
+        (
+            out.status
+                .code()
+                .or_else(|| out.status.signal().map(|s| 128 + s)),
+            counts,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, free, err) = run(None);
+    assert_eq!(code, Some(1), "{err}");
+    let mut failed = Vec::new();
+    for mb in [32, 40, 48] {
+        let kb = mb * 1024;
+        let (code, counts, err) = run(Some(kb));
+        match code {
+            Some(1) if counts == free => {}
+            Some(2) if err.contains("out of memory") && err.contains("ulimit -d") => {}
+            _ => failed.push(format!(
+                "{kb} KB: exit {code:?}, {counts:?}: {}",
+                err.lines().next().unwrap_or("")
+            )),
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        failed.is_empty(),
+        "{} of 3 runs neither answered as the unlimited run ({free:?}) nor refused:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}
+
 /// A refusal at the heap limit says what ran out and the limit, rather than
 /// aborting while it writes that. The 20,000-row pair with a JSON summary and
 /// an export runs out on a report row's or a changed cell's few dozen bytes,

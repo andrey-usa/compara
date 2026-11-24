@@ -83,6 +83,14 @@ All notable changes to this project are documented here. The format follows
   fits, or beyond what `ulimit -n` allows, are merged in passes first; equal
   keys keep their order in the file. A row also asks its batch for room
   enough for lower case (`--ignore-case`) and for a column named twice.
+- `sortmerge` sorting a batch under a heap limit (`ulimit -d`, a
+  container's) took the batch's sort order, the stable sort's scratch copy
+  of it, the buffer the run is written through and room in the list of runs
+  from the allocator with no way to refuse them, and near the limit the
+  process aborted (exit 134, "memory allocation of ... bytes failed"); so
+  could a merge reading back a row longer than the ones before it. Each is
+  now asked for with a refusal (exit 2, naming the limit), and the sort
+  needs no scratch copy: equal keys are ordered by their place in the file.
 - Under `--engine auto`, a CSV pair that does not fit `turbo` falls back to
   `sortmerge` from 24 MB of heap, the least a named `sortmerge` starts with,
   where it was refused below 48 MB.

@@ -192,8 +192,10 @@ impl Packed {
     /// Appends one row from its spilled form: `ends` as [`Packed::row_raw`]
     /// gives them and `text` the row's bytes. Checks what `push` would have
     /// guaranteed: the text is UTF-8, the ends do not decrease, and each one
-    /// falls on a character boundary and within the text.
-    pub fn push_raw(&mut self, ends: &[u32], text: &[u8]) -> Result<()> {
+    /// falls on a character boundary and within the text. `false`, with
+    /// nothing taken, when the allocator has no room for the row (see
+    /// [`Packed::try_room`]).
+    pub fn push_raw(&mut self, ends: &[u32], text: &[u8]) -> Result<bool> {
         let text = std::str::from_utf8(text)
             .map_err(|e| Error::new(format!("spilled run holds invalid UTF-8: {e}")))?;
         let mut prev = 0usize;
@@ -207,10 +209,13 @@ impl Packed {
         if prev != text.len() {
             return Err(Error::new("spilled run holds invalid UTF-8"));
         }
+        if !self.try_room(text.len()) {
+            return Ok(false);
+        }
         self.starts.push(self.text.len());
         self.text.push_str(text);
         self.ends.extend_from_slice(ends);
-        Ok(())
+        Ok(true)
     }
 
     pub fn clear(&mut self) {
