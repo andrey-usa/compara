@@ -310,6 +310,8 @@ fn file_meta(path: &Path) -> FileMeta {
             .unwrap_or_else(|_| path.to_path_buf())
             .to_string_lossy()
             .into_owned(),
-        size: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        size: crate::source::input_metadata(path)
+            .map(|m| m.len())
+            .unwrap_or(0),
     }
 }

@@ -3023,7 +3023,7 @@ fn nested_chunk(
 pub fn is_parquet(path: &std::path::Path) -> bool {
     use std::io::Read;
     let mut magic = [0u8; 4];
-    match std::fs::File::open(path) {
+    match crate::source::open_input(path) {
         Ok(mut f) => f.read_exact(&mut magic).is_ok() && &magic == b"PAR1",
         Err(_) => false,
     }

@@ -342,7 +342,7 @@ impl Source {
     fn decompress(&mut self) -> Result<()> {
         let mut head = [0u8; 6];
         let n = {
-            let mut f = File::open(&self.path)
+            let mut f = open_input(&self.path)
                 .map_err(|e| Error::new(format!("cannot read {}: {e}", self.spec)))?;
             read_up_to(&mut f, &mut head)?
         };
@@ -373,7 +373,7 @@ impl Source {
         let started = Instant::now();
         let input = BufReader::with_capacity(
             1 << 20,
-            File::open(&self.path)
+            open_input(&self.path)
                 .map_err(|e| Error::new(format!("cannot read {}: {e}", self.spec)))?,
         );
         let budget = crate::memory::in_memory_budget();
@@ -628,27 +628,106 @@ fn no_temp(what: &str, e: &std::io::Error) -> Error {
 ///
 /// Until then it is locked, which is what tells a later run, in any pid
 /// namespace, that this one is not over; its name ends `-locked` to say so
-/// (see [`sweep`]). The lock is held on a descriptor of its own, so it lasts
-/// as long as this does, whatever becomes of the one the file was made
-/// with: most are closed once the file is written, and the file is read
-/// again by its name.
+/// (see [`sweep`]). On Unix it is also held open from its making, on a
+/// descriptor of its own (the one locked), whatever becomes of the one it
+/// was made with: most are closed once the file is written, and what reads
+/// it next -- the input's expansion, the engines -- opens it again by its
+/// name, through [`open_input`], which reads it only while the name is still
+/// this file's.
 pub(crate) struct Temp {
     path: PathBuf,
-    _lock: Option<File>,
+    #[cfg(unix)]
+    _held: File,
 }
 
 impl Temp {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+
+    /// The file `file` made at `path`, held and known by its device and
+    /// inode from now on: neither is another file's while it is held open.
+    #[cfg(unix)]
+    fn held(path: PathBuf, file: File) -> Result<Temp> {
+        use std::os::unix::fs::MetadataExt;
+        let made = file.metadata().map_err(|e| no_temp("file", &e))?;
+        if let Ok(mut written) = WRITTEN.lock() {
+            written.push((path.clone(), (made.dev(), made.ino())));
+        }
+        Ok(Temp { path, _held: file })
+    }
 }
 
 impl Drop for Temp {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Ok(mut written) = WRITTEN.lock() {
+            written.retain(|(path, _)| *path != self.path);
+        }
         // Before the lock goes with the fields: the file is not unlocked
         // while it is there.
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// This process's temporary files, by name, with the device and inode of
+/// the file each was made as ([`Temp::held`]).
+#[cfg(unix)]
+static WRITTEN: std::sync::Mutex<Vec<(PathBuf, (u64, u64))>> = std::sync::Mutex::new(Vec::new());
+
+/// Opens `path`, an input to compare, to read: what the engines read.
+///
+/// A temporary file of this run's -- standard input spooled, a download, a
+/// decompressed or combined input -- is opened as the sweep opens a name
+/// ([`sweep::reopen`]: not through a link, not waiting on a pipe), and only
+/// if what it opens is the file this run made there. Where anyone may rename
+/// in the temporary directory (no sticky bit), the name may by now be
+/// someone else's file, or a link to one, and reading it would compare their
+/// data in place of the input. The check is on the descriptor that is then
+/// read or mapped, so nothing can come between them.
+pub fn open_input(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        let made = WRITTEN.lock().ok().and_then(|written| {
+            written
+                .iter()
+                .find(|(at, _)| at == path)
+                .map(|&(_, made)| made)
+        });
+        if let Some(made) = made {
+            use std::os::unix::fs::MetadataExt;
+            let replaced = |e: std::io::Error| {
+                std::io::Error::other(format!(
+                    "{e}; it is no longer the temporary file this run wrote there (another user \
+                     can rename files in {} where it has no sticky bit); set TMPDIR to a \
+                     directory of your own",
+                    std::env::temp_dir().display()
+                ))
+            };
+            let file = sweep::reopen(path, false).map_err(replaced)?;
+            let opened = file.metadata().map_err(replaced)?;
+            if (opened.dev(), opened.ino()) != made {
+                return Err(replaced(std::io::Error::other(
+                    "another file is at its name",
+                )));
+            }
+            return Ok(file);
+        }
+    }
+    File::open(path)
+}
+
+/// The metadata of `path`, an input to compare: of the file
+/// [`open_input`] would read.
+pub fn input_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    #[cfg(unix)]
+    if WRITTEN
+        .lock()
+        .is_ok_and(|written| written.iter().any(|(at, _)| at == path))
+    {
+        return open_input(path)?.metadata();
+    }
+    std::fs::metadata(path)
 }
 
 /// A new file in the temporary directory, for this user alone (see
@@ -660,22 +739,22 @@ pub(crate) fn temp_file(tag: &str) -> Result<(Temp, File)> {
     {
         let (path, file) = new_temp_file(&format!("{tag}-{}", sweep::LOCKED))?;
         if let Some(lock) = file.try_clone().ok().filter(|l| l.try_lock().is_ok()) {
-            return Ok((
-                Temp {
-                    path,
-                    _lock: Some(lock),
-                },
-                file,
-            ));
+            return Ok((Temp::held(path, lock)?, file));
         }
         // As for a directory (`TempDir::new`): where the lock cannot be
         // taken, the file is one of an unlocked run's, which a later run
         // leaves for a day.
         drop(file);
         let _ = std::fs::remove_file(&path);
+        let (path, file) = new_temp_file(tag)?;
+        let held = file.try_clone().map_err(|e| no_temp("file", &e))?;
+        Ok((Temp::held(path, held)?, file))
     }
-    let (path, file) = new_temp_file(tag)?;
-    Ok((Temp { path, _lock: None }, file))
+    #[cfg(not(unix))]
+    {
+        let (path, file) = new_temp_file(tag)?;
+        Ok((Temp { path }, file))
+    }
 }
 
 /// A new file in the temporary directory, for this user alone.

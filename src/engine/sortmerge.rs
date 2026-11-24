@@ -165,8 +165,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
 fn reader(path: &Path, opt: &Options) -> Result<csv::Reader<File>> {
     use std::io::{Seek, SeekFrom};
 
-    let mut file =
-        File::open(path).map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
+    let mut file = crate::source::open_input(path)
+        .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
     let delimiter = match opt.delimiter_byte()? {
         Some(d) => d,
         None => {
@@ -189,7 +189,7 @@ fn reader(path: &Path, opt: &Options) -> Result<csv::Reader<File>> {
 
 fn read_header(path: &Path, opt: &Options) -> Result<Vec<String>> {
     let mut head = Vec::with_capacity(1024);
-    File::open(path)
+    crate::source::open_input(path)
         .and_then(|f| f.take(1024).read_to_end(&mut head))
         .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
     crate::engine::turbo::refuse_non_text(&head, path)?;

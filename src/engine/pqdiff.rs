@@ -32,7 +32,6 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Write;
 use std::path::Path;
@@ -1271,7 +1270,8 @@ fn scan_mask(neq: &[u8], base: usize, mut hit: impl FnMut(usize)) {
 // ---------------------------------------------------------------------------
 
 fn map(path: &Path) -> Result<Mmap> {
-    let file = File::open(path).map_err(|e| Error::new(format!("cannot read {path:?}: {e}")))?;
+    let file = crate::source::open_input(path)
+        .map_err(|e| Error::new(format!("cannot read {path:?}: {e}")))?;
     // SAFETY: the file is opened read-only and not modified while mapped, which
     // is the same contract the `turbo` engine's Slab makes.
     unsafe { Mmap::map(&file) }.map_err(|e| Error::new(format!("cannot map {path:?}: {e}")))

@@ -994,7 +994,7 @@ fn delimiter_note(source: &Source, opt: &Options) {
     use std::io::Read;
     let Some(d) = opt.delimiter else { return };
     let mut head = Vec::with_capacity(4096);
-    let Ok(file) = fs::File::open(source.path()) else {
+    let Ok(file) = compara::source::open_input(source.path()) else {
         return;
     };
     if file.take(64 * 1024).read_to_end(&mut head).is_err() {

@@ -4692,7 +4692,7 @@ pub fn available() -> bool {
 /// rather than hand the file to DuckDB's CSV reader and report the parse error
 /// it makes of a binary footer.
 pub fn only_this_engine_reads(path: &Path) -> bool {
-    let Ok(mut file) = std::fs::File::open(path) else {
+    let Ok(mut file) = crate::source::open_input(path) else {
         return false;
     };
     use std::io::{Read, Seek, SeekFrom};

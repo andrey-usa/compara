@@ -72,8 +72,8 @@ pub(crate) fn read_error(path: &Path, e: csv::Error, engine: &str) -> Error {
 
 /// Opens a CSV reader with the delimiter forced or sniffed from the header.
 fn reader(path: &Path, opt: &Options) -> Result<csv::Reader<File>> {
-    let mut file =
-        File::open(path).map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
+    let mut file = crate::source::open_input(path)
+        .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
 
     let delimiter = match opt.delimiter_byte()? {
         Some(d) => d,
@@ -100,7 +100,7 @@ fn reader(path: &Path, opt: &Options) -> Result<csv::Reader<File>> {
 
 fn read_header(path: &Path, opt: &Options) -> Result<Vec<String>> {
     let mut head = Vec::with_capacity(1024);
-    File::open(path)
+    crate::source::open_input(path)
         .and_then(|f| f.take(1024).read_to_end(&mut head))
         .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
     crate::engine::turbo::refuse_non_text(&head, path)?;
@@ -136,7 +136,9 @@ fn read_store(
 
     let mut store = RowStore::new(opt, compared);
     let mut rdr = reader(path, opt)?;
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let size = crate::source::input_metadata(path)
+        .map(|m| m.len())
+        .unwrap_or(0);
     let mut record = csv::StringRecord::new();
     let mut read = 0usize;
     while rdr

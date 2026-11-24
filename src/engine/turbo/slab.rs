@@ -60,7 +60,7 @@ const PAGE: usize = 4096;
 impl Slab {
     /// Maps a file read-only, with a hint that it will be read front to back.
     pub(super) fn map(path: &Path) -> Result<Self> {
-        let file = File::open(path)
+        let file = crate::source::open_input(path)
             .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
         // Safety: the file is opened read-only and not modified while mapped.
         // A concurrent truncation would be a torn read, which is the documented

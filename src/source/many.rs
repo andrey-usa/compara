@@ -508,7 +508,7 @@ impl Combined {
     /// its partition values, one per [`Combined::set_partitions`] name.
     pub(crate) fn append_file(&mut self, name: &str, path: &Path, values: &[String]) -> Result<()> {
         let mut input =
-            File::open(path).map_err(|e| Error::new(format!("cannot read {name}: {e}")))?;
+            super::open_input(path).map_err(|e| Error::new(format!("cannot read {name}: {e}")))?;
         let mut head = [0u8; 6];
         let n = read_up_to(&mut input, &mut head)?;
         if n == 0 {
