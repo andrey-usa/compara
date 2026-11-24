@@ -8,6 +8,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- JSON is compared with fewer instructions: where the CPU has AVX2 (x86-64)
+  or NEON (ARM), the walk over each row's keys reads its bytes a vector
+  register at a time, and tells each member by one compare; elsewhere it
+  reads them as before, with the same answers.
 - NDJSON written with a space after each comma and colon, as Python's
   `json.dumps` writes it by default, is compared about as fast as compact
   NDJSON, where it had taken about twice as long: each member is told by
