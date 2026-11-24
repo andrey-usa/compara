@@ -959,6 +959,11 @@ mod tests {
 
     #[test]
     fn a_new_temporary_directory_swapped_before_it_is_locked_is_not_waited_on_or_followed() {
+        // The process's one sweep of the real temporary directory, done
+        // before any clock starts (it can take seconds on a busy machine, or
+        // with a killed run's spills to remove), and before the swap is set:
+        // the sweep opens names too.
+        super::super::sweep_once();
         let mut got = Vec::new();
         for (what, swap) in [
             ("pipe", new_to_pipe as fn(&Path)),
@@ -966,8 +971,6 @@ mod tests {
         ] {
             let (tx, rx) = mpsc::channel();
             let run = std::thread::spawn(move || {
-                // Done before the swap is set: the sweep opens names too.
-                super::super::sweep_once();
                 SWAP.set(Some((Point::Open, swap)));
                 // Whether what it hands back is a directory, not what was
                 // swapped in.
