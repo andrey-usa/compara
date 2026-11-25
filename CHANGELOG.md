@@ -106,16 +106,17 @@ All notable changes to this project are documented here. The format follows
   The batches the sort gives back are let go of before the merge's passes,
   which had been refused the room they held, and a refusal at the limit is
   written in room set aside for it, where writing it could abort too.
-- Under `--engine auto`, a CSV pair that does not fit `turbo` falls back to
-  `sortmerge` from 20 MB of heap, where it was refused below 48 MB, and a
-  named `sortmerge` starts from 20 MB, down from 24 MB. At 16 threads under
-  such a limit, `auto` was still refused where `--engine sortmerge`
-  answered: the C library keeps a finished thread's 2 MB stack mapped for
-  the next thread, the limit counts it, and `turbo`'s threads had taken most
-  of the limit before it handed the pair over. Under a heap limit (`ulimit
-  -d`, or a container's), thread stacks now take at most a third of it, so
-  below 6 MB a thread asked for (96 MB at `--threads 16`) fewer threads run;
-  and the fallback sizes `sortmerge` from what `turbo` left.
+- Under `--engine auto`, a CSV pair that does not fit `turbo` now falls back
+  to `sortmerge` under any heap limit a named `sortmerge` starts under, where
+  it had been refused under limits `sortmerge` alone would have answered in,
+  and a named `sortmerge` starts under smaller limits than before. At 16
+  threads under such a limit, `auto` was still refused where `--engine
+  sortmerge` answered: the C library keeps a finished thread's stack mapped
+  for the next thread, the limit counts it, and `turbo`'s threads had taken
+  most of the limit before it handed the pair over. Under a heap limit
+  (`ulimit -d`, or a container's), thread stacks now take at most a third of
+  it, so under a tight limit fewer threads run, and the fallback sizes
+  `sortmerge` from what `turbo` left.
 - A run killed while `sortmerge` spilled (SIGKILL, the OOM killer, an
   abort) left its runs in the temporary directory for good, and enough such
   runs filled the disk; a killed run's spooled standard input, download,
