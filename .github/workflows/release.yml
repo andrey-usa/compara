@@ -310,7 +310,7 @@ jobs:
           # Standard input, gzipped.
           gzip -c examples/orders_2026-08.csv | docker run --rm -i -v "$PWD/examples:/data:ro" \
             compara:test compare - orders_2026-09.csv -k order_id,line_no -i updated_at || [ $? = 1 ]
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         if: needs.plan.outputs.publish == 'true'
         with:
           registry: ghcr.io
