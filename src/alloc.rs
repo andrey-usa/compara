@@ -171,6 +171,14 @@ pub fn reserve_covers(size: usize) -> bool {
 /// once those are taken, into ones asked for with `try_reserve`; with neither,
 /// the refusal says what it can without its figures.
 pub(crate) fn refuse(what: &str, bytes: usize) -> Error {
+    refuse_saying(what, bytes, "", "")
+}
+
+/// [`refuse`], with `after` said after the size and `or` after the hint's
+/// "raise it": what the room was for, and another way out. Written into the
+/// same buffers, so a caller with more to say does not format it again into
+/// a string of its own at the limit.
+pub(crate) fn refuse_saying(what: &str, bytes: usize, after: &str, or: &str) -> Error {
     release_reserve();
     let Some(mut message) = message_buffer() else {
         return Error::out_of_memory_static(
@@ -180,7 +188,7 @@ pub(crate) fn refuse(what: &str, bytes: usize) -> Error {
     };
     let _ = write!(
         Bounded(&mut message),
-        "out of memory: {what} needs {}",
+        "out of memory: {what} needs {}{after}",
         Size(bytes)
     );
     // Without a buffer for it, the limit goes unsaid rather than the refusal.
@@ -191,7 +199,7 @@ pub(crate) fn refuse(what: &str, bytes: usize) -> Error {
         hint = room;
         let _ = write!(
             Bounded(&mut hint),
-            ", and this process may use {} (a container limit or `ulimit -d`): raise it",
+            ", and this process may use {} (a container limit or `ulimit -d`): raise it{or}",
             crate::source::Human(h)
         );
     }
@@ -449,6 +457,20 @@ mod tests {
     fn a_refusal_names_the_structure_and_its_size() {
         let e = refuse("the key index", 33_554_432);
         assert_eq!(e.to_string(), "out of memory: the key index needs 32 MB");
+    }
+
+    #[test]
+    fn a_refusal_says_what_the_room_was_for_in_its_own_buffer() {
+        let e = refuse_saying("a block", 2048, " to read ahead", ", or read in turn");
+        let m = e.to_string();
+        assert!(
+            m.starts_with("out of memory: a block needs 2 KB to read ahead"),
+            "{m}"
+        );
+        // The hint is said only under a heap limit, with what else to do.
+        if crate::memory::heap_limit().is_some() {
+            assert!(m.ends_with("raise it, or read in turn"), "{m}");
+        }
     }
 
     #[test]

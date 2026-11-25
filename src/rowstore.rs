@@ -137,11 +137,17 @@ impl Packed {
         if self.try_push_row_of(other, row) {
             return Ok(());
         }
-        let (ends, text) = other.row_raw(row);
         Err(crate::alloc::refuse(
             "a block of sorted rows",
-            self.bytes() + text.len() + ends.len() * 4 + 8,
+            self.room_for_row_of(other, row),
         ))
+    }
+
+    /// What this store would hold with another store's row appended, in
+    /// bytes: the size a refusal of [`Packed::push_row_of`] names.
+    pub fn room_for_row_of(&self, other: &Packed, row: usize) -> usize {
+        let (ends, text) = other.row_raw(row);
+        self.bytes() + text.len() + ends.len() * 4 + 8
     }
 
     /// Appends a copy of another store's row of the same width, if the

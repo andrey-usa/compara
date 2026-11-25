@@ -668,11 +668,17 @@ fn no_room_for(what: &str, bytes: usize) -> Error {
 /// the 2M-row pair at 6 and 9.5 MB). With no limit set, it is the machine
 /// that has no more to give, and that is said here.
 fn refused(what: &str, bytes: usize) -> Error {
-    let refusal = crate::alloc::refuse(what, bytes);
+    refused_saying(what, bytes, "", "")
+}
+
+/// [`refused`], with `after` said after the size and `or` after what to do,
+/// both written by [`crate::alloc::refuse_saying`] into the room it set aside.
+fn refused_saying(what: &str, bytes: usize, after: &str, or: &str) -> Error {
+    let refusal = crate::alloc::refuse_saying(what, bytes, after, or);
     if crate::memory::heap_limit().is_some() {
         return refusal;
     }
-    refusal.without_hint().context_after(what_to_do(""))
+    refusal.without_hint().context_after(what_to_do(or))
 }
 
 /// A buffer for a run, from the allocator, or the refusal naming `what`.
@@ -911,8 +917,8 @@ impl Ahead {
                         }
                         // Every block is back and the row still has no room:
                         // the last try, which names what it needed.
-                        if let Err(e) = block.push_row_of(rows, row) {
-                            let _ = to_join.send(Err(no_room(e)));
+                        if !block.try_push_row_of(rows, row) {
+                            let _ = to_join.send(Err(no_room(block.room_for_row_of(rows, row))));
                             return;
                         }
                     }
@@ -966,12 +972,17 @@ fn no_room_to_sort(text: usize, width: usize) -> Error {
     refused("a batch of rows to sort", text + width * 4 + 8)
 }
 
-/// The refusal of a row the read-ahead has no room for with every block back.
-fn no_room(e: Error) -> Error {
-    e.without_hint().context_after(format!(
-        " to read the sorted runs ahead of the merge{}",
-        what_to_do(", or `--threads 2` merges without reading ahead")
-    ))
+/// The refusal of a row the read-ahead has no room for with every block back,
+/// `bytes` being the block with the row in it. Said in the room set aside for
+/// a refusal, as [`refused`] is: formatted afresh, its words were a new
+/// string at a heap full to the byte.
+fn no_room(bytes: usize) -> Error {
+    refused_saying(
+        "a block of sorted rows",
+        bytes,
+        " to read the sorted runs ahead of the merge",
+        ", or `--threads 2` merges without reading ahead",
+    )
 }
 
 /// What a refusal of room says after what ran out: the heap limit, if there
