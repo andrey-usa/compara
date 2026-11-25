@@ -57,6 +57,13 @@ All notable changes to this project are documented here. The format follows
   escape in the report and the export, where every one read as U+FFFD:
   two different values looked alike, and under `--trim` or
   `--ignore-case` they were equal.
+- The same for a JSON string (`"\ud800"` against `"\ud801"`): under
+  `--trim` or `--ignore-case` the two were equal, as cells and as keys, and
+  in the report a changed row showed no changed cell. They now compare
+  apart under every option, and a lone surrogate is shown as its escape.
+  Every other value is shown and exported as written, so a lone surrogate
+  and a string holding its six characters (`\ud800`) look alike; the cell
+  is still listed as changed.
 - On Windows, a URL whose server refused the connection was reported as the
   raw error, without saying the connection was refused or that a proxy was
   set: Windows words it "actively refused", or in the language it is set
