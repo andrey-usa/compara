@@ -942,3 +942,85 @@ fn auto_under_a_heap_limit_answers_where_a_named_sortmerge_does() {
         "auto never fell back to sortmerge: {compared} runs"
     );
 }
+
+/// A file whose every key repeats is compared at the heap limit, rather than
+/// aborted on its list of duplicate keys. The sortmerge engine kept the
+/// `--max-rows` most repeated keys whether or not a report would show them,
+/// copied every key, sorted the whole list with a scratch copy at each key
+/// past the cap, and built the report's section from it at the end, none of
+/// it asked for with a refusal: with 60,000 keys twice each, every run from
+/// 20 to 26 MB ended on signal 6 ("memory allocation of 972778 bytes
+/// failed", then of 128 bytes), above the 20 MB the engine starts from.
+#[test]
+fn a_file_whose_keys_all_repeat_is_compared_at_the_heap_limit() {
+    let dir = std::env::temp_dir().join(format!("compara-oom-dups-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    const HEADER: &str = "account_id,txn_id,amount,updated_at\n";
+    let (mut a, mut b) = (String::from(HEADER), String::from(HEADER));
+    for i in 0..120_000 {
+        let k = i % 60_000;
+        a.push_str(&format!("a{k},t{k},{}.{},2026-01-01\n", i % 977, i % 97));
+        b.push_str(&format!("a{i},t{i},{}.{},2026-01-01\n", i % 977, i % 97));
+    }
+    let (a_path, b_path) = (dir.join("a.csv"), dir.join("b.csv"));
+    fs::write(&a_path, a).expect("write a");
+    fs::write(&b_path, b).expect("write b");
+    let run = |limit_kb: Option<usize>, threads: usize| {
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "{} exec {} compare {} {} -k account_id,txn_id --engine sortmerge \
+                 --threads {threads}",
+                limit_kb
+                    .map(|kb| format!("ulimit -d {kb};"))
+                    .unwrap_or_default(),
+                env!("CARGO_BIN_EXE_compara"),
+                a_path.display(),
+                b_path.display(),
+            ))
+            .env("RUST_BACKTRACE", "1")
+            .env_remove("COMPARA_BACKTRACE")
+            .env_remove("COMPARA_MEMORY")
+            .env_remove("COMPARA_SORTMERGE_BATCH_BYTES")
+            .output()
+            .expect("bash");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let counts = stdout
+            .rsplit_once(" | ")
+            .map(|(c, _)| c.to_string())
+            .unwrap_or(stdout);
+        use std::os::unix::process::ExitStatusExt;
+        (
+            out.status
+                .code()
+                .or_else(|| out.status.signal().map(|s| 128 + s)),
+            counts,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, free, err) = run(None, 4);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(free.contains("duplicate keys A 60,000, B 0"), "{free}");
+    let mut failed = Vec::new();
+    for threads in [4, 16] {
+        for mb in [20, 22, 24, 26] {
+            let kb = mb * 1024;
+            let (code, counts, err) = run(Some(kb), threads);
+            match code {
+                Some(1) if counts == free => {}
+                Some(2) if err.contains("out of memory") && err.contains("ulimit -d") => {}
+                _ => failed.push(format!(
+                    "{kb} KB, {threads} threads: exit {code:?}, {counts:?}: {}",
+                    err.lines().next().unwrap_or("")
+                )),
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        failed.is_empty(),
+        "{} of 8 runs neither answered as the unlimited run ({free:?}) nor refused:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}

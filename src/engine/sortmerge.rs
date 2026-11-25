@@ -137,8 +137,8 @@ pub(crate) fn compare_after(
 
     let (ca, cb) = (a_runs.sorted()?, b_runs.sorted()?);
 
-    let mut dup_a = Dups::new(&opt.key, opt.max_rows);
-    let mut dup_b = Dups::new(&opt.key, opt.max_rows);
+    let mut dup_a = Dups::new(&opt.key, opt.max_rows, opt.row_lists);
+    let mut dup_b = Dups::new(&opt.key, opt.max_rows, opt.row_lists);
     let mut join = |mut ca: Box<dyn Cursor>, mut cb: Box<dyn Cursor>| {
         merge_join(
             &mut ca,
@@ -164,14 +164,8 @@ pub(crate) fn compare_after(
     phases.mark("merge join");
 
     let meta = resolved.meta(&opt.key, a_header.len(), b_header.len());
-    let out = assemble(
-        meta,
-        joined,
-        dup_a.section(),
-        dup_b.section(),
-        opt,
-        &resolved.compared,
-    );
+    let (dup_a, dup_b) = (dup_a.section()?, dup_b.section()?);
+    let out = assemble(meta, joined, dup_a, dup_b, opt, &resolved.compared);
     drop(guard);
     out
 }
@@ -1573,7 +1567,7 @@ fn skip_key(
         c.next()?;
     }
     if repeats > 0 {
-        dups.record(&row.row(0), repeats + 1);
+        dups.record(row, repeats + 1)?;
     }
     current(c, row)
 }
@@ -1619,64 +1613,176 @@ impl Capped {
 /// A bounded list of the worst offenders, rather than every duplicate, so a
 /// pathological file where every key repeats does not undo the memory bound.
 /// Ordering matches every other engine: most duplicated first, then by key.
+///
+/// Held in a heap with the least of them on top, so a key that would not make
+/// the list is turned away by one comparison, with nothing copied. The list
+/// was sorted whole, with a stable sort's scratch copy, at every key past the
+/// cap, and its keys were copied whether kept or not: none of it asked for
+/// with a refusal, so under a heap limit the join aborted in it ("memory
+/// allocation of 4096 bytes failed", the 2M-row pair at 9.5 MB).
 struct Dups {
     key_cols: Vec<String>,
     key_size: usize,
     cap: usize,
-    best: Vec<(Vec<Val>, i64)>,
+    /// Whether there is a report to list them in; without one, as in
+    /// `turbo`, only the counts are kept.
+    listed: bool,
+    /// The best `cap + 1` so far: one past the cap, so that the section can
+    /// say it was cut short.
+    best: std::collections::BinaryHeap<Dup>,
     keys: i64,
     rows: i64,
 }
 
+/// A duplicated key and its rows, ordered by how far down the report it
+/// goes: fewer rows, then the greater key. Keys are distinct within a side,
+/// so the order is total and the list the same however it was reached.
+struct Dup {
+    key: Vec<Val>,
+    count: i64,
+}
+
+impl Ord for Dup {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .count
+            .cmp(&self.count)
+            .then_with(|| compare_keys(&self.key, &other.key, self.key.len()))
+    }
+}
+
+impl PartialOrd for Dup {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Dup {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Dup {}
+
+/// What the duplicate-key report is, in a refusal, and the way out it has.
+const DUPLICATES: &str = "the list of duplicate keys";
+const FEWER_DUPLICATES: &str = ", or a lower `--max-rows` lists fewer";
+
 impl Dups {
-    fn new(key_cols: &[String], cap: usize) -> Self {
+    fn new(key_cols: &[String], cap: usize, listed: bool) -> Self {
         Self {
             key_cols: key_cols.to_vec(),
             key_size: key_cols.len(),
             cap,
-            best: Vec::new(),
+            listed,
+            best: std::collections::BinaryHeap::new(),
             keys: 0,
             rows: 0,
         }
     }
 
-    fn record(&mut self, row: &[Val], count: i64) {
+    /// Counts the key of `row`'s first row, seen `count` times, and keeps it
+    /// if it is among the most repeated. The room it is kept in is asked for
+    /// with a refusal.
+    fn record(&mut self, row: &Packed, count: i64) -> Result<()> {
         self.keys += 1;
         self.rows += count;
-        self.best.push((row[..self.key_size].to_vec(), count));
-        if self.best.len() > self.cap + 1 {
-            self.sort_best();
-            self.best.truncate(self.cap + 1);
+        if !self.listed {
+            return Ok(());
         }
+        let full = self.best.len() > self.cap;
+        if full
+            && self
+                .best
+                .peek()
+                .is_some_and(|least| !self.goes_before(row, count, least))
+        {
+            return Ok(());
+        }
+        let key = self.key_of(row)?;
+        let dup = Dup { key, count };
+        if full {
+            if let Some(mut least) = self.best.peek_mut() {
+                *least = dup;
+            }
+            return Ok(());
+        }
+        if self.best.len() == self.best.capacity() {
+            let bytes = (self.best.len() + 1).saturating_mul(size_of::<Dup>());
+            self.best
+                .try_reserve(1)
+                .map_err(|_| refused_saying(DUPLICATES, bytes, "", FEWER_DUPLICATES))?;
+        }
+        self.best.push(dup);
+        Ok(())
     }
 
-    fn sort_best(&mut self) {
-        let key_size = self.key_size;
-        self.best.sort_by(|x, y| {
-            y.1.cmp(&x.1)
-                .then_with(|| compare_keys(&x.0, &y.0, key_size))
-        });
+    /// Whether `row`'s key, seen `count` times, goes before `least` in the
+    /// report: [`Dup`]'s order, read from the packed row, without a copy.
+    fn goes_before(&self, row: &Packed, count: i64, least: &Dup) -> bool {
+        match count.cmp(&least.count) {
+            Ordering::Equal => {}
+            more => return more == Ordering::Greater,
+        }
+        for (i, theirs) in least.key.iter().enumerate() {
+            match (row.cell(0, i), theirs.as_deref()) {
+                (None, None) => continue,
+                (None, Some(_)) => return false,
+                (Some(_), None) => return true,
+                (Some(a), Some(b)) => match a.cmp(b) {
+                    Ordering::Equal => continue,
+                    other => return other == Ordering::Less,
+                },
+            }
+        }
+        false
     }
 
-    fn section(&mut self) -> Section {
-        self.sort_best();
-        let rows: Vec<Vec<Cell>> = self
-            .best
-            .iter()
-            .take(self.cap)
-            .map(|(key, count)| {
-                let mut row: Vec<Cell> = key.iter().map(|v| Cell::Value(v.clone())).collect();
-                row.push(Cell::Count(*count));
-                row
-            })
-            .collect();
+    /// The key cells of `row`'s first row, copied with a refusal.
+    fn key_of(&self, row: &Packed) -> Result<Vec<Val>> {
+        let refusal = |bytes: usize| refused_saying(DUPLICATES, bytes, "", FEWER_DUPLICATES);
+        let mut key: Vec<Val> = Vec::new();
+        key.try_reserve_exact(self.key_size)
+            .map_err(|_| refusal(self.key_size * size_of::<Val>()))?;
+        for i in 0..self.key_size {
+            key.push(match row.cell(0, i) {
+                None => None,
+                Some(text) => {
+                    let mut s = String::new();
+                    s.try_reserve_exact(text.len())
+                        .map_err(|_| refusal(text.len()))?;
+                    s.push_str(text);
+                    Some(s)
+                }
+            });
+        }
+        Ok(key)
+    }
+
+    /// The report's section, most repeated first, built with a refusal:
+    /// at the end of a join under a heap limit it was the allocation that
+    /// aborted ("memory allocation of 128 bytes failed", a pair whose every
+    /// key repeats, at 20-22 MB).
+    fn section(&mut self) -> Result<Section> {
         let mut cols = self.key_cols.clone();
         cols.push("count".to_string());
-        Section {
+        if !self.listed {
+            return Ok(Section::capped(cols, Vec::new(), self.cap));
+        }
+        let best = std::mem::take(&mut self.best).into_sorted_vec();
+        let mut rows: Vec<Vec<Cell>> = crate::alloc::sized(best.len().min(self.cap), DUPLICATES)?;
+        for Dup { key, count } in best.into_iter().take(self.cap) {
+            let mut row: Vec<Cell> = crate::alloc::sized(key.len() + 1, DUPLICATES)?;
+            row.extend(key.into_iter().map(Cell::Value));
+            row.push(Cell::Count(count));
+            rows.push(row);
+        }
+        Ok(Section {
             cols,
             rows,
             truncated: self.keys > self.cap as i64,
-        }
+        })
     }
 }
 
@@ -1688,6 +1794,56 @@ pub fn available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The list of duplicate keys, kept in a heap, against the whole list
+    /// sorted: the same rows in the same order, and the same cut, at caps
+    /// below, at and above the number of keys, with absent key cells and
+    /// counts that tie.
+    #[test]
+    fn the_duplicate_keys_kept_are_those_of_the_whole_list_sorted() {
+        let mut all: Vec<(Vec<Val>, i64)> = Vec::new();
+        for k in 0..500u32 {
+            let first = (k % 7 != 0).then(|| format!("a{}", k % 13));
+            let second = (k % 11 != 0).then(|| format!("t{k}"));
+            // Some keys absent on purpose: a cell of neither column is a key.
+            all.push((vec![first, second], i64::from(k * 7919 % 9) + 2));
+        }
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|(key, _)| seen.insert(key.clone()));
+        let mut sorted = all.clone();
+        sorted.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| compare_keys(&x.0, &y.0, 2)));
+        let cols = ["k1".to_string(), "k2".to_string()];
+        for cap in [1, 5, 64, all.len() - 1, all.len(), all.len() + 3] {
+            let mut dups = Dups::new(&cols, cap, true);
+            for (key, count) in &all {
+                let mut row = Packed::new(2);
+                row.push(key.iter().map(|v| v.as_deref())).unwrap();
+                dups.record(&row, *count).unwrap();
+            }
+            let section = dups.section().unwrap();
+            let want: Vec<Vec<Cell>> = sorted
+                .iter()
+                .take(cap)
+                .map(|(key, count)| {
+                    let mut row = to_cells(key);
+                    row.push(Cell::Count(*count));
+                    row
+                })
+                .collect();
+            assert_eq!(section.rows, want, "cap {cap}");
+            assert_eq!(section.truncated, all.len() > cap, "cap {cap}");
+            assert_eq!(dups.keys, all.len() as i64);
+            assert_eq!(dups.rows, all.iter().map(|d| d.1).sum::<i64>());
+        }
+        // Without a report to list them in, only the counts are kept.
+        let mut dups = Dups::new(&cols, 5, false);
+        let mut row = Packed::new(2);
+        row.push([Some("a"), Some("b")]).unwrap();
+        dups.record(&row, 3).unwrap();
+        let section = dups.section().unwrap();
+        assert!(section.rows.is_empty() && !section.truncated);
+        assert_eq!((dups.keys, dups.rows), (1, 3));
+    }
 
     /// The room the sort asks for a lower-cased row: no character's lower
     /// case is more than half as long again in UTF-8.
