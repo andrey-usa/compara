@@ -61,8 +61,9 @@ const RUN_BUFFER_MIN: usize = 4 << 10;
 /// (`--memory`), when it is a sixteenth of that, so a comparison handed to
 /// this engine for want of memory fits what it was handed with. Both files
 /// are sorted at once, each with a batch being filled and one being written,
-/// and a batch can briefly hold twice its size while it grows.
-fn batch_bytes(opt: &Options) -> usize {
+/// and a batch can briefly hold twice its size while it grows. Of the limit,
+/// what an engine before this one left `held` is not this one's.
+fn batch_bytes(opt: &Options, held: u64) -> usize {
     if let Some(n) = std::env::var(BATCH_BYTES_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -71,7 +72,7 @@ fn batch_bytes(opt: &Options) -> usize {
         return n;
     }
     let allowance = [
-        crate::memory::heap_limit(),
+        crate::memory::heap_limit().map(|h| h.saturating_sub(held)),
         crate::memory::stated(opt.memory),
     ]
     .into_iter()
@@ -84,6 +85,23 @@ fn batch_bytes(opt: &Options) -> usize {
 }
 
 pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResult> {
+    compare_after(a_path, b_path, opt, 0)
+}
+
+/// [`compare`], in a process where the engine that ran before it left `held`
+/// bytes of the heap limit mapped: `auto` hands a pair `turbo` refused to this
+/// engine, and what `turbo` mapped -- its threads' stacks, which the C library
+/// keeps for the next thread, and their heaps -- stays counted against the
+/// limit. Sized from the whole limit, the batches and the merge's buffers did
+/// not fit beside it (the 2M-row pair at 16 threads, 31 and 32 MB: 2 of 6
+/// runs refused where a named sortmerge answered).
+pub(crate) fn compare_after(
+    a_path: &Path,
+    b_path: &Path,
+    opt: &Options,
+    held: u64,
+) -> Result<EngineResult> {
+    let budget = batch_bytes(opt, held);
     let a_header = read_header(a_path, opt)?;
     let b_header = read_header(b_path, opt)?;
     let resolved = resolve(&a_header, &b_header, opt)?;
@@ -97,7 +115,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
 
     let mut phases = Phases::new("");
     let sort = |side: &str, path: &Path, header: &[String]| -> Result<Runs> {
-        stream_into(work, side, path, header, &resolved.compared, opt, width)
+        stream_into(work, side, path, header, &resolved.compared, opt, budget)
     };
     let sort_b = || sort("b", b_path, &b_header);
     let (a_runs, b_runs) = if opt.thread_budget() > 1 {
@@ -215,8 +233,9 @@ fn stream_into(
     header: &[String],
     compared: &[String],
     opt: &Options,
-    width: usize,
+    budget: usize,
 ) -> Result<Runs> {
+    let width = opt.key.len() + compared.len();
     let dir = Arc::new(work.make_dir(side)?);
     let index: Vec<Option<usize>> = opt
         .key
@@ -225,7 +244,6 @@ fn stream_into(
         .map(|name| header.iter().position(|c| c == name))
         .collect();
     let key_size = opt.key.len();
-    let budget = batch_bytes(opt);
     let halves = room_halves(&index, opt.ignore_case);
 
     // Sorts a full batch and writes it as the run numbered `n`. The order and

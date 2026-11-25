@@ -165,6 +165,16 @@ handles more of the format, could not read them either: {turbo_err}"
             crate::source::human(heap)
         )));
     }
+    // What is mapped before `turbo` starts, under a heap limit: what it maps
+    // and leaves is not room an engine it hands the pair to can have.
+    let before = (requested == Engine::Auto && crate::memory::heap_limit().is_some())
+        .then(crate::memory::data_in_use)
+        .flatten();
+    let held = || {
+        before
+            .zip(crate::memory::data_in_use())
+            .map_or(0, |(before, now)| now.saturating_sub(before))
+    };
     let result = match engine {
         Engine::Turbo => turbo::compare(a, b, opt),
         Engine::SortMerge => sortmerge::compare(a, b, opt),
@@ -201,7 +211,7 @@ handles more of the format, could not read them either: {turbo_err}"
             eprintln!("note: {said}; comparing with the {other} engine");
             crate::alloc::hold_reserve();
             let result = match other {
-                Engine::SortMerge => sortmerge::compare(a, b, opt),
+                Engine::SortMerge => sortmerge::compare_after(a, b, opt, held()),
                 _ => native::compare(a, b, opt),
             };
             result
@@ -233,7 +243,7 @@ handles more of the format, could not read them either: {turbo_err}"
             );
             crate::memory::release_free();
             crate::alloc::hold_reserve();
-            sortmerge::compare(a, b, opt)
+            sortmerge::compare_after(a, b, opt, held())
                 .map(|r| (r, Engine::SortMerge.label().to_string()))
                 .map_err(|e| e.context_unless_input("the sortmerge engine failed: "))
         }
