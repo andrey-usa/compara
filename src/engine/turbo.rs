@@ -5446,3 +5446,29 @@ mod cell_changed_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod append_tests {
+    use super::*;
+
+    /// The sweep's chunks land after what the list already holds, in order,
+    /// each copied by a thread of its own into room reserved beforehand. Every
+    /// slot below the new length has to be written before `set_len` takes it
+    /// in; Miri reports a read of one that was not.
+    #[test]
+    fn chunks_appended_in_parallel_follow_in_order() {
+        let mut out: Vec<u64> = vec![1, 2, 3];
+        let parts: Vec<Vec<u64>> =
+            vec![(10..15).collect(), Vec::new(), (20..23).collect(), vec![30]];
+        let want: Vec<u64> = out.iter().chain(parts.iter().flatten()).copied().collect();
+        out.reserve_exact(want.len() - out.len());
+        append_in_parallel(&mut out, parts).unwrap();
+        assert_eq!(out, want);
+
+        // No room for them: refused, and the list is as it was.
+        let mut full = vec![7u32];
+        let room = full.capacity() - full.len();
+        assert!(append_in_parallel(&mut full, vec![vec![0; room], vec![1]]).is_err());
+        assert_eq!(full, [7]);
+    }
+}
