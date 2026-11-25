@@ -56,7 +56,7 @@ const SET_UP: u64 = 256 << 10;
 
 /// The stack a thread gets from [`Builder::new`]: `RUST_MIN_STACK`, read as
 /// the runtime reads it, or the runtime's 2 MB.
-fn stack_size() -> u64 {
+fn runtime_stack() -> u64 {
     static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
         std::env::var_os("RUST_MIN_STACK")
@@ -65,23 +65,91 @@ fn stack_size() -> u64 {
     })
 }
 
-/// Whether a new thread fits under the heap limit: room for a stack and its
-/// [`SET_UP`], with the stacks of the threads started here that hold one
-/// ([`LIVE`]) inside [`STACK_SHARE`] of the limit; `None` without a limit (or where what
-/// is in use cannot be read). Whether the C library has a stack cached is not
+/// Whether `RUST_MIN_STACK` names a stack: then every thread gets that one,
+/// as from [`Builder::new`].
+fn stack_named() -> bool {
+    static NAMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NAMED.get_or_init(|| std::env::var_os("RUST_MIN_STACK").is_some())
+}
+
+/// What a thread started here is for, which sets its stack under a heap
+/// limit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Work {
+    /// An engine's work on inputs already here: a lane, a sort, a read-ahead,
+    /// a Parquet decode. Under a heap limit it runs on [`ENGINE_STACK`].
+    Engine,
+    /// Opening an input, which may run a transfer -- an async runtime, TLS
+    /// and an object store's client -- or a thread such a transfer starts.
+    /// It keeps the runtime's stack: nothing here bounds how deep those go.
+    Input,
+}
+
+/// The stack an engine's thread gets under a heap limit, unless
+/// `RUST_MIN_STACK` names one.
+///
+/// A stack is a private mapping, and `RLIMIT_DATA` counts all of it whether
+/// or not a thread touches it. Three of the runtime's 2 MB stacks were 6 MB
+/// of the 20 MB a named sortmerge starts from, for threads that went no
+/// deeper than 19 KB. Measured, painting each stack at its thread's start
+/// and reading it at the end: the deepest of 11,000 engine threads in the
+/// test suite (release optimizations) was 70 KB, the report's deflate, then
+/// 65 KB inflating a gzip Parquet page; in an unoptimized build those two
+/// were 303 and 139 KB. The deepest recursion an engine has is the Parquet
+/// footer's, 64 levels, a few KB. `tests/out_of_memory.rs` runs all three
+/// under a heap limit, so a stack too small for them fails there.
+///
+/// Half a megabyte, too, is the least for which glibc hands a thread the
+/// 2 MB stack a finished thread left in its cache (it takes one up to four
+/// times the size asked for): smaller, and the stack of the thread that
+/// opened B, which keeps the runtime's, would stay mapped beside them.
+/// Without a limit, threads keep the runtime's stack.
+///
+/// What the smaller stack saves goes to the data, not to more threads:
+/// [`STACK_SHARE`] still counts each thread at the runtime's stack. Counted
+/// at its own, the share let four times as many start under a tight limit,
+/// each with batches or an index part and a C library heap of its own, and
+/// they took more than the stacks gave back. On builds that start sortmerge
+/// from 4 MB, the 200,000- and 2M-row pairs and one whose every key repeats,
+/// 4 to 24 MB, threads 4 and 16: refused in 200 of 794 runs, up to 22.5 MB,
+/// against 17, up to 7.5 MB, with each counted at the runtime's.
+const ENGINE_STACK: u64 = 512 << 10;
+
+/// The stack a thread for `work` is started on.
+fn stack_size(work: Work) -> u64 {
+    if work == Work::Engine && !stack_named() && crate::memory::heap_limit().is_some() {
+        ENGINE_STACK
+    } else {
+        runtime_stack()
+    }
+}
+
+/// [`Builder::new`], with the stack for `work` under a heap limit.
+fn builder(work: Work) -> Builder {
+    if work == Work::Engine && !stack_named() {
+        Builder::new().stack_size(ENGINE_STACK as usize)
+    } else {
+        Builder::new()
+    }
+}
+
+/// Whether a new thread fits under the heap limit: room for its `stack` and
+/// its [`SET_UP`], with the threads started here that hold a stack ([`LIVE`]),
+/// each counted at the runtime's, inside [`STACK_SHARE`] of the limit; `None`
+/// without a limit (or where what is in use cannot be read). Whether the C library has a stack cached is not
 /// knowable from here, so one is always counted; near the limit that refuses
 /// a thread a little early, which costs a core and not an answer. Nor does a
 /// thread take room promised to work under way ([`crate::memory::promise`]).
-fn fits() -> Option<bool> {
+fn fits(stack: u64) -> Option<bool> {
     let limit = crate::memory::heap_limit()?;
     let used = crate::memory::data_in_use()?;
-    let stacks =
-        (LIVE.load(std::sync::atomic::Ordering::Acquire) as u64 + 1).saturating_mul(stack_size());
+    let stacks = (LIVE.load(std::sync::atomic::Ordering::Acquire) as u64 + 1)
+        .saturating_mul(runtime_stack());
     Some(
         stacks <= limit / STACK_SHARE
             && used
                 .saturating_add(crate::memory::promised())
-                .saturating_add(stack_size())
+                .saturating_add(stack)
                 .saturating_add(SET_UP)
                 <= limit,
     )
@@ -99,12 +167,13 @@ fn fits() -> Option<bool> {
 /// (the 2M-row pair: every run from 24 to 32 MB; the 200,000-row pair, 24 to
 /// 36 MB). A third leaves the rest of the limit to the data, and the stacks
 /// it does keep are those the engine taking over starts its own threads on:
-/// `sortmerge` runs on up to three besides the first, 6 MB, a third of 18 MB.
+/// `sortmerge` runs on up to three besides the first, 6 MB counted, a third
+/// of 18 MB.
 const STACK_SHARE: u64 = 3;
 
 /// Threads started under a heap limit whose stacks the C library cannot hand
 /// to the next thread yet: those at work, and those finished but not joined,
-/// whose stacks are kept for the join. [`STACK_SHARE`] bounds their stacks.
+/// whose stacks are kept for the join. [`STACK_SHARE`] bounds how many.
 static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// One thread's place in [`LIVE`], shared by the thread and its [`Handle`]:
@@ -350,12 +419,26 @@ impl<'s, T> Task<'s, T> {
     }
 }
 
-/// [`Builder::spawn_scoped`], refused up front when there is no room for the
-/// thread under the heap limit, as the OS would have refused it. Under a
-/// limit, returns once the thread is set up (see [`SetUp`]). Every thread here
-/// is started through it or [`spawn_named`]; a refusal is handled where it
+/// [`Builder::spawn_scoped`] of an engine's work ([`Work::Engine`]),
+/// refused up front when there is no room for the thread under the heap
+/// limit, as the OS would have refused it. Under a limit, returns once the
+/// thread is set up (see [`SetUp`]). Every thread here is started through it,
+/// [`spawn_scoped_for`] or [`spawn_named`]; a refusal is handled where it
 /// already was, by doing the work on the calling thread.
 pub fn spawn_scoped<'s, 'e, T, F>(scope: &'s Scope<'s, 'e>, f: F) -> std::io::Result<Handle<'s, T>>
+where
+    F: FnOnce() -> T + Send + 's,
+    T: Send + 's,
+{
+    spawn_scoped_for(scope, Work::Engine, f)
+}
+
+/// [`spawn_scoped`], for `work` of either kind.
+pub fn spawn_scoped_for<'s, 'e, T, F>(
+    scope: &'s Scope<'s, 'e>,
+    work: Work,
+    f: F,
+) -> std::io::Result<Handle<'s, T>>
 where
     F: FnOnce() -> T + Send + 's,
     T: Send + 's,
@@ -367,12 +450,13 @@ where
     if crate::memory::heap_limit().is_none() {
         return Builder::new().spawn_scoped(scope, f).map(bare);
     }
+    let stack = stack_size(work);
     let _one = one_start();
     let mut starting = Starting::begin();
-    match fits() {
+    match fits(stack) {
         None => {
             drop(starting);
-            Builder::new().spawn_scoped(scope, f).map(bare)
+            builder(work).spawn_scoped(scope, f).map(bare)
         }
         Some(false) => {
             drop(starting);
@@ -389,7 +473,7 @@ where
                 inner: None,
                 live: Some(live),
             };
-            handle.inner = Some(Builder::new().spawn_scoped(scope, move || {
+            handle.inner = Some(builder(work).spawn_scoped(scope, move || {
                 RUNNING.set(true);
                 drop(counted);
                 let _working = working;
@@ -401,7 +485,8 @@ where
     }
 }
 
-/// [`std::thread::Builder::spawn`] of a named thread, the same way.
+/// [`std::thread::Builder::spawn`] of a named thread, the same way. Its work
+/// is a transfer's ([`Work::Input`]), on the runtime's stack.
 pub fn spawn_named<T, F>(name: &str, f: F) -> std::io::Result<std::thread::JoinHandle<T>>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -411,9 +496,10 @@ where
     if crate::memory::heap_limit().is_none() {
         return named.spawn(f);
     }
+    let stack = stack_size(Work::Input);
     let _one = one_start();
     let mut starting = Starting::begin();
-    match fits() {
+    match fits(stack) {
         None => {
             drop(starting);
             named.spawn(f)

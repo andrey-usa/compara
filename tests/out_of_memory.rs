@@ -1024,3 +1024,120 @@ fn a_file_whose_keys_all_repeat_is_compared_at_the_heap_limit() {
         failed.join("\n")
     );
 }
+
+/// A Parquet file whose footer carries a field no reader knows, a struct
+/// holding a struct `depth` levels down, after the fields it has.
+fn with_nested_footer_field(file: &Path, depth: usize) -> Vec<u8> {
+    let data = fs::read(file).expect("fixture");
+    let n = data.len();
+    let meta_len = u32::from_le_bytes(data[n - 8..n - 4].try_into().expect("4 bytes")) as usize;
+    let meta = &data[n - 8 - meta_len..n - 8];
+    assert_eq!(meta.last(), Some(&0), "a footer ends its struct");
+    // The footer's own fields, then field 2000 (long form: a struct, then
+    // the id zigzagged) nesting `depth` structs, closed, and the footer's end.
+    let mut footer = meta[..meta.len() - 1].to_vec();
+    footer.extend([0x0C, 0xA0, 0x1F]);
+    footer.extend(std::iter::repeat_n(0x1C, depth));
+    footer.extend(std::iter::repeat_n(0x00, depth + 2));
+    let mut out = data[..n - 8 - meta_len].to_vec();
+    out.extend_from_slice(&footer);
+    out.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"PAR1");
+    out
+}
+
+/// Under a heap limit an engine's threads run on a stack of a few hundred
+/// KB, not the runtime's 2 MB, and what they do must fit it with room to
+/// spare. The deepest recursion an engine has is a Parquet footer's: a field
+/// no reader knows is skipped one level per nested struct, 64 levels at
+/// most. The deepest stacks measured besides are inflating a gzip page and
+/// deflating the report. So a footer nested to the deepest any reader takes,
+/// and one level past it, in gzip and snappy files, is read under a heap
+/// limit on either side, by every reader, with a report written: an answer
+/// or a refusal, never a stack overflow (signal 11, or the runtime's abort).
+#[test]
+fn the_deepest_parquet_footer_is_read_on_an_engine_s_stack_under_a_heap_limit() {
+    let dir = std::env::temp_dir().join(format!("compara-oom-deep-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/formats");
+    let csv = fixtures.join("b.csv");
+    let made = |name: &str, from: &str, depth: usize| {
+        let path = dir.join(name);
+        fs::write(&path, with_nested_footer_field(&fixtures.join(from), depth)).expect("write");
+        path
+    };
+    let run = |limit_kb: Option<usize>, a: &Path, b: &Path, engine: &str| {
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "{} exec {} compare {} {} -k id --engine {engine} --threads 4 -o {}",
+                limit_kb
+                    .map(|kb| format!("ulimit -d {kb};"))
+                    .unwrap_or_default(),
+                env!("CARGO_BIN_EXE_compara"),
+                a.display(),
+                b.display(),
+                dir.join("report.html").display(),
+            ))
+            .env("RUST_BACKTRACE", "1")
+            .env_remove("COMPARA_BACKTRACE")
+            .env_remove("COMPARA_MEMORY")
+            .output()
+            .expect("bash");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let counts = stdout
+            .lines()
+            .find(|l| l.starts_with("A "))
+            .and_then(|l| l.rsplit_once(" | "))
+            .map(|(c, _)| c.to_string())
+            .unwrap_or_default();
+        use std::os::unix::process::ExitStatusExt;
+        (
+            out.status
+                .code()
+                .or_else(|| out.status.signal().map(|s| 128 + s)),
+            counts,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let mut failed = Vec::new();
+    let mut tried = 0;
+    for (a_from, b_from) in [
+        ("a_dict_gzip.parquet", "b_dict_snappy.parquet"),
+        ("a_dict_snappy.parquet", "b_dict_snappy.parquet"),
+    ] {
+        for depth in [64, 65] {
+            let a = made(&format!("a{depth}-{a_from}"), a_from, depth);
+            let b = made(&format!("b{depth}-{b_from}"), b_from, depth);
+            for (x, y) in [(&a, &b), (&a, &csv), (&csv, &b)] {
+                for engine in ["auto", "turbo"] {
+                    tried += 1;
+                    let (free, free_counts, _) = run(None, x, y, engine);
+                    let (code, counts, err) = run(Some(256 << 10), x, y, engine);
+                    let fine = match (depth, code) {
+                        (64, Some(0 | 1)) => free == code && counts == free_counts,
+                        (65, Some(2)) => err.contains("nests deeper than any writer produces"),
+                        _ => false,
+                    };
+                    if !fine {
+                        failed.push(format!(
+                            "{} against {}, depth {depth}, {engine}: exit {code:?} ({free:?} \
+                             without a limit), {counts:?}: {}",
+                            x.display(),
+                            y.display(),
+                            err.lines().last().unwrap_or("")
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        failed.is_empty(),
+        "{} of {tried} runs at a 256 MB heap limit neither answered as without one nor \
+         refused the footer:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}

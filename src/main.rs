@@ -550,8 +550,12 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     let want = Want::for_options(&opt);
     let (a, b) = std::thread::scope(|scope| {
         // A thread wants a stack, and under a small memory limit there may be
-        // none to give: then B is read after A, on this one.
-        let b = compara::parallel::spawn_scoped(scope, || Source::open(b_spec, &want)).ok();
+        // none to give: then B is read after A, on this one. Opening B may
+        // run a transfer, so its thread keeps the runtime's stack.
+        let b = compara::parallel::spawn_scoped_for(scope, compara::parallel::Work::Input, || {
+            Source::open(b_spec, &want)
+        })
+        .ok();
         let a = Source::open(a_spec, &want);
         let b = match b {
             Some(h) => h
