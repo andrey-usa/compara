@@ -104,14 +104,29 @@ pub fn hold_reserve() {
         if p.is_null() {
             break;
         }
-        if let Err(p) =
-            slot.compare_exchange(std::ptr::null_mut(), p, Ordering::AcqRel, Ordering::Acquire)
-        {
-            // SAFETY: allocated above with this layout; another call filled
-            // the slot first, so this block is held nowhere.
-            unsafe { System.dealloc(p, chunk()) };
+        if let Some(spare) = fill(slot, p) {
+            // SAFETY: `fill` hands back only `p`, allocated above with this
+            // layout; another call filled the slot first, so it is held
+            // nowhere.
+            unsafe { System.dealloc(spare, chunk()) };
         }
     }
+}
+
+/// Puts `new` in `slot` if the slot is empty. When another call filled the
+/// slot first, the slot keeps its block and `new` is handed back for the
+/// caller to free. The block `compare_exchange` reports on failure is the one
+/// the slot holds: freeing that one would leave the slot pointing at freed
+/// memory, freed again by [`release_reserve`].
+fn fill(slot: &AtomicPtr<u8>, new: *mut u8) -> Option<*mut u8> {
+    slot.compare_exchange(
+        std::ptr::null_mut(),
+        new,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    )
+    .err()
+    .map(|_held| new)
 }
 
 /// Gives one chunk of the reserve back to the allocator; whether there was
@@ -441,6 +456,20 @@ mod tests {
         assert_eq!(s.capacity(), cap);
         assert!(s.len() <= cap, "{s:?}");
         assert!("abcdefgé and more".starts_with(s.as_str()), "{s:?}");
+    }
+
+    #[test]
+    fn a_slot_another_call_filled_keeps_its_block() {
+        let mut held = 0u8;
+        let mut offered = 0u8;
+        let (held, offered) = (&raw mut held, &raw mut offered);
+        let slot = AtomicPtr::new(held);
+        assert_eq!(fill(&slot, offered), Some(offered), "the spare to free");
+        assert_eq!(slot.load(Ordering::Acquire), held);
+
+        let empty = AtomicPtr::new(std::ptr::null_mut());
+        assert_eq!(fill(&empty, offered), None);
+        assert_eq!(empty.load(Ordering::Acquire), offered);
     }
 
     #[test]
