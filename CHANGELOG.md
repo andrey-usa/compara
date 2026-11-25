@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-25
+
 ### Changed
 
 - A Hive part whose rows hold a partition column themselves gives it the
