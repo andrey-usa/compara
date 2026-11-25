@@ -3157,7 +3157,8 @@ mod tests {
                         (seed >> 32) as u32 & mask
                     })
                     .collect();
-                let bytes = packed(&vals, width);
+                // Against an unreadable page: a window read past the run faults.
+                let bytes = crate::guarded::Guarded::ending(&packed(&vals, width));
                 let mut got = vec![0i32; n];
                 assert!(
                     RleReader::new(&bytes, width).fill(&mut got),
@@ -3578,6 +3579,47 @@ mod tests {
             want.extend_from_slice(&plain);
             assert_eq!(out, want, "round {round}");
         }
+    }
+
+    /// `snappy_body` writes nothing past `end + SNAPPY_SLACK` and reads
+    /// nothing past its input, its unsafe block's promise: both are laid
+    /// against unreadable pages, so a byte written or read past them faults,
+    /// in every build. Whole and damaged streams, after a page already there.
+    #[test]
+    fn snappy_stays_inside_its_room_and_its_input() {
+        use crate::guarded::Guarded;
+        let mut rng = Rng(0x9a4d_5eed);
+        let mut expanded = 0;
+        for round in 0..20_000 {
+            let elements = 1 + rng.below(40);
+            let (mut stream, _) = random_stream(&mut rng, elements);
+            if round % 2 == 1 {
+                let i = rng.below(stream.len());
+                stream[i] = rng.next() as u8;
+            }
+            let Some((want, at)) = snappy_length(&stream) else {
+                continue;
+            };
+            if want > snappy_most(stream.len() - at) {
+                continue;
+            }
+            let base = rng.below(20);
+            let input = Guarded::ending(&stream);
+            let mut room = Guarded::room(base + want + SNAPPY_SLACK);
+            // Safety: `room` holds `base + want + SNAPPY_SLACK` bytes, this
+            // test's alone.
+            let (dst, ok) =
+                unsafe { snappy_body(&input, at, room.as_mut_ptr(), base, base + want) };
+            match reference(&stream) {
+                Some(plain) => {
+                    assert!(ok && dst == base + want, "round {round}");
+                    assert_eq!(&room[base..dst], &plain[..], "round {round}");
+                    expanded += 1;
+                }
+                None => assert!(!(ok && dst == base + want), "round {round}"),
+            }
+        }
+        assert!(expanded > 10_000, "{expanded}");
     }
 
     #[test]
