@@ -66,20 +66,101 @@ fn stack_size() -> u64 {
 }
 
 /// Whether a new thread fits under the heap limit: room for a stack and its
-/// [`SET_UP`]; `None` without a limit (or where what is in use cannot be
-/// read). Whether the C library has a stack cached is not knowable from here,
-/// so one is always counted; near the limit that refuses a thread a little
-/// early, which costs a core and not an answer. Nor does a thread take room
-/// promised to work under way ([`crate::memory::promise`]).
+/// [`SET_UP`], with the stacks of the threads started here that hold one
+/// ([`LIVE`]) inside [`STACK_SHARE`] of the limit; `None` without a limit (or where what
+/// is in use cannot be read). Whether the C library has a stack cached is not
+/// knowable from here, so one is always counted; near the limit that refuses
+/// a thread a little early, which costs a core and not an answer. Nor does a
+/// thread take room promised to work under way ([`crate::memory::promise`]).
 fn fits() -> Option<bool> {
     let limit = crate::memory::heap_limit()?;
     let used = crate::memory::data_in_use()?;
+    let stacks =
+        (LIVE.load(std::sync::atomic::Ordering::Acquire) as u64 + 1).saturating_mul(stack_size());
     Some(
-        used.saturating_add(crate::memory::promised())
-            .saturating_add(stack_size())
-            .saturating_add(SET_UP)
-            <= limit,
+        stacks <= limit / STACK_SHARE
+            && used
+                .saturating_add(crate::memory::promised())
+                .saturating_add(stack_size())
+                .saturating_add(SET_UP)
+                <= limit,
     )
+}
+
+/// The part of the heap limit thread stacks may take at once: a third.
+///
+/// The C library keeps a finished thread's stack mapped for the next one
+/// (glibc, up to 40 MB), and a mapped stack counts against the limit whether
+/// or not a thread runs on it. So the most threads alive at once is what the
+/// stacks hold for the rest of the run. Without a share, `turbo` at 16 threads
+/// under a 28 MB limit started twelve lanes, 24 MB of stacks, and then could
+/// not fit a 512 KB index; its fallback to `sortmerge` started with 27 of its
+/// 28 MB already mapped and was refused, where a named `sortmerge` answered
+/// (the 2M-row pair: every run from 24 to 32 MB; the 200,000-row pair, 24 to
+/// 36 MB). A third leaves the rest of the limit to the data, and the stacks
+/// it does keep are those the engine taking over starts its own threads on:
+/// `sortmerge` runs on up to three besides the first, 6 MB, a third of 18 MB.
+const STACK_SHARE: u64 = 3;
+
+/// Threads started under a heap limit whose stacks the C library cannot hand
+/// to the next thread yet: those at work, and those finished but not joined,
+/// whose stacks are kept for the join. [`STACK_SHARE`] bounds their stacks.
+static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One thread's place in [`LIVE`], shared by the thread and its [`Handle`]:
+/// taken before the thread starts, and given back by whichever of the two is
+/// done last -- the handle once joined or let go, the thread once its work
+/// ends. A thread joined gives its stack back at the join; one let go, as it
+/// exits.
+struct Live(std::sync::atomic::AtomicU8);
+
+impl Live {
+    const WORK_DONE: u8 = 1;
+    const HANDLE_GONE: u8 = 2;
+
+    fn take() -> std::sync::Arc<Self> {
+        LIVE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        std::sync::Arc::new(Live(std::sync::atomic::AtomicU8::new(0)))
+    }
+
+    fn end(&self, which: u8) {
+        let was = self.0.fetch_or(which, std::sync::atomic::Ordering::AcqRel);
+        // The last of the two to end: the other's mark is there, not this one's.
+        if was == (Self::WORK_DONE | Self::HANDLE_GONE) & !which {
+            LIVE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+/// Held by the new thread while its work runs, a panic included; dropped
+/// unrun with the closure when the spawn fails.
+struct Working(std::sync::Arc<Live>);
+
+impl Drop for Working {
+    fn drop(&mut self) {
+        self.0.end(Live::WORK_DONE);
+    }
+}
+
+/// [`ScopedJoinHandle`], counted in [`LIVE`] until joined or let go.
+pub struct Handle<'s, T> {
+    inner: Option<ScopedJoinHandle<'s, T>>,
+    live: Option<std::sync::Arc<Live>>,
+}
+
+impl<'s, T> Handle<'s, T> {
+    /// [`ScopedJoinHandle::join`].
+    pub fn join(mut self) -> std::thread::Result<T> {
+        self.inner.take().expect("a handle not yet joined").join()
+    }
+}
+
+impl<T> Drop for Handle<'_, T> {
+    fn drop(&mut self) {
+        if let Some(live) = &self.live {
+            live.end(Live::HANDLE_GONE);
+        }
+    }
 }
 
 /// Threads started under a heap limit and not yet set up; while there are
@@ -253,7 +334,7 @@ impl SetUp {
 /// Work that is either running on its own thread or already finished.
 pub enum Task<'s, T> {
     /// On a thread of its own; `join` waits for it.
-    Running(ScopedJoinHandle<'s, T>),
+    Running(Handle<'s, T>),
     /// The OS refused a thread, so it ran on the caller's.
     Done(T),
 }
@@ -274,23 +355,24 @@ impl<'s, T> Task<'s, T> {
 /// limit, returns once the thread is set up (see [`SetUp`]). Every thread here
 /// is started through it or [`spawn_named`]; a refusal is handled where it
 /// already was, by doing the work on the calling thread.
-pub fn spawn_scoped<'s, 'e, T, F>(
-    scope: &'s Scope<'s, 'e>,
-    f: F,
-) -> std::io::Result<ScopedJoinHandle<'s, T>>
+pub fn spawn_scoped<'s, 'e, T, F>(scope: &'s Scope<'s, 'e>, f: F) -> std::io::Result<Handle<'s, T>>
 where
     F: FnOnce() -> T + Send + 's,
     T: Send + 's,
 {
+    let bare = |handle| Handle {
+        inner: Some(handle),
+        live: None,
+    };
     if crate::memory::heap_limit().is_none() {
-        return Builder::new().spawn_scoped(scope, f);
+        return Builder::new().spawn_scoped(scope, f).map(bare);
     }
     let _one = one_start();
     let mut starting = Starting::begin();
     match fits() {
         None => {
             drop(starting);
-            Builder::new().spawn_scoped(scope, f)
+            Builder::new().spawn_scoped(scope, f).map(bare)
         }
         Some(false) => {
             drop(starting);
@@ -299,11 +381,20 @@ where
         Some(true) => {
             let set_up = SetUp::new();
             let counted = starting.hand_over(std::sync::Arc::clone(&set_up));
-            let handle = Builder::new().spawn_scoped(scope, move || {
+            let live = Live::take();
+            let working = Working(std::sync::Arc::clone(&live));
+            // Made first, so that a failed spawn, which drops the closure and
+            // with it `working`, gives the place back as it drops this.
+            let mut handle = Handle {
+                inner: None,
+                live: Some(live),
+            };
+            handle.inner = Some(Builder::new().spawn_scoped(scope, move || {
                 RUNNING.set(true);
                 drop(counted);
+                let _working = working;
                 f()
-            })?;
+            })?);
             set_up.wait();
             Ok(handle)
         }
@@ -334,9 +425,15 @@ where
         Some(true) => {
             let set_up = SetUp::new();
             let counted = starting.hand_over(std::sync::Arc::clone(&set_up));
+            // The callers of this one join in their own time, or never; it is
+            // counted until its work ends, as a thread let go.
+            let live = Live::take();
+            live.end(Live::HANDLE_GONE);
+            let working = Working(live);
             let handle = named.spawn(move || {
                 RUNNING.set(true);
                 drop(counted);
+                let _working = working;
                 f()
             })?;
             set_up.wait();
@@ -402,6 +499,27 @@ impl<T> Once<T> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_thread_gives_its_place_back_once_whichever_ends_last() {
+        // Only threads started under a heap limit take a place: without one,
+        // the count moves here alone.
+        if crate::memory::heap_limit().is_some() {
+            return;
+        }
+        let before = LIVE.load(Ordering::Acquire);
+        for [first, last] in [
+            [Live::WORK_DONE, Live::HANDLE_GONE],
+            [Live::HANDLE_GONE, Live::WORK_DONE],
+        ] {
+            let live = Live::take();
+            assert_eq!(LIVE.load(Ordering::Acquire), before + 1);
+            live.end(first);
+            assert_eq!(LIVE.load(Ordering::Acquire), before + 1);
+            live.end(last);
+            assert_eq!(LIVE.load(Ordering::Acquire), before);
+        }
+    }
 
     #[test]
     fn spawn_runs_the_work_once() {
