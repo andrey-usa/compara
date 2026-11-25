@@ -17,13 +17,18 @@ All notable changes to this project are documented here. The format follows
 - JSON is compared with fewer instructions: where the CPU has AVX2 (x86-64)
   or NEON (ARM), the walk over each row's keys reads its bytes a vector
   register at a time, and tells each member by one compare; elsewhere it
-  reads them as before, with the same answers.
+  reads them as before, with the same answers. On the perf gate's pair of
+  200,000 compact NDJSON rows a side, a compare takes 1,318.7M instructions
+  against 0.8.0's 1,702.5M (-22.5%, with the next entry's change;
+  [run 45638875050](https://github.com/andrey-usa/compara/actions/runs/45638875050), cachegrind).
 - NDJSON written with a space after each comma and colon, as Python's
-  `json.dumps` writes it by default, is compared about as fast as compact
-  NDJSON, where it had taken about twice as long: each member is told by
-  its name and separators as the file's first row spells them. Compact
-  NDJSON, and names written with escapes, are read a little faster too.
-  The perf gate counts both spellings, so a change that loses this fails.
+  `json.dumps` writes it by default, is compared with about as many
+  instructions as compact NDJSON (1.05x), where 0.8.0 took 2.13x: each
+  member is told by its name and separators as the file's first row spells
+  them. On the perf gate's 200,000-row pair, 3,624.6M instructions became
+  1,382.5M (-61.9%,
+  [run 45638875050](https://github.com/andrey-usa/compara/actions/runs/45638875050)). The perf gate counts both
+  spellings, so a change that loses this fails.
 - The release binaries, the perf gate and the benchmarks are built by one
   named rustc, 1.100.0 (`rust-toolchain.toml`), where each run took the
   stable Rust of its day, and each names it: a release's notes give the
@@ -134,9 +139,9 @@ All notable changes to this project are documented here. The format follows
   request it is refused, exit 2, with the limit and what to do.
 - A refusal at the heap limit (`ulimit -d`, or a container's) could end on
   signal 6, "memory allocation of 8 bytes failed", while it wrote its own
-  message: with `--json` and `--export-dir`, most runs of a 20,000-row pair
-  at 8-11 MB did. The message is now written into room set aside at start,
-  and names the limit and what to do, as the other refusals do.
+  message, most often with `--json` and `--export-dir`. The message is now
+  written into room set aside at start, and names the limit and what to
+  do, as the other refusals do.
 - An `s3://`, `gs://` or `az://` object behind a server that does not
   answer the request for its end (`Range: bytes=-n`) with a 501, as Fastly
   does, was asked again ten times, for seconds to minutes, and then failed.
