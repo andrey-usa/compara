@@ -853,3 +853,92 @@ fn a_refusal_at_the_heap_limit_is_written_not_aborted() {
         failed.join("\n")
     );
 }
+
+/// `auto` under a heap limit answers wherever a named sortmerge does, at more
+/// than one thread. `turbo` refuses a pair whose indexes do not fit and hands
+/// it to sortmerge in the same process, and at 16 threads it had started a
+/// dozen lanes first: their stacks, kept mapped by the C library for the next
+/// thread, held 24 of 28 MB when sortmerge started, and the 2M-row pair was
+/// refused at every limit from 24 to 32 MB ("a sorted run's buffer for the
+/// merge needs 4 KB") where the named engine answered.
+#[test]
+fn auto_under_a_heap_limit_answers_where_a_named_sortmerge_does() {
+    let dir = std::env::temp_dir().join(format!("compara-oom-auto-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let made = Command::new(env!("CARGO_BIN_EXE_compara-gen-data"))
+        .args(["--rows", "2m", "--prefix", "t", "--out-dir"])
+        .arg(&dir)
+        .output()
+        .expect("gen-data");
+    assert!(made.status.success(), "{made:?}");
+    let (a, b) = (dir.join("t_a.csv"), dir.join("t_b.csv"));
+    // Exit code (128 + the signal for one that killed it), the counts
+    // (without the engine and its time) and stderr.
+    let run = |limit_kb: Option<usize>, engine: &str, threads: usize| {
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "{} exec {} compare {} {} -k account_id,txn_id -i updated_at,note \
+                 --engine {engine} --threads {threads}",
+                limit_kb
+                    .map(|kb| format!("ulimit -d {kb};"))
+                    .unwrap_or_default(),
+                env!("CARGO_BIN_EXE_compara"),
+                a.display(),
+                b.display(),
+            ))
+            .env("RUST_BACKTRACE", "1")
+            .env_remove("COMPARA_BACKTRACE")
+            .env_remove("COMPARA_MEMORY")
+            .env_remove("COMPARA_SORTMERGE_BATCH_BYTES")
+            .output()
+            .expect("bash");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let counts = stdout
+            .rsplit_once(" | ")
+            .map(|(c, _)| c.to_string())
+            .unwrap_or(stdout);
+        use std::os::unix::process::ExitStatusExt;
+        (
+            out.status
+                .code()
+                .or_else(|| out.status.signal().map(|s| 128 + s)),
+            counts,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, free, err) = run(None, "sortmerge", 4);
+    assert_eq!(code, Some(1), "{err}");
+    let (mut failed, mut compared, mut fell_back) = (Vec::new(), 0, 0);
+    for threads in [4, 16] {
+        for mb in [20, 24, 28, 32] {
+            let kb = mb * 1024;
+            let (named, named_counts, _) = run(Some(kb), "sortmerge", threads);
+            if named != Some(1) || named_counts != free {
+                continue;
+            }
+            compared += 1;
+            let (code, counts, err) = run(Some(kb), "auto", threads);
+            fell_back += usize::from(err.contains("comparing with the sortmerge engine"));
+            if code != Some(1) || counts != free {
+                failed.push(format!(
+                    "{kb} KB, {threads} threads: exit {code:?}, {counts:?}: {}",
+                    err.lines().last().unwrap_or("")
+                ));
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        failed.is_empty(),
+        "{} of {compared} runs where a named sortmerge answered did not answer under auto \
+         ({free:?}):\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+    assert!(compared > 0, "a named sortmerge answered at no limit tried");
+    assert!(
+        fell_back > 0,
+        "auto never fell back to sortmerge: {compared} runs"
+    );
+}
