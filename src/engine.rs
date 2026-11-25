@@ -199,6 +199,7 @@ handles more of the format, could not read them either: {turbo_err}"
                 )
             });
             eprintln!("note: {said}; comparing with the {other} engine");
+            crate::alloc::hold_reserve();
             let result = match other {
                 Engine::SortMerge => sortmerge::compare(a, b, opt),
                 _ => native::compare(a, b, opt),
@@ -231,6 +232,7 @@ handles more of the format, could not read them either: {turbo_err}"
                 std::env::temp_dir().display()
             );
             crate::memory::release_free();
+            crate::alloc::hold_reserve();
             sortmerge::compare(a, b, opt)
                 .map(|r| (r, Engine::SortMerge.label().to_string()))
                 .map_err(|e| e.context_unless_input("the sortmerge engine failed: "))

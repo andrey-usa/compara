@@ -74,7 +74,10 @@ fn chunk() -> Layout {
     Layout::from_size_align(RESERVE_CHUNK, 16).expect("a valid layout")
 }
 
-/// Sets aside the room a refusal is written into. `main` calls it first.
+/// Sets aside the room a refusal is written into. `main` calls it first, and
+/// `auto` again when it hands a pair `turbo` refused to another engine: the
+/// refusal spent some of it, and the engine taking over may meet the limit
+/// too. Only what is missing is asked for, so nothing held is given up.
 pub fn hold_reserve() {
     {
         let mut held = MESSAGE_BUFFERS
@@ -92,13 +95,21 @@ pub fn hold_reserve() {
         }
     }
     for slot in &RESERVE {
+        if !slot.load(Ordering::Acquire).is_null() {
+            continue;
+        }
         // SAFETY: a non-zero size; the block is freed in `release_reserve`
         // with the same layout.
         let p = unsafe { System.alloc(chunk()) };
-        let old = slot.swap(p, Ordering::AcqRel);
-        if !old.is_null() {
-            // SAFETY: allocated above with this layout, by an earlier call.
-            unsafe { System.dealloc(old, chunk()) };
+        if p.is_null() {
+            break;
+        }
+        if let Err(p) =
+            slot.compare_exchange(std::ptr::null_mut(), p, Ordering::AcqRel, Ordering::Acquire)
+        {
+            // SAFETY: allocated above with this layout; another call filled
+            // the slot first, so this block is held nowhere.
+            unsafe { System.dealloc(p, chunk()) };
         }
     }
 }
