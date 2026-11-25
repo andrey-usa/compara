@@ -899,7 +899,21 @@ mod tests {
                 _ => b'a' + (x % 26) as u8,
             });
         }
-        for end in [d.len(), d.len() - 1, 100, 64, 33, 7] {
+        // Cut at lengths that end a register at every place, each against an
+        // unreadable page: a register read past the data faults.
+        let full = d;
+        for (len, end) in (0..=64).flat_map(|cut| {
+            let len = full.len() - cut;
+            [
+                (len, len),
+                (len, len - 1),
+                (len, 100),
+                (len, 64),
+                (len, 33),
+                (len, 7),
+            ]
+        }) {
+            let d = crate::guarded::Guarded::ending(&full[..len]);
             let mut wide = Delims::new(w, &d, 0, end, b',', b'\n');
             let mut swar = Delims::new(Swar, &d, 0, end, b',', b'\n');
             let mut at = 0;
@@ -946,7 +960,21 @@ mod tests {
                     _ => b'a' + (x % 26) as u8,
                 });
             }
-            for end in [d.len(), d.len() - 1, 100, 64, 33, 7] {
+            // Cut at lengths that end a register at every place, each against an
+            // unreadable page: a register read past the data faults.
+            let full = d;
+            for (len, end) in (0..=64).flat_map(|cut| {
+                let len = full.len() - cut;
+                [
+                    (len, len),
+                    (len, len - 1),
+                    (len, 100),
+                    (len, 64),
+                    (len, 33),
+                    (len, 7),
+                ]
+            }) {
+                let d = crate::guarded::Guarded::ending(&full[..len]);
                 let mut wide = Delims::new(w, &d, 0, end, b',', b'\n');
                 let mut swar = Delims::new(Swar, &d, 0, end, b',', b'\n');
                 let mut at = 0;

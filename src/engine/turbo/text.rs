@@ -3778,6 +3778,7 @@ fn end_of_array_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize, open:
 mod tests {
     use super::super::slab::Slab;
     use super::*;
+    use crate::guarded::Guarded;
 
     /// The counted JSON proof agrees with the member walk: rows that differ in
     /// a tracked or untracked value, a name, a member added or dropped, with
@@ -3858,14 +3859,32 @@ mod tests {
             } else {
                 row(n, Some(((next() % n as u64) as usize, next())))
             };
-            // Slabs with room for whole registers past the rows.
+            // Slabs with room for whole registers past the rows, and now and
+            // then less, ending where an unreadable page begins: a register
+            // read past a slab's end faults.
             let mut a = a_row.clone().into_bytes();
-            a.extend_from_slice(&[b' '; 80]);
+            a.extend(std::iter::repeat_n(
+                b' ',
+                if next() % 4 == 0 {
+                    (next() % 81) as usize
+                } else {
+                    80
+                },
+            ));
+            let a = Guarded::ending(&a);
             let mut b = b"{\"pad\":0}\n".to_vec();
             let b_lo = b.len();
             b.extend_from_slice(b_row.as_bytes());
             let b_hi = b.len();
-            b.extend_from_slice(&[b' '; 80]);
+            b.extend(std::iter::repeat_n(
+                b' ',
+                if next() % 4 == 0 {
+                    (next() % 81) as usize
+                } else {
+                    80
+                },
+            ));
+            let b = Guarded::ending(&b);
             let walk = json_rows_match_with(Swar, &p, &a, 0, a_row.len(), &b, b_lo, b_hi);
             // Safety: `w` proves AVX2.
             let counted =
@@ -3947,13 +3966,24 @@ mod tests {
                 _ => {}
             }
             let (a_row, b_row) = (text(&a_members), text(&b_members));
+            // Slabs with room for whole registers past the rows, and now and
+            // then less, ending where an unreadable page begins: a register
+            // read past a slab's end faults.
             let mut a = a_row.clone().into_bytes();
-            a.extend_from_slice(&[b' '; 80]);
+            a.extend(std::iter::repeat_n(
+                b' ',
+                if next(4) == 0 { next(81) } else { 80 },
+            ));
+            let a = Guarded::ending(&a);
             let mut b = b"{\"pad\":0}\n".to_vec();
             let b_lo = b.len();
             b.extend_from_slice(b_row.as_bytes());
             let b_hi = b.len();
-            b.extend_from_slice(&[b' '; 80]);
+            b.extend(std::iter::repeat_n(
+                b' ',
+                if next(4) == 0 { next(81) } else { 80 },
+            ));
+            let b = Guarded::ending(&b);
             let holds = json_rows_match_with(Swar, &p, &a, 0, a_row.len(), &b, b_lo, b_hi);
             if let Some(w) = Wide::detect() {
                 // Safety: `w` proves AVX2, or NEON on aarch64.
@@ -3965,8 +3995,8 @@ mod tests {
                 continue;
             }
             let (sa, sb) = (
-                Slab::owned(a.clone(), Dialect::Json),
-                Slab::owned(b.clone(), Dialect::Json),
+                Slab::owned(a.to_vec(), Dialect::Json),
+                Slab::owned(b.to_vec(), Dialect::Json),
             );
             let (mut fa, mut fb) = ([ABSENT; 3], [ABSENT; 3]);
             p.parse(sa.data(), 0, a_row.len(), &mut fa);
@@ -4070,13 +4100,24 @@ mod tests {
                 _ => {}
             }
             let (a_row, b_row) = (text(&members), text(&b_members));
+            // Slabs with room for whole registers past the rows, and now and
+            // then less, ending where an unreadable page begins: a register
+            // read past a slab's end faults.
             let mut a = a_row.clone().into_bytes();
-            a.extend_from_slice(&[b' '; 80]);
+            a.extend(std::iter::repeat_n(
+                b' ',
+                if next(4) == 0 { next(81) } else { 80 },
+            ));
+            let a = Guarded::ending(&a);
             let mut b = b"{\"pad\":0}\n".to_vec();
             let b_lo = b.len();
             b.extend_from_slice(b_row.as_bytes());
             let b_hi = b.len();
-            b.extend_from_slice(&[b' '; 80]);
+            b.extend(std::iter::repeat_n(
+                b' ',
+                if next(4) == 0 { next(81) } else { 80 },
+            ));
+            let b = Guarded::ending(&b);
             let walk = json_rows_match_with(Swar, &p, &a, 0, a_row.len(), &b, b_lo, b_hi);
             let counted = json_rows_match_counted(w, &p, &a, 0, a_row.len(), &b, b_lo, b_hi);
             if let Some(counted) = counted {
@@ -4157,6 +4198,8 @@ mod tests {
                     }
                 }
             }
+            // Against an unreadable page: a register read past the data faults.
+            let data = Guarded::ending(&data);
             let from = (next() % len as u64) as usize;
             let end = from + (next() % (len - from + 1) as u64) as usize;
             for delimiter in *b",\t" {
@@ -4172,6 +4215,15 @@ mod tests {
                         end_of_row_counted(w, &data, from, end, delimiter),
                         want,
                         "a register at a time: {:?} from {from} end {end}",
+                        String::from_utf8_lossy(&data)
+                    );
+                }
+                #[cfg(target_arch = "x86_64")]
+                if let Some(w) = Wide512::detect() {
+                    assert_eq!(
+                        end_of_row_counted(w, &data, from, end, delimiter),
+                        want,
+                        "sixty-four bytes at a time: {:?} from {from} end {end}",
                         String::from_utf8_lossy(&data)
                     );
                 }
@@ -4244,7 +4296,11 @@ mod tests {
                     }
                 }
             }
-            data.extend_from_slice(&[b'\n'; 70]);
+            // Room past the row for a register or two, or less, against an
+            // unreadable page: a register read past the data faults.
+            let room = (next() % 71) as usize;
+            data.extend(std::iter::repeat_n(b'\n', room));
+            let data = Guarded::ending(&data);
             let lo = (next() % len as u64) as usize;
             let hi = lo + (next() % (len - lo + 40) as u64) as usize;
             let hi = hi.min(data.len());
@@ -4259,6 +4315,18 @@ mod tests {
                     "{:?} lo {lo} hi {hi} commas {commas}",
                     String::from_utf8_lossy(&data)
                 );
+                #[cfg(target_arch = "x86_64")]
+                if let Some(w) = Wide512::detect() {
+                    // Safety: `w` proves AVX-512BW.
+                    let counted =
+                        unsafe { guard_span_wide512(w, &data, lo, hi, delimiter, commas) };
+                    assert_eq!(
+                        counted,
+                        walk,
+                        "64: {:?} lo {lo} hi {hi} commas {commas}",
+                        String::from_utf8_lossy(&data)
+                    );
+                }
             }
         }
     }
@@ -4314,8 +4382,10 @@ mod tests {
         }
     }
 
+    /// A JSON slab of `text` that ends where an unreadable page begins, so a
+    /// scan that reads past the end of the file faults.
     fn json_slab(text: &str) -> Slab {
-        let mut s = Slab::owned(text.as_bytes().to_vec(), Dialect::Json);
+        let mut s = Slab::guarded(text.as_bytes(), Dialect::Json);
         s.set_dialect(Dialect::Json);
         s
     }
@@ -5260,18 +5330,106 @@ mod tests {
             ),
         ];
         for (parser, data) in &parsers {
+            // Against an unreadable page: a register read past the file faults.
+            let data = &Guarded::ending(data);
             let n = 4;
             let mut at = 0;
             while at < data.len() {
                 let mut a = vec![ABSENT; n];
                 let mut b = vec![ABSENT; n];
                 let next = parser.parse_with(Swar, data, at, data.len(), &mut a);
-                assert_eq!(parser.parse_with(w, data, at, data.len(), &mut b), next);
+                // Safety: `w` proves AVX2, or NEON on aarch64.
+                assert_eq!(
+                    unsafe { parser.parse_wide(w, data, at, data.len(), &mut b) },
+                    next
+                );
                 assert_eq!(a, b, "the row at {at}");
+                #[cfg(target_arch = "x86_64")]
+                if let Some(w) = Wide512::detect() {
+                    let mut c = vec![ABSENT; n];
+                    // Safety: `w` proves AVX-512BW.
+                    let got = unsafe { parser.parse_wide512(w, data, at, data.len(), &mut c) };
+                    assert_eq!((got, &c), (next, &a), "64: the row at {at}");
+                }
                 assert!(next > at);
                 at = next;
             }
         }
+    }
+
+    /// The gapped proof's runs, found in A's row and matched in B's, at each
+    /// width against eight bytes at a time, on rows that end where an
+    /// unreadable page begins: a register read past a row's file faults.
+    #[test]
+    fn runs_are_found_and_matched_alike_at_every_width() {
+        let parser = RowParser::csv(b',', vec![Some(0), Some(2), Some(4)]);
+        let runs = Runs::plan(&parser).expect("columns 1 and 3 are gaps");
+        let fields = [
+            "a",
+            "bb",
+            "",
+            "\"q,\"\"x\"",
+            "12345678901234567890123456789012345678",
+            "\"\n\"",
+            "\"",
+            "x y",
+        ];
+        let mut seed = 0x51ed_270b_9a3f_c11du64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let n = runs.len();
+        let (mut found, mut matched) = (0, 0);
+        for _ in 0..20_000 {
+            let mut cells: Vec<&str> = (0..1 + next(7))
+                .map(|_| fields[next(fields.len())])
+                .collect();
+            let a_text = cells.join(",") + "\n";
+            if next(3) == 0 {
+                let i = next(cells.len());
+                cells[i] = fields[next(fields.len())];
+            }
+            let b_text = format!("p,q\n{}\n", cells.join(","));
+            let b_lo = 4;
+            let (a, b) = (
+                Guarded::ending(a_text.as_bytes()),
+                Guarded::ending(b_text.as_bytes()),
+            );
+            let mut want = vec![(0, 0); n];
+            let a_found = runs.of_row_with(Swar, &a, 0, a.len(), b',', &mut want);
+            let b_matches = a_found && runs.matches_with(Swar, &a, &want, &b, b_lo, b.len(), b',');
+            let mut spans = vec![(0, 0); n];
+            if let Some(w) = Wide::detect() {
+                // Safety: `w` proves AVX2, or NEON on aarch64.
+                let got = unsafe { runs.of_row_wide(w, &a, 0, a.len(), b',', &mut spans) };
+                assert_eq!(got, a_found, "{a_text:?}");
+                if a_found {
+                    assert_eq!(spans, want, "{a_text:?}");
+                    // Safety: as above.
+                    let got = unsafe { runs.matches_wide(w, &a, &want, &b, b_lo, b.len(), b',') };
+                    assert_eq!(got, b_matches, "{a_text:?} {b_text:?}");
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            if let Some(w) = Wide512::detect() {
+                // Safety: `w` proves AVX-512BW.
+                let got = unsafe { runs.of_row_wide512(w, &a, 0, a.len(), b',', &mut spans) };
+                assert_eq!(got, a_found, "64: {a_text:?}");
+                if a_found {
+                    assert_eq!(spans, want, "64: {a_text:?}");
+                    // Safety: as above.
+                    let got =
+                        unsafe { runs.matches_wide512(w, &a, &want, &b, b_lo, b.len(), b',') };
+                    assert_eq!(got, b_matches, "64: {a_text:?} {b_text:?}");
+                }
+            }
+            found += usize::from(a_found);
+            matched += usize::from(b_matches);
+        }
+        assert!(found > 5_000 && matched > 2_000, "{found} {matched}");
     }
 
     #[test]
@@ -5465,6 +5623,8 @@ mod tests {
                     }
                 })
                 .collect();
+            // Against an unreadable page: a block read past the data faults.
+            let data = Guarded::ending(&data);
             let end = next(len + 1);
             let from = next(end + 1);
             for lines in [true, false] {
@@ -5480,7 +5640,7 @@ mod tests {
                         .position(|b| matches!(b, b'"' | b'\\' | b'\n'))
                         .map(|n| at + n);
                     match row.next(at) {
-                        Some(stop) => assert_eq!(Some(stop), first, "{at} in {data:?}"),
+                        Some(stop) => assert_eq!(Some(stop), first, "{at} in {:?}", &data[..]),
                         // Only past the blocks read, or with none in 64 bytes.
                         None => {
                             assert!(

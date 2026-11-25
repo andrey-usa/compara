@@ -35,8 +35,15 @@ pub(super) enum Dialect {
 /// Where the bytes came from. A mapping is paged in on demand and evictable; an
 /// arena is what a columnar format leaves behind once its pages are decoded.
 enum Bytes {
-    Mapped { _file: File, map: Mmap },
+    Mapped {
+        _file: File,
+        map: Mmap,
+    },
     Owned(Vec<u8>),
+    /// Bytes that end where an unreadable page begins: a scan that reads past
+    /// the slab's end faults in a test instead of reading on unseen.
+    #[cfg(test)]
+    Guarded(crate::guarded::Guarded),
 }
 
 pub(super) struct Slab {
@@ -191,6 +198,19 @@ impl Slab {
         }
     }
 
+    /// A slab over `data` laid against an unreadable page at its end
+    /// ([`crate::guarded::Guarded::ending`]).
+    #[cfg(test)]
+    pub(super) fn guarded(data: &[u8], dialect: Dialect) -> Self {
+        Slab {
+            bytes: Bytes::Guarded(crate::guarded::Guarded::ending(data)),
+            dialect,
+            start: 0,
+            releasing: false,
+            json_text: false,
+        }
+    }
+
     pub(super) fn set_dialect(&mut self, dialect: Dialect) {
         self.dialect = dialect;
     }
@@ -220,6 +240,8 @@ impl Slab {
         match &self.bytes {
             Bytes::Mapped { map, .. } => &map[self.start..],
             Bytes::Owned(v) => v,
+            #[cfg(test)]
+            Bytes::Guarded(g) => g,
         }
     }
 

@@ -27,6 +27,8 @@ pub mod contract;
 pub mod engine;
 pub mod error;
 pub mod gendata;
+#[cfg(test)]
+pub(crate) mod guarded;
 pub mod hugepages;
 pub mod keyhash;
 pub mod memory;
