@@ -687,10 +687,12 @@ fn text_of_json(slab: &Slab, f: Field) -> Option<std::borrow::Cow<'_, [u8]>> {
     Some(text.into())
 }
 
-/// `text` as [`text_as_json`] reads it, for a value already decoded: the
-/// normalising route (`--trim`, `--ignore-case`), which compares strings.
+/// `text` as [`text_as_json`] reads it, for a value already decoded and shown
+/// ([`cell_text`]): the normalising route (`--trim`, `--ignore-case`), which
+/// compares strings. Read as JSON from the bytes it shows.
 pub(super) fn str_as_json(text: &str) -> Option<String> {
-    let json = json_text(text.as_bytes())?;
+    let text = unshown(text);
+    let json = json_text(&text)?;
     Some(shown(LogicalBytes::new(json, Mode::Nested).collect()))
 }
 
@@ -885,47 +887,225 @@ fn json_number_end(text: &[u8], mut at: usize) -> Option<usize> {
     Some(at)
 }
 
-/// Decoded bytes as text: UTF-8 as it is, and a lone surrogate as the
-/// `\uXXXX` escape that names it.
+/// Decoded bytes as the text the normalising route compares and hashes:
+/// UTF-8 as it is, a lone surrogate as the `\uXXXX` escape that names it, and
+/// a backslash doubled where it could be read as part of one.
 ///
 /// A JSON escape can name half of a surrogate pair alone, which UTF-8 cannot
 /// hold; the decoder keeps it as its three bytes (see [`LogicalBytes::hold`])
 /// and compares it so, but as text they were three U+FFFD, the same for every
-/// lone surrogate: `["\ud800"]` and `["\ud801"]`, two different values, read
-/// alike in the report and the export. In a nested value's text a backslash
-/// of its own is always escaped, so the escape cannot be mistaken for one.
-/// Any other byte that is not UTF-8 is U+FFFD, as before.
+/// lone surrogate: `"\ud800"` and `"\ud801"`, two different values, were
+/// equal under `--trim` or `--ignore-case`, which compare text.
+///
+/// As its escape, a lone surrogate would be the six characters of a
+/// string that holds them as text (`"\\ud800"` in JSON, `\ud800` in a CSV
+/// cell), so the text is told from it as JSON tells them apart, by the
+/// backslashes before it: a run of them just before a lone surrogate, or
+/// before `u` and the four hex digits of one (D800 to DFFF, any case), is
+/// doubled. Read back, an odd run there ends in a lone surrogate and an even
+/// one is text. Every other backslash is kept as it is. The reading is one to one, so
+/// text compared through it is equal only where the bytes are; a nested
+/// value is compared through it too, as a string holding the same text is.
+/// What the report and the export show is [`as_written`], which doubles no
+/// backslash. Any other byte that is not UTF-8 is U+FFFD, as before.
 fn shown(bytes: Vec<u8>) -> String {
-    let bytes = match String::from_utf8(bytes) {
-        Ok(s) => return s,
-        Err(e) => e.into_bytes(),
+    match String::from_utf8(bytes) {
+        Ok(s) if !backslash_before_surrogate(s.as_bytes()) => s,
+        Ok(s) => shown_escaped(s.as_bytes()),
+        Err(e) => shown_escaped(e.as_bytes()),
+    }
+}
+
+/// Whether UTF-8 text has a backslash just before the text of a surrogate,
+/// which [`shown`] doubles. UTF-8 holds no lone surrogate, so text without
+/// one is shown as it is: a Windows path, a regular expression.
+#[inline]
+fn backslash_before_surrogate(bytes: &[u8]) -> bool {
+    has_backslash(bytes) && surrogate_after_backslash(bytes)
+}
+
+/// [`backslash_before_surrogate`] once a backslash is found: out of line, as
+/// few values hold one.
+#[inline(never)]
+fn surrogate_after_backslash(bytes: &[u8]) -> bool {
+    (0..bytes.len()).any(|at| bytes[at] == b'\\' && surrogate_text_at(bytes, at + 1))
+}
+
+/// Whether `bytes` hold a backslash, a word at a time. Asked of every CSV or
+/// Parquet text cell the normalising route reads, most of them a word or two
+/// long; `contains` reads them a byte at a time, a compare and a branch a
+/// byte, and that way the check cost 3.9% of a `--trim` compare of the perf
+/// gate's CSV pair (cachegrind, one thread), about three times this.
+#[inline]
+fn has_backslash(bytes: &[u8]) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    // Exact: a byte of `w` is zero only where the byte read was a backslash,
+    // and the borrow it starts reaches no byte below it.
+    let hit = |w: u64| {
+        let w = w ^ (ONES * u64::from(b'\\'));
+        w.wrapping_sub(ONES) & !w & (ONES << 7) != 0
     };
+    let (words, _) = bytes.as_chunks::<8>();
+    if words.iter().any(|w| hit(u64::from_le_bytes(*w))) {
+        return true;
+    }
+    // The tail, zero-padded, and a zero is no backslash.
+    let rem = bytes.len() % 8;
+    rem != 0 && hit(crate::keyhash::tail_word(bytes, rem))
+}
+
+/// [`shown`] for bytes that are not UTF-8 or have a backslash to double.
+/// Out of line: nearly every value is neither.
+#[inline(never)]
+fn shown_escaped(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() + 8);
-    let mut rest = &bytes[..];
-    loop {
-        match std::str::from_utf8(rest) {
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'\\' {
+            let run = bytes[at..].iter().take_while(|&&b| b == b'\\').count();
+            let next = at + run;
+            let times =
+                if lone_surrogate_at(bytes, next).is_some() || surrogate_text_at(bytes, next) {
+                    2 * run
+                } else {
+                    run
+                };
+            out.extend(std::iter::repeat_n('\\', times));
+            at = next;
+            continue;
+        }
+        if let Some(cp) = lone_surrogate_at(bytes, at) {
+            let _ = write!(out, "\\u{cp:04x}");
+            at += 3;
+            continue;
+        }
+        // UTF-8 up to the next backslash, as far as it is UTF-8.
+        let to = bytes[at..]
+            .iter()
+            .position(|&b| b == b'\\')
+            .map_or(bytes.len(), |n| at + n);
+        match std::str::from_utf8(&bytes[at..to]) {
             Ok(s) => {
                 out.push_str(s);
-                return out;
+                at = to;
+            }
+            Err(e) if e.valid_up_to() > 0 => {
+                out.push_str(&String::from_utf8_lossy(&bytes[at..at + e.valid_up_to()]));
+                at += e.valid_up_to();
             }
             Err(e) => {
-                let (good, bad) = rest.split_at(e.valid_up_to());
-                out.push_str(&String::from_utf8_lossy(good));
-                if let [0xED, b1 @ 0xA0..=0xBF, b2 @ 0x80..=0xBF, ..] = *bad {
-                    let cp = 0xD000 | (u32::from(b1 & 0x3F) << 6) | u32::from(b2 & 0x3F);
+                out.push('\u{FFFD}');
+                at += e.error_len().unwrap_or(to - at);
+            }
+        }
+    }
+    out
+}
+
+/// Decoded bytes as written, for the report and the export: UTF-8 exactly as
+/// it is, a lone surrogate as the `\uXXXX` escape that names it, and any other
+/// byte that is not UTF-8 as U+FFFD. A nested value's text is its JSON.
+///
+/// No backslash is doubled, unlike [`shown`]: a value that is UTF-8 is shown,
+/// and exported, byte for byte. In a nested value's text a backslash of its
+/// own is always escaped, so there the escape cannot be mistaken for one and
+/// the text reads back (`json.loads`, `jq`) as the value; in a string it can.
+fn as_written(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            let bytes = e.into_bytes();
+            let mut out = String::with_capacity(bytes.len() + 8);
+            let mut at = 0;
+            while at < bytes.len() {
+                if let Some(cp) = lone_surrogate_at(&bytes, at) {
                     let _ = write!(out, "\\u{cp:04x}");
-                    rest = &bad[3..];
-                } else {
-                    out.push('\u{FFFD}');
-                    rest = &bad[e.error_len().unwrap_or(bad.len())..];
+                    at += 3;
+                    continue;
+                }
+                match std::str::from_utf8(&bytes[at..]) {
+                    Ok(s) => {
+                        out.push_str(s);
+                        at = bytes.len();
+                    }
+                    Err(e) if e.valid_up_to() > 0 => {
+                        out.push_str(&String::from_utf8_lossy(&bytes[at..at + e.valid_up_to()]));
+                        at += e.valid_up_to();
+                    }
+                    Err(e) => {
+                        out.push('\u{FFFD}');
+                        at += e.error_len().unwrap_or(bytes.len() - at);
+                    }
                 }
             }
+            out
         }
     }
 }
 
-/// The field decoded. Only the report sections and the normalising paths call
-/// this; the fast path never builds a string for a cell at all.
+/// The code point of the lone surrogate whose three bytes (as
+/// [`LogicalBytes::hold`] encodes one) start at `at`.
+fn lone_surrogate_at(bytes: &[u8], at: usize) -> Option<u32> {
+    match bytes.get(at..at + 3)? {
+        &[0xED, b1 @ 0xA0..=0xBF, b2 @ 0x80..=0xBF] => {
+            Some(0xD000 | (u32::from(b1 & 0x3F) << 6) | u32::from(b2 & 0x3F))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the text at `at` is `u` and the four hex digits of a surrogate,
+/// which a backslash before it would make read as one. Either case, `U`
+/// included: `--ignore-case` lowercases the text after it is shown.
+fn surrogate_text_at(bytes: &[u8], at: usize) -> bool {
+    matches!(
+        bytes.get(at..at + 5),
+        Some(&[b'u' | b'U', b'd' | b'D', b'8' | b'9' | b'a'..=b'f' | b'A'..=b'F', c, d])
+            if c.is_ascii_hexdigit() && d.is_ascii_hexdigit()
+    )
+}
+
+/// The bytes [`shown`] gave as `text`: the inverse of its reading, for text
+/// that has to be read again as JSON ([`str_as_json`]).
+fn unshown(text: &str) -> std::borrow::Cow<'_, [u8]> {
+    let bytes = text.as_bytes();
+    if !bytes.contains(&b'\\') {
+        return bytes.into();
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'\\' {
+            out.push(bytes[at]);
+            at += 1;
+            continue;
+        }
+        let run = bytes[at..].iter().take_while(|&&b| b == b'\\').count();
+        let next = at + run;
+        if !surrogate_text_at(bytes, next) {
+            out.extend(std::iter::repeat_n(b'\\', run));
+        } else {
+            out.extend(std::iter::repeat_n(b'\\', run / 2));
+            if run % 2 == 1 {
+                let hex = std::str::from_utf8(&bytes[next + 1..next + 5]).unwrap_or_default();
+                let cp = u32::from_str_radix(hex, 16).unwrap_or(0xFFFD);
+                out.extend_from_slice(&[
+                    0xE0 | (cp >> 12) as u8,
+                    0x80 | ((cp >> 6) & 0x3F) as u8,
+                    0x80 | (cp & 0x3F) as u8,
+                ]);
+                at = next + 5;
+                continue;
+            }
+        }
+        at = next;
+    }
+    out.into()
+}
+
+/// The field decoded, for a column name. A name is looked up as it reads
+/// here, so it keeps the replacement character for a byte that is not UTF-8;
+/// a value is read by [`cell_text`].
 pub(super) fn text_of(slab: &Slab, f: Field) -> String {
     // Asked of the field word, not of a `LogicalBytes` built to answer it: a
     // plain field, every column name the key walk reads among them, is the
@@ -936,38 +1116,68 @@ pub(super) fn text_of(slab: &Slab, f: Field) -> String {
     }
     let bytes: Vec<u8> = slab.logical(f).collect();
     if mode == Mode::Nested {
-        return shown(bytes);
+        return as_written(bytes);
     }
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// [`text_of`] that refuses rather than aborting when there is no room.
+/// A cell's value as text, read by [`shown`], as the normalising paths
+/// compare and hash it; the fast path never builds a string for a cell at
+/// all. What the report shows is [`display_text`] ([`text_of_checked`]).
+pub(super) fn cell_text(slab: &Slab, f: Field) -> String {
+    if slab.mode(f) == Mode::Raw {
+        let raw = slab.raw(f);
+        return match std::str::from_utf8(raw) {
+            // A JSON string's field is plain only where it holds no backslash.
+            Ok(s) if slab.dialect == Dialect::Json || !backslash_before_surrogate(raw) => {
+                s.to_owned()
+            }
+            _ => shown_escaped(raw),
+        };
+    }
+    shown(slab.logical(f).collect())
+}
+
+/// A cell's value as shown in the report and the export: as written
+/// ([`as_written`]), a nested value as its JSON.
 ///
-/// The report path uses this one. The comparison path keeps [`text_of`]: it
+/// Not [`cell_text`]'s reading: that one doubles a backslash before the text
+/// of a surrogate escape, and an export keeps a value exactly as it was, so a
+/// CSV cell holding JSON that `json.dumps` wrote (`"hi \ud83d\ude00"`) is
+/// written back as it was read. A lone surrogate and a string holding its six
+/// characters then show alike; [`cell_text`] tells them apart, and the cells
+/// a changed row lists are decided by it, not by what is shown.
+pub(super) fn display_text(slab: &Slab, f: Field) -> String {
+    if slab.mode(f) == Mode::Raw {
+        let raw = slab.raw(f);
+        return match std::str::from_utf8(raw) {
+            Ok(s) => s.to_owned(),
+            Err(_) => as_written(raw.to_vec()),
+        };
+    }
+    as_written(slab.logical(f).collect())
+}
+
+/// [`display_text`] that refuses rather than aborting when there is no room.
+///
+/// The report path uses this one. The comparison path keeps [`cell_text`]: it
 /// decodes a cell only when `--trim` or `--ignore-case` is on, throws the string
 /// away immediately, and is the hottest loop in the port -- a `Result` there
 /// would be paid ten million times to report a failure that cannot happen,
 /// because nothing of that size is being held.
 pub(super) fn text_of_checked(slab: &Slab, f: Field, what: &str) -> crate::Result<String> {
-    let mode = slab.mode(f);
-    if mode == Mode::Raw {
-        return match std::str::from_utf8(slab.raw(f)) {
+    if slab.mode(f) == Mode::Raw {
+        let raw = slab.raw(f);
+        return match std::str::from_utf8(raw) {
             Ok(s) => crate::alloc::string(s, what),
-            // Lossy replacement allocates its own string; it is reached only by
-            // input that is not UTF-8, which is not the case a budget is tight
-            // for.
-            Err(_) => Ok(String::from_utf8_lossy(slab.raw(f)).into_owned()),
+            // Escaping allocates its own string; it is reached only by input
+            // that is not UTF-8, which is not the case a budget is tight for.
+            Err(_) => Ok(as_written(raw.to_vec())),
         };
     }
     let mut bytes: Vec<u8> = crate::alloc::sized(f_len_hint(f), what)?;
     bytes.extend(slab.logical(f));
-    if mode == Mode::Nested {
-        return Ok(shown(bytes));
-    }
-    match String::from_utf8(bytes) {
-        Ok(s) => Ok(s),
-        Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
-    }
+    Ok(as_written(bytes))
 }
 
 /// An upper bound on a field's decoded length: decoding only ever removes
@@ -1188,6 +1398,127 @@ mod tests {
             shown(b"a\xffb\xed\xa0".to_vec()),
             "a\u{fffd}b\u{fffd}\u{fffd}"
         );
+    }
+
+    #[test]
+    fn a_shown_value_reads_back_as_its_bytes() {
+        // A lone surrogate is its escape; a backslash is doubled only in a
+        // run just before one or before the text of one, in either case.
+        let cases: [(&[u8], &str); 9] = [
+            (b"\xed\xa0\x80", r"\ud800"),
+            (br"\ud800", r"\\ud800"),
+            (br"\UDBFF", r"\\UDBFF"),
+            (b"\\\xed\xa0\x80", r"\\\ud800"),
+            (br"\\ud800", r"\\\\ud800"),
+            (
+                br"C:\temp\\x\u0041\ud7ff\ue000",
+                r"C:\temp\\x\u0041\ud7ff\ue000",
+            ),
+            (b"a\xffb\xed\xa0", "a\u{fffd}b\u{fffd}\u{fffd}"),
+            (b"\\\xff", "\\\u{fffd}"),
+            ("caf\u{e9} \u{1f600}".as_bytes(), "caf\u{e9} \u{1f600}"),
+        ];
+        for (bytes, text) in cases {
+            assert_eq!(shown(bytes.to_vec()), text, "{bytes:?}");
+        }
+        // One to one: every run of backslashes, text and lone surrogates
+        // shown reads back as itself.
+        let parts: [&[u8]; 8] = [
+            b"\\",
+            b"\xed\xa0\x80",
+            b"\xed\xbf\xbf",
+            b"ud800",
+            b"UDC00",
+            b"u0041",
+            b"x",
+            "\u{e9}".as_bytes(),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for n in 0..8u32.pow(4) {
+            let mut bytes = Vec::new();
+            let mut m = n;
+            for _ in 0..4 {
+                bytes.extend_from_slice(parts[(m % 8) as usize]);
+                m /= 8;
+            }
+            let text = shown(bytes.clone());
+            assert_eq!(&*unshown(&text), &bytes[..], "{text}");
+            if let Some(other) = seen.insert(text.clone(), bytes.clone()) {
+                assert_eq!(other, bytes, "{text} shows two values");
+            }
+        }
+    }
+
+    #[test]
+    fn a_nested_value_is_shown_as_its_json_and_compared_as_a_string_of_its_text() {
+        // A string holding the text `\ud800`, one holding a backslash and a
+        // lone surrogate, and a lone surrogate.
+        let (slab, f) = member(r#"["\\ud800", "\\\ud800", "\ud800"]"#);
+        let json = r#"["\\ud800","\\\ud800","\ud800"]"#;
+        assert_eq!(display_text(&slab, f), json);
+        assert_eq!(text_of_checked(&slab, f, "a test").expect("room"), json);
+        // Compared, its text is read as a string's is: the same as a JSON
+        // string holding that text, and apart from one holding the shown JSON.
+        assert_eq!(
+            cell_text(&slab, f),
+            r#"["\\\\ud800","\\\\\ud800","\ud800"]"#
+        );
+        let string = |spelled: &str| {
+            let text = format!("{{\"s\":\"{spelled}\"}}");
+            let slab = Slab::owned(text.clone().into_bytes(), Dialect::Json);
+            let f = pack(6, (text.len() - 8) as u64, true);
+            (cell_text(&slab, f), slab.logical(f).collect::<Vec<u8>>())
+        };
+        let nested: Vec<u8> = slab.logical(f).collect();
+        let (text, bytes) = string(r#"[\"\\\\ud800\",\"\\\\\ud800\",\"\ud800\"]"#);
+        assert_eq!((text, bytes), (cell_text(&slab, f), nested.clone()));
+        let (text, bytes) = string(r#"[\"\\ud800\",\"\\\ud800\",\"\ud800\"]"#);
+        assert_eq!(text, json);
+        assert_ne!(text, cell_text(&slab, f));
+        assert_ne!(bytes, nested);
+    }
+
+    #[test]
+    fn a_value_is_shown_as_written_and_a_lone_surrogate_as_its_escape() {
+        // JSON strings, spelled as JSON spells them, and what the report and
+        // the export show: no backslash doubled, so the text `\ud800` and a
+        // lone surrogate look alike, though the compare's reading
+        // (`cell_text`) tells them apart.
+        let json = |spelled: &str| {
+            let text = format!("{{\"s\":\"{spelled}\"}}");
+            let slab = Slab::owned(text.clone().into_bytes(), Dialect::Json);
+            let f = pack(6, (text.len() - 8) as u64, spelled.contains('\\'));
+            (slab, f)
+        };
+        for (spelled, want, compared) in [
+            (r"\ud800", r"\ud800", r"\ud800"),
+            (r"\\ud800", r"\ud800", r"\\ud800"),
+            (r"\\\ud800", r"\\ud800", r"\\\ud800"),
+            (r"\\ud83d\\ude00", r"\ud83d\ude00", r"\\ud83d\\ude00"),
+            (r"hi \ud83d\ude00", "hi \u{1f600}", "hi \u{1f600}"),
+            (r"C:\\temp\\x", r"C:\temp\x", r"C:\temp\x"),
+        ] {
+            let (slab, f) = json(spelled);
+            assert_eq!(display_text(&slab, f), want, "{spelled}");
+            assert_eq!(text_of_checked(&slab, f, "a test").expect("room"), want);
+            assert_eq!(cell_text(&slab, f), compared, "{spelled}");
+        }
+        // CSV cells as their bytes: UTF-8 exactly, a lone surrogate's WTF-8
+        // bytes as its escape, any other byte that is not UTF-8 as U+FFFD.
+        for (bytes, want) in [
+            (&br"\ud800"[..], r"\ud800"),
+            (b"\xed\xa0\x80", r"\ud800"),
+            (
+                br#"{"msg":"hi \ud83d\ude00"}"#,
+                r#"{"msg":"hi \ud83d\ude00"}"#,
+            ),
+            (b"a\xffb", "a\u{fffd}b"),
+        ] {
+            let slab = Slab::owned(bytes.to_vec(), Dialect::Csv);
+            let f = pack(0, bytes.len() as u64, false);
+            assert_eq!(display_text(&slab, f), want, "{bytes:?}");
+            assert_eq!(text_of_checked(&slab, f, "a test").expect("room"), want);
+        }
     }
 
     fn nested_shown(value: &str) -> String {

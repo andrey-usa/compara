@@ -960,6 +960,183 @@ fn a_lone_surrogate_in_a_nested_value_is_shown_as_its_escape() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// The same for a top-level JSON string, which has no escaping of its own to
+/// tell a lone surrogate's escape from the six characters `\ud800` as text:
+/// `--trim` and `--ignore-case` compared the text, where every lone surrogate
+/// was U+FFFD three times, so `"\ud800"` and `"\ud801"` were equal there and
+/// one key, and the report showed them alike. Compared, two values are equal
+/// under every option only where their bytes allow it. Shown, a lone
+/// surrogate is its escape and every other value is as written, so a lone
+/// surrogate and its six characters as text look alike; the cell is still
+/// listed, in the report and the export alike, as the compare decides it.
+#[test]
+fn a_lone_surrogate_in_a_json_string_is_compared_and_shown_as_its_escape() {
+    let dir = std::env::temp_dir().join(format!("compara-surrogate-str-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("a temp dir");
+    // Row by row: two lone surrogates; a plain backslash; the text `\ud800`
+    // against the lone surrogate; letters around one, apart in case only; a
+    // pair, which is one character; one surrogate, a space after it on one
+    // side, its digits in two cases.
+    let a_rows = [
+        r#""\ud800""#,
+        r#""a\\b""#,
+        r#""\\ud800""#,
+        r#""x\ud800""#,
+        r#""😀""#,
+        r#""\ud800 ""#,
+    ];
+    let b_rows = [
+        r#""\ud801""#,
+        r#""a\\b""#,
+        r#""\ud800""#,
+        r#""X\ud800""#,
+        r#""😀""#,
+        r#""\uD800""#,
+    ];
+    let write = |name: &str, rows: &[&str]| {
+        let path = dir.join(name);
+        let text: String = rows
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("{{\"id\":{i},\"v\":{v}}}\n"))
+            .collect();
+        fs::write(&path, text).unwrap();
+        path
+    };
+    let (a, b) = (write("a.ndjson", &a_rows), write("b.ndjson", &b_rows));
+    // Keyed on the strings, the last row left out: its two sides are one
+    // key only under --trim.
+    let (ka, kb) = (
+        write("ka.ndjson", &a_rows[..5]),
+        write("kb.ndjson", &b_rows[..5]),
+    );
+    // (trim, ignore case, changed rows, matched keys)
+    for (trim, ignore_case, changed, matched) in [
+        (false, false, 4, 3),
+        (true, false, 3, 3),
+        (false, true, 3, 4),
+        (true, true, 2, 4),
+    ] {
+        for threads in [1usize, 4] {
+            let what = format!("trim {trim}, ignore case {ignore_case}, threads {threads}");
+            // The report's changed cells come from the rows without an
+            // export, and from the export's own pass with one.
+            for export in [false, true] {
+                let what = format!("{what}, export {export}");
+                let to = dir.join(format!("ex-{trim}-{ignore_case}-{threads}"));
+                let mut opt = options(&["id"]);
+                (opt.threads, opt.trim, opt.ignore_case) = (Some(threads), trim, ignore_case);
+                if export {
+                    opt.export_dir = Some(to.to_string_lossy().into_owned());
+                }
+                let result = run(&a, &b, &mut opt);
+                assert_eq!(
+                    result.counts.changed,
+                    changed,
+                    "{what}: {}",
+                    answer(&result)
+                );
+                let shown = whole(&result);
+                assert!(
+                    shown.contains(r#"["0",[[0,"\\ud800","\\ud801"]]]"#),
+                    "{what}: {shown}"
+                );
+                assert!(
+                    shown.contains(r#"["2",[[0,"\\ud800","\\ud800"]]]"#),
+                    "{what}: {shown}"
+                );
+                if export {
+                    let [_, _, changed_csv] = exported(&to);
+                    assert!(
+                        changed_csv.contains("\n0,\\ud800,\\ud801\n")
+                            && changed_csv.contains("\n2,\\ud800,\\ud800\n"),
+                        "{what}: {changed_csv}"
+                    );
+                }
+            }
+            let mut opt = options(&["v"]);
+            (opt.threads, opt.trim, opt.ignore_case) = (Some(threads), trim, ignore_case);
+            let result = run(&ka, &kb, &mut opt);
+            assert_eq!(
+                result.counts.matched,
+                matched,
+                "{what}: {}",
+                answer(&result)
+            );
+            assert_eq!(
+                result.counts.a_dup_keys + result.counts.b_dup_keys,
+                0,
+                "{what}: {}",
+                answer(&result)
+            );
+        }
+    }
+    // A nested value is shown as its JSON, a lone surrogate in it as its
+    // escape: `["\ud800"]`, as a JSON string holding that text is shown. The
+    // two differ, and the changed cell is listed though they look alike.
+    let nested = write("nested.ndjson", &[r#"["\ud800"]"#, "1"]);
+    let string = write("string.ndjson", &[r#""[\"\\ud800\"]""#, "1"]);
+    for export in [false, true] {
+        let mut opt = options(&["id"]);
+        if export {
+            opt.export_dir = Some(dir.join("ex-nested").to_string_lossy().into_owned());
+        }
+        let result = run(&nested, &string, &mut opt);
+        assert_eq!(result.counts.changed, 1, "{}", answer(&result));
+        let shown = whole(&result);
+        assert!(
+            shown.contains(r#"["0",[[0,"[\"\\ud800\"]","[\"\\ud800\"]"]]]"#),
+            "export {export}: {shown}"
+        );
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// An export keeps every value exactly as it was: a CSV cell holding JSON
+/// that Python's `json.dumps` wrote, an emoji spelled as the escapes of its
+/// surrogate pair, and a Windows path, are written back byte for byte. Shown
+/// by the reading the compare uses, which doubles a backslash before the text
+/// of a surrogate, the JSON read back as other text.
+#[test]
+fn an_exported_cell_is_its_input_cell_byte_for_byte() {
+    let dir = std::env::temp_dir().join(format!("compara-export-as-is-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("a temp dir");
+    let (a, b) = (dir.join("a.csv"), dir.join("b.csv"));
+    fs::write(
+        &a,
+        "id,payload\n1,\"{\"\"msg\"\":\"\"hi \\ud83d\\ude00\"\"}\"\n2,C:\\temp\\x\n",
+    )
+    .unwrap();
+    fs::write(
+        &b,
+        "id,payload\n1,\"{\"\"msg\"\":\"\"hi \\ud83d\\ude01\"\"}\"\n2,C:\\temp\\y\n",
+    )
+    .unwrap();
+    let rows = |path: &Path| -> Vec<String> {
+        let text = fs::read_to_string(path).unwrap();
+        text.lines()
+            .skip(1)
+            .map(|l| l.split_once(',').unwrap().1.to_string())
+            .collect()
+    };
+    let (cells_a, cells_b) = (rows(&a), rows(&b));
+    for trim in [false, true] {
+        let to = dir.join(format!("ex-{trim}"));
+        let mut opt = options(&["id"]);
+        opt.trim = trim;
+        opt.export_dir = Some(to.to_string_lossy().into_owned());
+        let result = run(&a, &b, &mut opt);
+        assert_eq!(result.counts.changed, 2, "{}", answer(&result));
+        let [_, _, changed] = exported(&to);
+        let want: String = std::iter::once("id,payload (A),payload (B)\n".to_string())
+            .chain((0..2).map(|i| format!("{},{},{}\n", i + 1, cells_a[i], cells_b[i])))
+            .collect();
+        assert_eq!(changed, want, "trim {trim}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A member name is the name its escapes spell. Python's `json.dumps` writes
 /// every non-ASCII name escaped by default, a character past U+FFFF as a
 /// surrogate pair, and PHP escapes `/`. Such a name was looked up as written

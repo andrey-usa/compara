@@ -46,7 +46,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
-use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
+use slab::{Dialect, Slab, cell_text, display_text, same_bytes, text_of_checked};
 pub(crate) use text::refuse_non_text;
 use text::{
     KeyBudget, LaterKeys, RowParser, Runs, csv_header, detect_delimiter, guard_span, in_order,
@@ -213,7 +213,7 @@ fn value(slab: &Slab, f: Field, opt: &Options) -> Val {
     if f == ABSENT {
         return None;
     }
-    normalise(empty_to_null(&text_of(slab, f)), opt)
+    normalise(empty_to_null(&cell_text(slab, f)), opt)
 }
 
 /// [`value`] that refuses rather than aborting when there is no room.
@@ -3493,22 +3493,23 @@ fn join_tail(
     // and is never a cell. Decoding both whole rows first was two strings
     // per column per kept row -- two million at fifty thousand rows of
     // twenty columns -- nearly all of them thrown away again unread.
+    let changed_of = |p: &Pick| {
+        let build = |kept: Option<&KeptRows>| {
+            let (sa, fa) = row_fields(a, ai, kept, true, p.row);
+            let (sb, fb) = row_fields(b, bi, kept, false, p.mate);
+            changed_row(sa, &fa, sb, &fb, key_size, &ctx.typed, opt)
+        };
+        match kept {
+            // A copy that does not decode leaves the file to answer, as
+            // `KeptRows::values` does.
+            Some(_) => build(kept).or_else(|_| build(None)),
+            None => build(None),
+        }
+    };
     let mut changed_rows = if exporting {
         Vec::new()
     } else {
-        map_rows(keep_changed, threads, "a changed row", |p| {
-            let build = |kept: Option<&KeptRows>| {
-                let (sa, fa) = row_fields(a, ai, kept, true, p.row);
-                let (sb, fb) = row_fields(b, bi, kept, false, p.mate);
-                changed_row(sa, &fa, sb, &fb, key_size, &ctx.typed, opt)
-            };
-            match kept {
-                // A copy that does not decode leaves the file to answer, as
-                // `KeptRows::values` does.
-                Some(_) => build(kept).or_else(|_| build(None)),
-                None => build(None),
-            }
-        })?
+        map_rows(keep_changed, threads, "a changed row", changed_of)?
     };
     phases.mark("  row values (par)");
     sort_rows(&mut removed_rows, key_size);
@@ -3531,6 +3532,7 @@ fn join_tail(
             ExportSides {
                 a_row: &a_row,
                 b_row: &b_row,
+                changed_of: &changed_of,
                 a,
                 ai,
                 compared,
@@ -3575,9 +3577,12 @@ fn join_tail(
 }
 
 /// What the changed-row export reads its rows through.
-struct ExportSides<'x, FA, FB> {
+struct ExportSides<'x, FA, FB, FC> {
     a_row: &'x FA,
     b_row: &'x FB,
+    /// A changed row's key and differing cells, decided from its fields as
+    /// the join decided them ([`changed_row`]).
+    changed_of: &'x FC,
     a: &'x Side,
     ai: &'x RowIndex,
     compared: &'x [String],
@@ -3595,9 +3600,9 @@ const EXPORT_BLOCK: usize = 1 << 14;
 /// per cell). Then each block of the order is decoded on all threads, written,
 /// and dropped. Returns the report's share of the rows: the first `max_rows + 1`
 /// in key order, as cells, which is what the report keeps of an uncapped list.
-fn export_changed<FA, FB>(
+fn export_changed<FA, FB, FC>(
     picks: &[Pick],
-    sides: ExportSides<FA, FB>,
+    sides: ExportSides<FA, FB, FC>,
     ctx: &JoinCtx,
     opt: &Options,
     threads: usize,
@@ -3605,6 +3610,7 @@ fn export_changed<FA, FB>(
 where
     FA: Fn(i32) -> Result<Vec<Val>> + Sync,
     FB: Fn(i32) -> Result<Vec<Val>> + Sync,
+    FC: Fn(&Pick) -> Result<(Vec<Val>, Vec<CellDiff>)> + Sync,
 {
     let dir = ExportDir::of(opt)?;
     let (_, both) = export_headers(opt, sides.compared);
@@ -3667,7 +3673,7 @@ where
         let rows = map_rows(&items, threads, "a changed row", |&(pos, p)| {
             let (ar, br) = ((sides.a_row)(p.row)?, (sides.b_row)(p.mate)?);
             let shown = if pos < report_rows {
-                Some(changed_cells_of(&ar, &br, ctx, opt)?)
+                Some(changed_cells_of(&ar, (sides.changed_of)(&p)?.1, ctx)?)
             } else {
                 None
             };
@@ -3694,23 +3700,12 @@ where
 }
 
 /// A changed row as the report shows it: its key, then the cells that differ.
-fn changed_cells_of(ar: &[Val], br: &[Val], ctx: &JoinCtx, opt: &Options) -> Result<Vec<Cell>> {
-    let (key_size, nc) = (ctx.key_size, ctx.nc);
-    let mut cells: Vec<CellDiff> = Vec::new();
-    for i in 0..nc {
-        let (x, y) = (&ar[key_size + i], &br[key_size + i]);
-        if ctx.typed[i].differs(x, y, opt) {
-            alloc::push(
-                &mut cells,
-                CellDiff {
-                    column: i,
-                    a: alloc::val(x.as_deref(), "a changed cell")?,
-                    b: alloc::val(y.as_deref(), "a changed cell")?,
-                },
-                "a changed cell",
-            )?;
-        }
-    }
+///
+/// The cells are [`changed_row`]'s, decided from the fields as the join
+/// decided them, not from the strings shown: two values can show alike (a
+/// lone surrogate and its escape as text) and still differ.
+fn changed_cells_of(ar: &[Val], cells: Vec<CellDiff>, ctx: &JoinCtx) -> Result<Vec<Cell>> {
+    let key_size = ctx.key_size;
     let mut row: Vec<Cell> = alloc::sized(key_size + 1, "a changed row's key")?;
     for v in &ar[..key_size] {
         row.push(Cell::Value(alloc::val(
@@ -3879,11 +3874,44 @@ fn row_fields<'s>(
     (&side.slab, fields)
 }
 
+/// Whether a cell of a matched row differs, asked of its fields as the join's
+/// loop asks it, so the report lists exactly the cells the join counted.
+///
+/// Not asked of the strings shown: a value is shown as written, a lone
+/// surrogate as its escape (`slab::display_text`), so a lone surrogate and a
+/// string holding its six characters show alike, and a nested value and a
+/// string holding its JSON do, though the compare tells each pair apart.
+///
+/// Spelled out rather than calling the helpers the join's loop inlines
+/// (`plain_differs`, `same_value`, `cell_differs`): a second caller made the
+/// compiler keep two of them out of line and shape `join_row` otherwise, and
+/// a plain compare of the perf gate's CSV pair took 0.07% more instructions
+/// (cachegrind, one thread), all of it in `join_row`.
+#[inline(never)]
+fn cell_changed(kind: Typed, a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
+    if !needs_normalising(opt) {
+        let (xa, yb) = (plain_absent(x), plain_absent(y));
+        if xa || yb {
+            return xa != yb;
+        }
+        if same_bytes(a, x, b, y) {
+            return false;
+        }
+        let bytes = |s: &Slab, f: Field| s.logical(f).collect::<Vec<u8>>();
+        return kind == Typed::Text || !kind.same_value(&bytes(a, x), &bytes(b, y));
+    }
+    if kind != Typed::Text {
+        return kind.differs(&value(a, x, opt), &value(b, y, opt), opt);
+    }
+    let (va, vb) = values(a, x, b, y, opt);
+    differs(&va, &vb, opt)
+}
+
 /// A changed row's key values and its differing cells, decoded from the two
 /// rows' fields. A column whose two fields hold the same bytes is skipped
 /// undecoded: equal bytes are equal values under every option, so `differs`
-/// could only have said no. Every other column is decoded and asked, exactly
-/// as it was when the whole rows were.
+/// could only have said no. Every other column is asked as the join asked it
+/// ([`cell_changed`]), and decoded only where it differs.
 fn changed_row(
     sa: &Slab,
     fa: &[Field],
@@ -3903,10 +3931,9 @@ fn changed_row(
         if field::is_real(x) && field::is_real(y) && same_bytes(sa, x, sb, y) {
             continue;
         }
-        let xv = value_checked(sa, x, opt, "a changed cell")?;
-        let yv = value_checked(sb, y, opt, "a changed cell")?;
-        let differ = kind.differs(&xv, &yv, opt);
-        if differ {
+        if cell_changed(kind, sa, x, sb, y, opt) {
+            let xv = value_checked(sa, x, opt, "a changed cell")?;
+            let yv = value_checked(sb, y, opt, "a changed cell")?;
             alloc::push(
                 &mut cells,
                 CellDiff {
@@ -4962,7 +4989,7 @@ fn render_row(slab: &Slab, fields: &[Field]) -> Vec<String> {
         .iter()
         .map(|&f| {
             if field::is_real(f) {
-                text_of(slab, f)
+                display_text(slab, f)
             } else {
                 String::new()
             }
@@ -5128,5 +5155,294 @@ mod fit_tests {
             fits_estimated(None, &b, &a, b',').is_none(),
             "no limit, no check"
         );
+    }
+}
+
+#[cfg(test)]
+mod surrogate_tests {
+    use super::*;
+
+    /// A JSON slab of strings, spelled as JSON spells them between their
+    /// quotes, and each string's field as the reader makes it.
+    fn strings(values: &[&str]) -> (Slab, Vec<Field>) {
+        let (mut text, mut fields) = (Vec::new(), Vec::new());
+        for v in values {
+            text.extend_from_slice(b"{\"v\":\"");
+            let at = text.len() as u64;
+            text.extend_from_slice(v.as_bytes());
+            fields.push(field::pack(at, v.len() as u64, v.contains('\\')));
+            text.extend_from_slice(b"\"}\n");
+        }
+        (Slab::owned(text, Dialect::Json), fields)
+    }
+
+    /// The reference: the value's code points, a lone surrogate one of them,
+    /// read from its decoded bytes; trimmed of white space and lowercased a
+    /// character at a time as the options ask, a surrogate left alone.
+    fn code_points(slab: &Slab, f: Field, opt: &Options) -> Option<Vec<u32>> {
+        let bytes: Vec<u8> = slab.logical(f).collect();
+        let mut cps = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let b = bytes[at];
+            let n = match b {
+                0..=0x7F => 1,
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                _ => 4,
+            };
+            let mut cp = if n == 1 {
+                u32::from(b)
+            } else {
+                u32::from(b) & (0x7F >> n)
+            };
+            for &c in &bytes[at + 1..at + n] {
+                cp = (cp << 6) | u32::from(c & 0x3F);
+            }
+            cps.push(cp);
+            at += n;
+        }
+        let space = |cp: &u32| char::from_u32(*cp).is_some_and(char::is_whitespace);
+        if opt.trim {
+            while cps.first().is_some_and(space) {
+                cps.remove(0);
+            }
+            while cps.last().is_some_and(space) {
+                cps.pop();
+            }
+        }
+        if opt.ignore_case {
+            cps = cps
+                .into_iter()
+                .flat_map(|cp| match char::from_u32(cp) {
+                    Some(c) => c.to_lowercase().map(u32::from).collect::<Vec<_>>(),
+                    None => vec![cp],
+                })
+                .collect();
+        }
+        (!cps.is_empty()).then_some(cps)
+    }
+
+    /// Two strings are equal under every option exactly where their code
+    /// points are, a lone surrogate included, and equal strings hash alike,
+    /// on the plain route and on the normalising one. Under `--trim` and
+    /// `--ignore-case` every lone surrogate was U+FFFD three times, so
+    /// `\ud800` and `\ud801` were one value and one key.
+    #[test]
+    fn lone_surrogates_are_equal_and_hash_alike_only_where_their_code_points_are() {
+        let values = [
+            r"\ud800",
+            r"\ud801",
+            r"\uD800",
+            r"\udc00",
+            r"\\ud800",
+            r"\\uD800",
+            r"\\Ud800",
+            r"\\\ud800",
+            r"\\\\ud800",
+            r"\\\\\ud800",
+            r"a\\b",
+            r"\ud800 ",
+            r" \ud800",
+            r"x\ud800",
+            r"X\ud800",
+            r"\ud83d\ude00",
+            "\u{1f600}",
+            r"\ud800\udc00",
+            r"\ud800\\udc00",
+            r"\ud800\u0041",
+            r"\ud800A",
+            r"\u00e9",
+            "\u{e9}",
+            "\u{c9}",
+            r"\ufffd\ufffd\ufffd",
+        ];
+        let (slab, fields) = strings(&values);
+        let k = keyhash::from_seed(1);
+        for (trim, ignore_case) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut opt = Options::with_key(["v"]);
+            (opt.trim, opt.ignore_case) = (trim, ignore_case);
+            let normalise = needs_normalising(&opt);
+            let hash = |f| hash_field(&slab, f, &opt, normalise, false, k.start, k.mul);
+            for (i, &x) in fields.iter().enumerate() {
+                for (j, &y) in fields.iter().enumerate() {
+                    let (a, b) = (values[i], values[j]);
+                    let want = code_points(&slab, x, &opt) == code_points(&slab, y, &opt);
+                    let what = format!("{a:?} and {b:?}, trim {trim}, ignore case {ignore_case}");
+                    assert_eq!(same(&slab, x, &slab, y, &opt), want, "{what}");
+                    assert_eq!(!cell_differs(&slab, x, &slab, y, &opt), want, "{what}");
+                    if want {
+                        assert_eq!(hash(x), hash(y), "{what}: equal, hashed apart");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cell_changed_tests {
+    use super::*;
+
+    /// The join's per-cell decision, spelled as `join_row` spells it: its
+    /// plain loop (`ctx.plain`) and its other loop, branch for branch. Kept
+    /// here rather than shared with `join_row`: a shared function moved
+    /// `join_row`'s code and cost a plain NDJSON compare 0.06% more
+    /// instructions (cachegrind, one thread).
+    fn join_decision(kind: Typed, a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
+        if !needs_normalising(opt) {
+            let (xa, yb) = (plain_absent(x), plain_absent(y));
+            plain_differs(a, x, xa, b, y, yb)
+                && !(kind != Typed::Text && !xa && !yb && same_value(kind, a, x, b, y))
+        } else if kind != Typed::Text {
+            kind.differs(&value(a, x, opt), &value(b, y, opt), opt)
+        } else {
+            cell_differs(a, x, b, y, opt)
+        }
+    }
+
+    /// A JSON slab of members, each written as JSON writes it, and each one's
+    /// field as the reader makes it: a string's between its quotes, escaped
+    /// where it holds a backslash; a nested value's escaped; a number as it is.
+    fn json(members: &[&str]) -> (Slab, Vec<Field>) {
+        let (mut text, mut fields) = (Vec::new(), Vec::new());
+        for m in members {
+            text.extend_from_slice(b"{\"v\":");
+            let at = text.len() as u64;
+            text.extend_from_slice(m.as_bytes());
+            fields.push(if let Some(s) = m.strip_prefix('"') {
+                let inner = &s[..s.len() - 1];
+                field::pack(at + 1, inner.len() as u64, inner.contains('\\'))
+            } else {
+                field::pack(at, m.len() as u64, m.starts_with(['[', '{']))
+            });
+            text.extend_from_slice(b"}\n");
+        }
+        (Slab::owned(text, Dialect::Json), fields)
+    }
+
+    /// A CSV slab of cells, `true` where the cell is quoted with a doubled
+    /// quote in it, and each one's field (between the quotes, for a quoted one).
+    fn csv(cells: &[(&[u8], bool)]) -> (Slab, Vec<Field>) {
+        let (mut text, mut fields) = (Vec::new(), Vec::new());
+        for &(c, quoted) in cells {
+            if quoted {
+                text.push(b'"');
+            }
+            fields.push(field::pack(text.len() as u64, c.len() as u64, quoted));
+            text.extend_from_slice(c);
+            text.extend_from_slice(if quoted {
+                b"\",".as_slice()
+            } else {
+                b",".as_slice()
+            });
+        }
+        (Slab::owned(text, Dialect::Csv), fields)
+    }
+
+    /// The cells a changed row lists are the ones the join counted: for every
+    /// kind a compared column takes and every option that changes the
+    /// decision, on look-alike lone surrogates, numbers and instants equal as
+    /// values but not as text, absent and empty cells, an escaped spelling of
+    /// plain text, and CSV text cells against nested JSON values.
+    #[test]
+    fn a_changed_cell_is_one_the_join_counted() {
+        let (js, jf) = json(&[
+            r#""\ud800""#,
+            r#""\ud801""#,
+            r#""\\ud800""#,
+            r#""\uD800""#,
+            r#""x\ud800""#,
+            r#""X\ud800""#,
+            r#""A""#,
+            r#""\u0041""#,
+            r#""a""#,
+            r#"" a ""#,
+            r#""""#,
+            r#""1""#,
+            r#""1.0""#,
+            r#""1e2""#,
+            r#""100""#,
+            r#""2024-01-01T00:00:00Z""#,
+            r#""2024-01-01 00:00:00""#,
+            r#""2024-01-01T00:00:00+00:00""#,
+            r#""true""#,
+            r#""[1,2]""#,
+            r#""[\"\\ud800\"]""#,
+            "1",
+            "1.0",
+            "100",
+            "true",
+            "[1, 2]",
+            "[1,2]",
+            r#"["\ud800"]"#,
+            r#"{"a": 1}"#,
+        ]);
+        let (cs, cf) = csv(&[
+            (b"[1,2]", false),
+            (br#"{""a"": 1}"#, true),
+            (br#"[""\ud800""]"#, true),
+            (b"1", false),
+            (b"1.0", false),
+            (b"1e2", false),
+            (b"A", false),
+            (b" a ", false),
+            (b"", false),
+            (br"\ud800", false),
+            (b"\xed\xa0\x80", false),
+            (b"2024-01-01", false),
+            (b"2024-01-01T00:00:00Z", false),
+            (b"true", false),
+        ]);
+        let mut cells: Vec<(&Slab, Field)> = Vec::new();
+        cells.extend(jf.iter().map(|&f| (&js, f)));
+        cells.extend(cf.iter().map(|&f| (&cs, f)));
+        cells.push((&js, ABSENT));
+        cells.push((&cs, ABSENT));
+        let shown = |s: &Slab, f: Field| {
+            if field::is_real(f) {
+                String::from_utf8_lossy(&s.logical(f).collect::<Vec<u8>>()).into_owned()
+            } else {
+                "(absent)".to_string()
+            }
+        };
+        let options = [
+            (false, false, 0.0),
+            (true, false, 0.0),
+            (false, true, 0.0),
+            (true, true, 0.0),
+            (false, false, 0.5),
+            (true, true, 0.5),
+        ];
+        for kind in [Typed::Text, Typed::Number, Typed::Instant] {
+            for (trim, ignore_case, tolerance) in options {
+                let mut opt = Options::with_key(["id"]);
+                (opt.trim, opt.ignore_case, opt.tolerance) = (trim, ignore_case, tolerance);
+                let (mut differ, mut equal) = (0, 0);
+                for &(a, x) in &cells {
+                    for &(b, y) in &cells {
+                        let want = join_decision(kind, a, x, b, y, &opt);
+                        let got = cell_changed(kind, a, x, b, y, &opt);
+                        assert_eq!(
+                            got,
+                            want,
+                            "{kind:?}, trim {trim}, ignore case {ignore_case}, tolerance \
+                             {tolerance}: {:?} against {:?}",
+                            shown(a, x),
+                            shown(b, y),
+                        );
+                        if want {
+                            differ += 1;
+                        } else {
+                            equal += 1;
+                        }
+                    }
+                }
+                assert!(
+                    differ > 0 && equal > cells.len(),
+                    "{kind:?} {differ} {equal}"
+                );
+            }
+        }
     }
 }
