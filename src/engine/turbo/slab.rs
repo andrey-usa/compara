@@ -35,6 +35,8 @@ pub(super) enum Dialect {
 /// Where the bytes came from. A mapping is paged in on demand and evictable; an
 /// arena is what a columnar format leaves behind once its pages are decoded.
 enum Bytes {
+    // The fuzzer's `map` reads every file into an owned buffer.
+    #[cfg_attr(fuzzing, allow(dead_code))]
     Mapped {
         _file: File,
         map: Mmap,
@@ -70,7 +72,25 @@ const BOM: &[u8] = b"\xEF\xBB\xBF";
 const PAGE: usize = 4096;
 
 impl Slab {
+    /// The fuzzer's [`Slab::map`]: the bytes copied into an allocation of
+    /// exactly their length. A mapping ends at a page boundary, so a scan that
+    /// reads a few bytes past the file's end reads the zeroes left in its last
+    /// page, which AddressSanitizer does not watch; past an allocation it
+    /// reports the read.
+    #[cfg(fuzzing)]
+    pub(super) fn map(path: &Path) -> Result<Self> {
+        use std::io::Read as _;
+        let cannot = |e: std::io::Error| Error::new(format!("cannot read {}: {e}", path.display()));
+        let mut read = Vec::new();
+        (&crate::source::open_input(path).map_err(cannot)?)
+            .read_to_end(&mut read)
+            .map_err(cannot)?;
+        let start = if read.starts_with(BOM) { BOM.len() } else { 0 };
+        Ok(Slab::owned(read[start..].to_vec(), Dialect::Csv))
+    }
+
     /// Maps a file read-only, with a hint that it will be read front to back.
+    #[cfg(not(fuzzing))]
     pub(super) fn map(path: &Path) -> Result<Self> {
         let file = crate::source::open_input(path)
             .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
