@@ -3450,6 +3450,48 @@ fn ini_section(text: &str, name: &str) -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
+    /// What `QuietPipe`'s unsafe blocks promise: SIGPIPE blocked on this
+    /// thread while it lives, a SIGPIPE raised meanwhile taken back, and the
+    /// thread's mask as it was once it is dropped; a mask that blocked it
+    /// already is left blocked.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_quiet_pipe_blocks_sigpipe_on_its_thread_and_puts_the_mask_back() {
+        fn blocked() -> bool {
+            // Safety: a zeroed set filled by pthread_sigmask, which changes
+            // nothing with a null new set.
+            unsafe {
+                let mut now: libc::sigset_t = std::mem::zeroed();
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut now),
+                    0
+                );
+                libc::sigismember(&now, libc::SIGPIPE) == 1
+            }
+        }
+        std::thread::spawn(|| {
+            assert!(!blocked());
+            let quiet = QuietPipe::new();
+            assert!(blocked());
+            // Safety: raised on this thread, where it is blocked: it waits
+            // until the drop takes it back, and never runs its default.
+            assert_eq!(
+                unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGPIPE) },
+                0
+            );
+            drop(quiet);
+            assert!(!blocked());
+            // Already blocked: a second one leaves it blocked.
+            let outer = QuietPipe::new();
+            drop(QuietPipe::new());
+            assert!(blocked());
+            drop(outer);
+            assert!(!blocked());
+        })
+        .join()
+        .unwrap();
+    }
+
     /// Windows words a refused connection its own way; both are told as
     /// refused, so the message names the cause (and a proxy, if one is set).
     #[test]
