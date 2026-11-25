@@ -416,10 +416,12 @@ fn a_json_part_that_ends_inside_a_row_is_refused_with_its_line() {
         let side = d.0.join(part).to_string_lossy().into_owned();
         let got = compare(&side, &side, &["-k", "id"]);
         assert_eq!(got.0, 2, "{part}: {}", got.1);
+        // The part is named by its path as the system spells it: `\` between
+        // the directories on Windows.
+        let part_0 = std::path::Path::new("day=1").join("part-0.json");
+        let line = format!("{}: line 2 (\"{{\\\"id\\\":1,", part_0.display());
         assert!(
-            got.1
-                .contains("day=1/part-0.json: line 2 (\"{\\\"id\\\":1,")
-                && got.1.contains("opens a row that the part ends inside"),
+            got.1.contains(&line) && got.1.contains("opens a row that the part ends inside"),
             "{part}: {}",
             got.1
         );
