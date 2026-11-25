@@ -1,0 +1,67 @@
+name: miri
+
+# The unsafe code's tests under Miri: the vector scans, snappy and RLE, the
+# guarded test bytes, the `set_len` sites and the reserve's slots. Miri sees
+# what the guard pages and debug assertions cannot: a read of memory nothing
+# wrote, a block used or freed after it was freed, aliasing through raw
+# pointers. It interprets each step, about a thousand times slower than a
+# native run, so the randomized tests run a hundredth of their rounds under
+# `cfg(miri)`, and this runs once a night and on a dispatch, never on a push
+# or a pull request: nothing waits on it.
+
+on:
+  schedule: [{cron: "41 4 * * *"}]
+  workflow_dispatch:
+
+permissions: {contents: read}
+
+concurrency:
+  group: miri-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  miri:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # Miri needs a nightly; rust-toolchain.toml keeps the compiler every
+      # other job builds with. A dated one, so a night's red is the code's,
+      # not a new nightly's. Move it by hand.
+      TOOLCHAIN: nightly-2026-11-10
+      # Miri answers the CPU-feature checks from the target's features, so
+      # these make the AVX2 scans and their unsafe loads run.
+      RUSTFLAGS: -Ctarget-feature=+avx2,+popcnt,+bmi1
+      # The Parquet tests read their fixtures from tests/fixtures.
+      MIRIFLAGS: -Zmiri-disable-isolation
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # A schedule runs the default branch's copy of this file, and the
+          # code that changes is on next: that is what a night checks.
+          ref: ${{ github.event_name == 'schedule' && 'next' || '' }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          components: miri, rust-src
+      - name: Miri's standard library
+        run: cargo "+$TOOLCHAIN" miri setup
+      - name: miri
+        run: |
+          # bash -e: the cargo call is in an OR list so the lines after it
+          # run, and pipefail makes the list see cargo's status, not tee's.
+          set -o pipefail
+          code=0
+          cargo "+$TOOLCHAIN" miri test --locked --no-default-features --lib -- \
+            engine::turbo::field:: engine::turbo::text:: engine::turbo::append_tests:: \
+            parquet::tests:: guarded:: alloc:: \
+            --skip a_control_character_stops_the_scan 2>&1 | tee miri.log || code=$?
+          if [ "$code" != 0 ]; then
+            # Miri's report follows the test's own "test <name> ... " on its
+            # line, so the first such line names the test and what it did.
+            what=$(grep -m1 -E 'error: (Undefined Behavior|memory leaked|unsupported operation)|^test .* FAILED|panicked at' miri.log | cut -c1-400 || true)
+            what=${what:-exit $code}
+            echo "::error title=miri::$what. Run it: RUSTFLAGS='$RUSTFLAGS' MIRIFLAGS='$MIRIFLAGS' cargo +$TOOLCHAIN miri test --no-default-features --lib -- --exact <the test>; the log above names the test, the line and the allocation."
+          fi
+          exit $code
