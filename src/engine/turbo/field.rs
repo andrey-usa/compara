@@ -824,6 +824,7 @@ pub(super) fn skip_quoted_with<S: Scan>(scan: S, data: &[u8], from: usize, end: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guarded::every;
 
     #[test]
     fn scanning_crosses_the_word_boundary() {
@@ -900,9 +901,11 @@ mod tests {
             });
         }
         // Cut at lengths that end a register at every place, each against an
-        // unreadable page: a register read past the data faults.
+        // unreadable page: a register read past the data faults. Under Miri,
+        // each place once, and every seventh start counted down from the end.
         let full = d;
-        for (len, end) in (0..=64).flat_map(|cut| {
+        let cuts = if cfg!(miri) { Wide::STEP } else { 64 };
+        for (len, end) in (0..=cuts).flat_map(|cut| {
             let len = full.len() - cut;
             [
                 (len, len),
@@ -927,7 +930,7 @@ mod tests {
                 }
                 at = want + 1;
             }
-            for from in 0..end {
+            for from in (0..end).rev().step_by(every(7)) {
                 assert_eq!(
                     next_of1_with(w, &d, from, end, b'"'),
                     next_of1_with(Swar, &d, from, end, b'"'),
@@ -1084,10 +1087,12 @@ mod tests {
             d.push((next() % 251) as u8);
         }
         // Every delimiter value, paired with a second one that is sometimes
-        // the same, sometimes a neighbour, sometimes far away.
-        for a in 0..=255u8 {
+        // the same, sometimes a neighbour, sometimes far away. Under Miri,
+        // every seventeenth value at every fifth offset, counted down from the
+        // last so that the load ending at the data's end is always one.
+        for a in (0..=255u8).step_by(every(17)) {
             for b in [a, a.wrapping_add(1), a.wrapping_sub(1), 0, 255] {
-                for at in 0..=(d.len() - Wide::STEP) {
+                for at in (0..=(d.len() - Wide::STEP)).rev().step_by(every(5)) {
                     let mut want = 0u64;
                     for i in 0..Wide::STEP {
                         if d[at + i] == a || d[at + i] == b {
@@ -1098,13 +1103,14 @@ mod tests {
                 }
             }
         }
-        // `same` over two random slices, at every offset pair that fits.
+        // `same` over two random slices, at every offset pair that fits (under
+        // Miri every fifth and every thirteenth, again from the last).
         let mut e = Vec::new();
         for _ in 0..300 {
             e.push((next() % 251) as u8);
         }
-        for xi in 0..=(d.len() - Wide::STEP) {
-            for yi in 0..=(e.len() - Wide::STEP) {
+        for xi in (0..=(d.len() - Wide::STEP)).rev().step_by(every(5)) {
+            for yi in (0..=(e.len() - Wide::STEP)).rev().step_by(every(13)) {
                 let mut want = 0u64;
                 for i in 0..Wide::STEP {
                     if d[xi + i] == e[yi + i] {

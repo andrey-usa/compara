@@ -3090,6 +3090,7 @@ pub fn is_parquet(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guarded::rounds;
 
     /// A literal of `lit`, then one two-byte-offset copy of `len` at `offset`.
     fn stream(lit: &[u8], offset: usize, len: usize) -> Vec<u8> {
@@ -3222,7 +3223,12 @@ mod tests {
     #[test]
     fn a_column_read_in_runs_is_the_column_read_in_one_pass() {
         let mut split = 0;
-        for (name, data) in fixtures() {
+        // Under Miri, the smallest fixture of several row groups alone: its
+        // five columns are compressed and read in runs, byte arrays and words
+        // both, which is every `set_len` here; the larger ones take minutes
+        // each there.
+        let small = |name: &str| !cfg!(miri) || name.ends_with("a_dict_row_groups.parquet");
+        for (name, data) in fixtures().into_iter().filter(|(name, _)| small(name)) {
             let Ok(fm) = read_file_meta(&data, &name) else {
                 continue;
             };
@@ -3274,8 +3280,10 @@ mod tests {
                 }
             }
         }
-        // The row-group fixtures alone have eleven columns read four ways.
-        assert!(split >= 40, "only {split} columns were read in runs");
+        // The row-group fixtures alone have eleven columns read four ways, the
+        // smallest five.
+        let want = if cfg!(miri) { 20 } else { 40 };
+        assert!(split >= want, "only {split} columns were read in runs");
     }
 
     #[test]
@@ -3301,6 +3309,11 @@ mod tests {
     /// A footer that undersells its chunks, or whose counts do not add up,
     /// leaves the reading to the single pass, which reads it as before.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "its three fixtures take many minutes under Miri; the runs' reads are \
+                  a_column_read_in_runs_is_the_column_read_in_one_pass's there"
+    )]
     fn a_footer_the_runs_cannot_trust_is_read_in_one_pass() {
         for file in ["rg_snappy.parquet", "rg_zstd.parquet", "rg_none.parquet"] {
             let (name, data) = fixtures()
@@ -3389,7 +3402,9 @@ mod tests {
     fn snappy_expands_the_densest_stream_there_is() {
         // One literal byte, then copies of 64 from one byte back, three bytes
         // each: the bound on a stream's length must not refuse a real one.
-        for copies in [1usize, 2, 3, 100, 5000] {
+        // (Under Miri, 500 copies stand in for the 5,000.)
+        let long = if cfg!(miri) { 500 } else { 5000 };
+        for copies in [1usize, 2, 3, 100, long] {
             let mut s = length_prefix(1 + 64 * copies as u64);
             s.extend_from_slice(&[0x00, b'a']);
             for _ in 0..copies {
@@ -3565,7 +3580,7 @@ mod tests {
     #[test]
     fn snappy_expands_random_streams_of_every_element_form() {
         let mut rng = Rng(0x5eed);
-        for round in 0..3000 {
+        for round in 0..rounds(3000) {
             let elements = 1 + rng.below(80);
             let (stream, plain) = random_stream(&mut rng, elements);
             assert_eq!(reference(&stream).as_deref(), Some(&plain[..]));
@@ -3590,7 +3605,7 @@ mod tests {
         use crate::guarded::Guarded;
         let mut rng = Rng(0x9a4d_5eed);
         let mut expanded = 0;
-        for round in 0..20_000 {
+        for round in 0..rounds(20_000) {
             let elements = 1 + rng.below(40);
             let (mut stream, _) = random_stream(&mut rng, elements);
             if round % 2 == 1 {
@@ -3619,13 +3634,13 @@ mod tests {
                 None => assert!(!(ok && dst == base + want), "round {round}"),
             }
         }
-        assert!(expanded > 10_000, "{expanded}");
+        assert!(expanded > rounds(10_000), "{expanded}");
     }
 
     #[test]
     fn snappy_agrees_with_the_reference_on_damaged_streams() {
         let mut rng = Rng(0xbad5eed);
-        for round in 0..20000 {
+        for round in 0..rounds(20000) {
             let elements = 1 + rng.below(30);
             let (mut stream, _) = random_stream(&mut rng, elements);
             let head = stream.iter().position(|&b| b & 0x80 == 0).unwrap() + 1;

@@ -14,6 +14,20 @@
 //! are an exact-length allocation, and the scans' own tests still compare
 //! their answers.
 
+/// How many rounds a randomized test runs: `native`, or a hundredth of it
+/// under Miri, which interprets each step about a thousand times slower. The
+/// edges a scan can get wrong come up in the first rounds as in the last;
+/// the native count is for the rarer shapes.
+pub(crate) const fn rounds(native: usize) -> usize {
+    if cfg!(miri) { native / 100 } else { native }
+}
+
+/// The step through an exhaustive range: every value natively, every
+/// `under_miri`th under Miri. Prime steps keep every alignment in reach.
+pub(crate) const fn every(under_miri: usize) -> usize {
+    if cfg!(miri) { under_miri } else { 1 }
+}
+
 /// Bytes with no readable byte right after them ([`Guarded::ending`]) or right
 /// before them ([`Guarded::starting`]).
 pub(crate) struct Guarded {

@@ -3778,7 +3778,7 @@ fn end_of_array_row<S: Scan>(scan: S, data: &[u8], pos: usize, end: usize, open:
 mod tests {
     use super::super::slab::Slab;
     use super::*;
-    use crate::guarded::Guarded;
+    use crate::guarded::{Guarded, rounds};
 
     /// The counted JSON proof agrees with the member walk: rows that differ in
     /// a tracked or untracked value, a name, a member added or dropped, with
@@ -3821,7 +3821,7 @@ mod tests {
         ];
         let gaps = ["", "", "", " ", "  "];
         let mut agreed = 0;
-        for _ in 0..30_000 {
+        for _ in 0..rounds(30_000) {
             let row = |n: usize, mutate: Option<(usize, u64)>| -> String {
                 let mut out = String::from("{");
                 for i in 0..n {
@@ -3893,7 +3893,7 @@ mod tests {
             agreed += usize::from(walk);
         }
         assert!(
-            agreed > 1000,
+            agreed > rounds(1000),
             "too few rows proved equal to test anything: {agreed}"
         );
     }
@@ -3945,7 +3945,7 @@ mod tests {
             format!("{{{}}}\n", body.join(","))
         };
         let (mut proved, mut proved_escaped) = (0, 0);
-        for _ in 0..20_000 {
+        for _ in 0..rounds(20_000) {
             let mut order = [0usize, 1, 2, 3, 4];
             for i in (1..order.len()).rev() {
                 order.swap(i, next(i + 1));
@@ -4013,7 +4013,7 @@ mod tests {
             }
         }
         assert!(
-            proved > 2000 && proved_escaped > 1000,
+            proved > rounds(2000) && proved_escaped > rounds(1000),
             "too few rows proved to test anything: {proved}, {proved_escaped} with an escape"
         );
     }
@@ -4072,7 +4072,7 @@ mod tests {
             (seed % n as u64) as usize
         };
         let (mut answered, mut answered_escaped) = (0, 0);
-        for _ in 0..40_000 {
+        for _ in 0..rounds(40_000) {
             let fill = "f".repeat(next(40));
             let n = 2 + next(5);
             let mut members: Vec<(usize, usize)> = (0..n)
@@ -4130,7 +4130,7 @@ mod tests {
             }
         }
         assert!(
-            answered > 10_000 && answered_escaped > 3000,
+            answered > rounds(10_000) && answered_escaped > rounds(3000),
             "too few rows answered by the count: {answered}, {answered_escaped} past an escape"
         );
     }
@@ -4184,7 +4184,7 @@ mod tests {
         };
         let alphabets: [&[u8]; 3] = [b"ab,\"\"\n\rxyz", b"a,,\"\"\"\n", b"abcdefg,\t\"\n"];
         let mut literal = 0usize;
-        for round in 0..60_000 {
+        for round in 0..rounds(60_000) {
             let alphabet = alphabets[round % alphabets.len()];
             let len = (next() % 260) as usize + 1;
             let mut data: Vec<u8> = (0..len)
@@ -4243,7 +4243,7 @@ mod tests {
             }
         }
         assert!(
-            literal > 1000,
+            literal > rounds(1000),
             "too few rows with a quote that is content to test anything: {literal}"
         );
     }
@@ -4283,7 +4283,7 @@ mod tests {
             seed
         };
         let alphabet = b"abc,,,\"\n\r xyz0123";
-        for _ in 0..20_000 {
+        for _ in 0..rounds(20_000) {
             let len = (next() % 300) as usize + 1;
             let mut data: Vec<u8> = (0..len)
                 .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
@@ -4345,7 +4345,7 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        for _ in 0..5_000 {
+        for _ in 0..rounds(5_000) {
             let mut row = Vec::new();
             let fields = (next() % 20) as usize + 1;
             for f in 0..fields {
@@ -4929,7 +4929,7 @@ mod tests {
             (seed % n as u64) as usize
         };
         let (mut walks, mut refused, mut parsed) = (0, 0, 0);
-        for case in 0..6_000 {
+        for case in 0..rounds(6_000) {
             // Most rows are spaced as the file's writer spaces them, and
             // list the first row's names in its order.
             let (comma, colon) = (next(6), next(5));
@@ -5052,7 +5052,7 @@ mod tests {
             parsed += 1;
         }
         assert!(
-            walks > 5_000 && refused > 500 && parsed > 3_000,
+            walks > rounds(5_000) && refused > rounds(500) && parsed > rounds(3_000),
             "{walks} {refused} {parsed}"
         );
     }
@@ -5383,7 +5383,7 @@ mod tests {
         };
         let n = runs.len();
         let (mut found, mut matched) = (0, 0);
-        for _ in 0..20_000 {
+        for _ in 0..rounds(20_000) {
             let mut cells: Vec<&str> = (0..1 + next(7))
                 .map(|_| fields[next(fields.len())])
                 .collect();
@@ -5429,7 +5429,10 @@ mod tests {
             found += usize::from(a_found);
             matched += usize::from(b_matches);
         }
-        assert!(found > 5_000 && matched > 2_000, "{found} {matched}");
+        assert!(
+            found > rounds(5_000) && matched > rounds(2_000),
+            "{found} {matched}"
+        );
     }
 
     #[test]
@@ -5491,7 +5494,7 @@ mod tests {
             (seed % n as u64) as usize
         };
         let (mut walks, mut refused) = (0, 0);
-        for case in 0..3_000 {
+        for case in 0..rounds(3_000) {
             let framed = case % 3 == 2;
             let (comma, colon) = [(",", ":"), (", ", ": ")][next(2)];
             let order: Vec<usize> = (0..1 + next(6)).map(|_| next(names.len())).collect();
@@ -5592,7 +5595,7 @@ mod tests {
             refused += usize::from(reference.is_err());
         }
         assert!(
-            walks > 2_500 && refused > 200 && refused < walks / 2,
+            walks > rounds(2_500) && refused > rounds(200) && refused < walks / 2,
             "{walks} {refused}"
         );
     }
@@ -5610,7 +5613,7 @@ mod tests {
             (seed % n as u64) as usize
         };
         let bytes = b"\"\\\n}x y,:";
-        for _ in 0..2_000 {
+        for _ in 0..rounds(2_000) {
             let len = next(1_200);
             // Sparse and dense stops, and stretches of none longer than a block.
             let density = [3, 9, 40, 200][next(4)];
