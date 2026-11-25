@@ -63,8 +63,14 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn with_tiny_batches<T>(body: impl FnOnce() -> T) -> T {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Safety: the variable is read in this process, so it cannot be set on a
+    // child instead. Other test threads read the environment only through
+    // `std::env`, which holds the lock `set_var` takes; no test here reads it
+    // through the C library's `getenv`, which would not. No test can catch a
+    // racing reader, so this is the whole of the argument.
     unsafe { std::env::set_var(BATCH_BYTES_ENV, "2048") };
     let out = body();
+    // Safety: as above.
     unsafe { std::env::remove_var(BATCH_BYTES_ENV) };
     out
 }

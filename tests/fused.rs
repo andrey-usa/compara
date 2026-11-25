@@ -11,11 +11,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 
 use compara::gendata::{Compression, Format, generate_as};
-
-static FUSED_ENV: Mutex<()> = Mutex::new(());
 
 fn fixture_id() -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -285,19 +282,16 @@ impl Drop for Fixture {
 }
 
 /// Runs the binary in `dir`; `fused` sets `COMPARA_FUSED_JOIN=1`.
+///
+/// The variable is set on the child alone, not on this process, whose
+/// environment every test thread shares: what makes `set_var` unsafe.
 fn run(dir: &Path, args: &[&str], fused: bool) -> (i32, String, String) {
-    let _guard = FUSED_ENV.lock().unwrap();
+    let mut command = Command::new(BIN);
+    command.current_dir(dir).args(args);
     if fused {
-        unsafe { std::env::set_var("COMPARA_FUSED_JOIN", "1") };
+        command.env("COMPARA_FUSED_JOIN", "1");
     }
-    let out = Command::new(BIN)
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .expect("the binary");
-    if fused {
-        unsafe { std::env::remove_var("COMPARA_FUSED_JOIN") };
-    }
+    let out = command.output().expect("the binary");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
