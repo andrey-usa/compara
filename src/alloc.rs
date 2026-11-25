@@ -405,6 +405,10 @@ mod tests {
     /// An allocation no machine can serve refuses rather than aborting. This is
     /// the whole point of the module: on the old code the process died here.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri stops at an allocation this large instead of failing it"
+    )]
     fn an_impossible_size_refuses() {
         let huge = usize::MAX / 16;
         let e = sized::<u64>(huge, "hash per row").unwrap_err();
@@ -470,6 +474,26 @@ mod tests {
         let empty = AtomicPtr::new(std::ptr::null_mut());
         assert_eq!(fill(&empty, offered), None);
         assert_eq!(empty.load(Ordering::Acquire), offered);
+    }
+
+    /// Calls racing on the reserve's slots, as `hold_reserve` would be if
+    /// threads called it at once. Each block must end up held by one slot or
+    /// freed, once: a block freed while a slot still holds it is freed again by
+    /// `release_reserve`, and a block nobody holds leaks. Miri reports either,
+    /// and its scheduler interleaves the calls between a slot's load and its
+    /// `compare_exchange`; natively a double free aborts when the race is met.
+    #[test]
+    fn calls_racing_on_the_reserve_free_each_block_once() {
+        let rounds = if cfg!(miri) { 12 } else { 200 };
+        for _ in 0..rounds {
+            std::thread::scope(|s| {
+                for _ in 0..3 {
+                    s.spawn(hold_reserve);
+                }
+            });
+            while release_reserve() {}
+        }
+        hold_reserve();
     }
 
     #[test]

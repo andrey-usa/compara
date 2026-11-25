@@ -229,7 +229,9 @@ pub fn promise(bytes: u64) -> std::result::Result<Promise, Short> {
     }
 }
 
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+// Miri runs no foreign functions, `getrlimit` among them: under it the
+// process has no limits, as on a platform that cannot read them.
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 mod rlimit {
     use std::ffi::c_int;
 
@@ -345,7 +347,7 @@ mod rlimit {
     }
 }
 
-#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64", not(miri))))]
 mod rlimit {
     pub fn cap_data(_: u64) -> Option<u64> {
         None
@@ -726,7 +728,7 @@ mod tests {
         assert!(m.available <= m.limit);
     }
 
-    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
     #[test]
     fn vm_data_is_read_from_its_line() {
         let status = b"Name:\tcompara\nVmPeak:\t  999 kB\nVmData:\t  118536 kB\nVmStk:\t 132 kB\n";
