@@ -497,6 +497,10 @@ mod memfd {
     use std::fs::File;
     use std::path::PathBuf;
 
+    /// MFD_CLOEXEC.
+    #[cfg(target_os = "linux")]
+    pub(super) const CLOEXEC: std::ffi::c_uint = 1;
+
     #[cfg(target_os = "linux")]
     pub fn create() -> Option<File> {
         use std::os::fd::FromRawFd;
@@ -506,7 +510,6 @@ mod memfd {
                 flags: std::ffi::c_uint,
             ) -> std::ffi::c_int;
         }
-        const CLOEXEC: std::ffi::c_uint = 1;
         if !std::path::Path::new("/proc/self/fd").is_dir() {
             return None;
         }
@@ -1090,7 +1093,8 @@ pub fn free_space(dir: &Path) -> Option<u64> {
         }
         let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
         // struct statvfs on 64-bit Linux: f_bsize, f_frsize, f_blocks,
-        // f_bfree, f_bavail, ... -- all 64-bit, well inside 32 words.
+        // f_bfree, f_bavail, ... -- all 64-bit, well inside 32 words
+        // (`the_statvfs_words_read_are_the_c_library_s`).
         let mut buf = [0u64; 32];
         // SAFETY: a NUL-terminated path and a buffer larger than the struct.
         if unsafe { statvfs(path.as_ptr(), buf.as_mut_ptr()) } != 0 {
@@ -1150,6 +1154,24 @@ impl std::fmt::Display for Human {
 
 #[cfg(test)]
 mod tests {
+    /// The words `free_space` reads from its buffer are the fields of the C
+    /// library's `struct statvfs`, which fits in it: a larger struct would be
+    /// written past the buffer.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn the_statvfs_words_read_are_the_c_library_s() {
+        assert!(size_of::<libc::statvfs>() <= 32 * 8);
+        assert_eq!(std::mem::offset_of!(libc::statvfs, f_frsize), 8);
+        assert_eq!(std::mem::offset_of!(libc::statvfs, f_bavail), 4 * 8);
+    }
+
+    /// The flag `memfd::create` passes is the C library's MFD_CLOEXEC.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_memfd_flag_is_the_c_library_s() {
+        assert_eq!(memfd::CLOEXEC, libc::MFD_CLOEXEC);
+    }
+
     use super::*;
     #[cfg(unix)]
     use std::cell::{Cell, RefCell};

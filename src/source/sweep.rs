@@ -613,10 +613,11 @@ fn euid() -> u32 {
 }
 
 /// Whether process `pid` exists here. One that belongs to another user
-/// exists too: only "no such process" (ESRCH, 3 on Linux, macOS and the
-/// BSDs) says it is gone.
+/// exists too: only "no such process" ([`ESRCH`]) says it is gone.
+/// "No such process", 3 on Linux, macOS and the BSDs.
+const ESRCH: i32 = 3;
+
 fn alive(pid: i32) -> bool {
-    const ESRCH: i32 = 3;
     // SAFETY: signal 0 is not sent; kill only checks that the process exists
     // and may be signalled. `parse` refuses 0 and negative ids, which would
     // name process groups.
@@ -628,6 +629,15 @@ fn alive(pid: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The number `alive` reads as "gone", and the widths of the ids that
+    /// `geteuid` and `kill` are declared with here, are the C library's.
+    #[test]
+    fn the_declarations_are_the_c_library_s() {
+        assert_eq!(super::ESRCH, libc::ESRCH);
+        assert_eq!(size_of::<libc::uid_t>(), size_of::<u32>());
+        assert_eq!(size_of::<libc::pid_t>(), size_of::<i32>());
+    }
+
     use super::*;
     use std::cell::Cell;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};

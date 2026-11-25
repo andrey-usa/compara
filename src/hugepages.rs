@@ -26,13 +26,16 @@ pub struct HugePages;
 const FROM: usize = 4 << 20;
 
 #[cfg(target_os = "linux")]
+const MADV_HUGEPAGE: std::ffi::c_int = 14;
+#[cfg(target_os = "linux")]
+const PAGE: usize = 4096;
+
+#[cfg(target_os = "linux")]
 fn advise(p: *mut u8, size: usize) {
     use std::ffi::{c_int, c_void};
     unsafe extern "C" {
         fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
     }
-    const MADV_HUGEPAGE: c_int = 14;
-    const PAGE: usize = 4096;
     if size < FROM || p.is_null() {
         return;
     }
@@ -110,5 +113,16 @@ unsafe impl GlobalAlloc for HugePages {
         // not been advised yet.
         advise(p, new_size);
         p
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    /// The advice `madvise` is given is the C library's number for huge
+    /// pages; another number would be other advice (14 is MADV_HUGEPAGE, 4
+    /// would be MADV_DONTNEED, which drops the buffer's contents).
+    #[test]
+    fn the_advice_is_the_c_library_s() {
+        assert_eq!(super::MADV_HUGEPAGE, libc::MADV_HUGEPAGE);
     }
 }

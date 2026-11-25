@@ -161,14 +161,17 @@ fn quiet_panics() {
 /// A closed pipe ends the process quietly, as it ends `cat`: `compara head
 /// big.csv | head -1` is not an error. Rust ignores SIGPIPE, so a write to a
 /// closed pipe would fail -- and `println!` would panic -- instead.
+#[cfg(unix)]
+const SIGPIPE: std::ffi::c_int = 13;
+#[cfg(unix)]
+const SIG_DFL: usize = 0;
+
 fn default_sigpipe() {
     #[cfg(unix)]
     {
         unsafe extern "C" {
             fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
         }
-        const SIGPIPE: std::ffi::c_int = 13;
-        const SIG_DFL: usize = 0;
         // SAFETY: restores the default disposition of one signal.
         unsafe {
             signal(SIGPIPE, SIG_DFL);
@@ -1124,4 +1127,17 @@ fn thousands(n: i64) -> String {
         out.push(c);
     }
     if n < 0 { format!("-{out}") } else { out }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    /// The signal and disposition `default_sigpipe` passes are the C
+    /// library's, and its `signal` takes and returns a handler as wide as
+    /// the library's.
+    #[test]
+    fn the_signal_declaration_is_the_c_library_s() {
+        assert_eq!(super::SIGPIPE, libc::SIGPIPE);
+        assert_eq!(super::SIG_DFL, libc::SIG_DFL);
+        assert_eq!(size_of::<usize>(), size_of::<libc::sighandler_t>());
+    }
 }

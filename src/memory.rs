@@ -330,6 +330,19 @@ mod rlimit {
         })?;
         kb.checked_mul(1024)
     }
+
+    /// The declarations the unsafe calls above rest on are the C library's:
+    /// the struct `getrlimit` fills is `struct rlimit`, and the resources are
+    /// its numbers. A wrong one would write past `now` or ask another limit.
+    #[test]
+    fn the_declarations_are_the_c_library_s() {
+        assert_eq!(size_of::<RLimit>(), size_of::<libc::rlimit>());
+        assert_eq!(align_of::<RLimit>(), align_of::<libc::rlimit>());
+        assert_eq!(std::mem::offset_of!(libc::rlimit, rlim_max), 8);
+        assert_eq!(RLIMIT_DATA, libc::RLIMIT_DATA as c_int);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        assert_eq!(RLIMIT_NOFILE, libc::RLIMIT_NOFILE as c_int);
+    }
 }
 
 #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
@@ -492,6 +505,15 @@ mod flush {
             sync_file_range(fd, 0, 0, WAIT_BEFORE | WRITE | WAIT_AFTER);
             posix_fadvise(fd, 0, 0, DONTNEED);
         }
+    }
+
+    /// The flags passed to the unsafe calls above are the C library's.
+    #[test]
+    fn the_flags_are_the_c_library_s() {
+        assert_eq!(WAIT_BEFORE, libc::SYNC_FILE_RANGE_WAIT_BEFORE);
+        assert_eq!(WRITE, libc::SYNC_FILE_RANGE_WRITE);
+        assert_eq!(WAIT_AFTER, libc::SYNC_FILE_RANGE_WAIT_AFTER);
+        assert_eq!(DONTNEED, libc::POSIX_FADV_DONTNEED);
     }
 }
 
