@@ -749,6 +749,10 @@ fn panicked() -> Error {
 }
 
 fn prefetch_slot(slots: &[u32], mask: u64, h: u64) {
+    // The bound the pointer below rests on, checked where tests run with
+    // debug assertions (ci's Linux x86-64 leg): a prefetch shows nothing a
+    // test could see, so no answer would catch it.
+    debug_assert!(((h & mask) as usize) < slots.len());
     #[cfg(target_arch = "x86_64")]
     // Safety: the index is masked into the table's length, so the pointer is in
     // bounds, and a prefetch has no architectural effect in any case.
@@ -1194,6 +1198,10 @@ const BLOCK: usize = 4096;
 ))]
 #[inline(always)]
 fn vector_nonzero(neq: &[u8], at: usize) -> u64 {
+    // No ci job builds for a vector unit, so no test there runs this; built
+    // with `-C target-cpu=x86-64-v3`, the suite does (`scan_mask`'s callers)
+    // and, with debug assertions, checks the bound here.
+    debug_assert!(at + MASK_WIDTH <= neq.len());
     #[cfg(target_feature = "avx512bw")]
     // Safety: the caller has checked `at + 64 <= neq.len()`, and the build
     // targets a CPU with AVX-512BW or this function is not compiled at all.

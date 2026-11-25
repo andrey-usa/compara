@@ -649,6 +649,9 @@ struct Region {
 /// table.
 #[inline]
 fn prefetch_slot(part: &[u32], slot: usize) {
+    // Checked where tests run with debug assertions: a prefetch shows
+    // nothing a test could see.
+    debug_assert!(slot < part.len());
     #[cfg(target_arch = "x86_64")]
     // Safety: the caller masks `slot` into `part`, and a prefetch has no
     // architectural effect in any case.
@@ -1653,6 +1656,9 @@ impl RowIndex {
     /// turns that serial chain of misses into overlapping ones.
     #[inline]
     fn prefetch(&self, hash: u32) {
+        // Checked where tests run with debug assertions: a prefetch shows
+        // nothing a test could see.
+        debug_assert!(self.slot(hash) < self.table.len());
         #[cfg(target_arch = "x86_64")]
         // Safety: `slot` masks into the table's length, so the pointer is in
         // bounds, and a prefetch has no architectural effect in any case.
