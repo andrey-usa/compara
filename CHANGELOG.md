@@ -91,6 +91,9 @@ All notable changes to this project are documented here. The format follows
   could a merge reading back a row longer than the ones before it. Each is
   now asked for with a refusal (exit 2, naming the limit), and the sort
   needs no scratch copy: equal keys are ordered by their place in the file.
+  The batches the sort gives back are let go of before the merge's passes,
+  which had been refused the room they held, and a refusal at the limit is
+  written in room set aside for it, where writing it could abort too.
 - Under `--engine auto`, a CSV pair that does not fit `turbo` falls back to
   `sortmerge` from 24 MB of heap, the least a named `sortmerge` starts with,
   where it was refused below 48 MB.
