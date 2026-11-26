@@ -6,6 +6,30 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Under a heap limit (`ulimit -d`, or a container's), the threads an engine
+  starts for its own work (a lane, a sort, the merge's read-ahead, a Parquet
+  decode) run on smaller stacks, which the limit counts whether or not a
+  thread goes deep into them; a thread that opens an input, which may run a
+  transfer, keeps the runtime's stack. As many threads start as before: what
+  the smaller stacks give back goes to the data.
+
+### Fixed
+
+- `sortmerge` under a heap limit aborted (exit 134, "memory allocation of
+  ... bytes failed") on a file whose keys repeat, under limits it starts
+  under: its list of the most repeated keys copied every key, was sorted
+  whole at each key past `--max-rows`, and built the report's section at
+  the end, none of it asked for with a refusal. The list is now kept only
+  for a report (`-o`), as `turbo` keeps it; without one only the counts are
+  kept. Its room is asked for with a refusal (exit 2, naming the limit, and
+  a lower `--max-rows` as another way out), and a key that would not make
+  the list is turned away without a copy.
+- The refusal of a row the merge's read-ahead has no room for is written in
+  the room set aside for it, as `sortmerge`'s other refusals at the limit
+  are, where formatting it afresh could abort too.
+
 ## [0.9.0] - 2026-11-25
 
 ### Added
