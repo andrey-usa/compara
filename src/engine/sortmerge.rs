@@ -29,7 +29,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, mpsc};
 
-use crate::columns::{compare_keys, differs, resolve};
+use crate::columns::{compare_keys, differs_text, resolve};
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
 use crate::error::{Error, Result};
 use crate::options::Options;
@@ -1395,11 +1395,9 @@ fn merge_join(
     let cap = if opt.row_lists { opt.max_rows } else { 0 };
     // An export's changed rows are written as the merge finds them, so the
     // report's list stays at its cap either way.
-    let mut changed = Capped::new(if exporting { opt.max_rows } else { cap }, false);
-    let mut added = Capped::new(cap, exporting);
-    let mut removed = Capped::new(cap, exporting);
-    let mut changed_a: Vec<Vec<Val>> = Vec::new();
-    let mut changed_b: Vec<Vec<Val>> = Vec::new();
+    let mut changed = Capped::new(if exporting { opt.max_rows } else { cap }, false, CHANGED);
+    let mut added = Capped::new(cap, exporting, ADDED);
+    let mut removed = Capped::new(cap, exporting, REMOVED);
     // The merge visits matched keys in key order, which is the order of the
     // file, so each changed row goes straight to it and is dropped.
     let mut changed_out = match (&opt.export_dir, exporting) {
@@ -1428,12 +1426,12 @@ fn merge_join(
         match order {
             Ordering::Less => {
                 a_keys += 1;
-                removed.push_with(|| to_cells(&ar.row(0)));
+                removed.push_with(|list| list.cells_of(&ar, width))?;
                 skip_key(a, &mut ar, key_size, dup_a)?;
             }
             Ordering::Greater => {
                 b_keys += 1;
-                added.push_with(|| to_cells(&br.row(0)));
+                added.push_with(|list| list.cells_of(&br, width))?;
                 skip_key(b, &mut br, key_size, dup_b)?;
             }
             Ordering::Equal => {
@@ -1441,16 +1439,19 @@ fn merge_join(
                 b_keys += 1;
                 matched += 1;
 
-                let mut cells: Vec<CellDiff> = Vec::new();
+                // Counted from the cells in place: a changed row is copied
+                // only when the report's list holds it.
+                let mut differing = false;
                 for i in 0..nc {
+                    let c = key_size + i;
                     // Equal text is never a difference, with or without a
-                    // tolerance, so only cells that differ as text become values.
-                    if ar.cell_bytes(0, key_size + i) == br.cell_bytes(0, key_size + i) {
+                    // tolerance, so only cells that differ as text are compared
+                    // as values.
+                    if ar.cell_bytes(0, c) == br.cell_bytes(0, c) {
                         continue;
                     }
-                    let (x, y) = (ar.cell(0, key_size + i), br.cell(0, key_size + i));
-                    let (x, y) = (x.map(str::to_string), y.map(str::to_string));
-                    if differs(&x, &y, opt) {
+                    let (x, y) = (ar.cell(0, c), br.cell(0, c));
+                    if differs_text(x, y, opt) {
                         if y.is_none() {
                             blanked_per[i] += 1;
                         }
@@ -1458,39 +1459,22 @@ fn merge_join(
                             filled_per[i] += 1;
                         }
                         changed_per[i] += 1;
-                        cells.push(CellDiff {
-                            column: i,
-                            a: x,
-                            b: y,
-                        });
+                        differing = true;
                     }
                 }
-                if !cells.is_empty() {
-                    let arow = ar.row(0);
+                if differing {
                     if let Some(out) = changed_out.as_mut() {
-                        let brow = br.row(0);
                         let mut record: Vec<&str> = Vec::with_capacity(key_size + 2 * nc);
-                        for v in &arow[..key_size] {
-                            record.push(v.as_deref().unwrap_or(""));
+                        for i in 0..key_size {
+                            record.push(ar.cell(0, i).unwrap_or(""));
                         }
-                        for i in 0..nc {
-                            record.push(arow[key_size + i].as_deref().unwrap_or(""));
-                            record.push(brow[key_size + i].as_deref().unwrap_or(""));
+                        for c in key_size..width {
+                            record.push(ar.cell(0, c).unwrap_or(""));
+                            record.push(br.cell(0, c).unwrap_or(""));
                         }
                         out.write_record(&record)?;
                     }
-                    changed.push_with(|| {
-                        let mut row: Vec<Cell> = arow[..key_size]
-                            .iter()
-                            .map(|v| Cell::Value(v.clone()))
-                            .collect();
-                        row.push(Cell::Diffs(cells));
-                        row
-                    });
-                    if !exporting && opt.row_lists && changed_a.len() <= opt.max_rows {
-                        changed_a.push(arow);
-                        changed_b.push(br.row(0));
-                    }
+                    changed.push_with(|list| list.changed_row(&ar, &br, key_size, opt))?;
                 }
                 skip_key(a, &mut ar, key_size, dup_a)?;
                 skip_key(b, &mut br, key_size, dup_b)?;
@@ -1532,8 +1516,11 @@ fn merge_join(
         changed: changed.held,
         added: added.held,
         removed: removed.held,
-        changed_a,
-        changed_b,
+        // `sections` reads these only for an export, and this engine writes
+        // its export's changed rows itself, as the merge finds them: rows
+        // kept here were copied for nothing.
+        changed_a: Vec::new(),
+        changed_b: Vec::new(),
         changed_written: exporting,
     })
 }
@@ -1572,40 +1559,149 @@ fn skip_key(
     current(c, row)
 }
 
-fn to_cells(row: &[Val]) -> Vec<Cell> {
-    row.iter().map(|v| Cell::Value(v.clone())).collect()
-}
-
 /// A row list that stops growing at the report cap but keeps counting.
 ///
 /// The counts in the contract are always exact and the embedded rows are always
 /// capped, so holding more than the cap only ever serves `--export-dir`. Not
 /// holding them is what lets this engine compare a file far larger than memory.
+///
+/// The list, its rows and their text are asked for with a refusal. Under a heap
+/// limit they were built with ones that abort: a pair whose every key repeats,
+/// with a report, ended in "memory allocation of 1572864 bytes failed" -- the
+/// added rows' list doubling past 32,768 rows -- at `ulimit -d` 10-28 MB.
 struct Capped {
     held: Vec<Vec<Cell>>,
     cap: usize,
     unbounded: bool,
     total: i64,
+    /// What the list is, in a refusal.
+    what: &'static str,
 }
 
+/// The report's row lists, in a refusal. A list held for `--export-dir`
+/// is every row, which `--max-rows` does not shorten.
+const CHANGED: [&str; 2] = [
+    "the report's list of changed rows",
+    "the changed rows for the export",
+];
+const ADDED: [&str; 2] = [
+    "the report's list of added rows",
+    "the added rows for the export",
+];
+const REMOVED: [&str; 2] = [
+    "the report's list of removed rows",
+    "the removed rows for the export",
+];
+const FEWER_ROWS: &str = ", or a lower `--max-rows` lists fewer";
+
 impl Capped {
-    fn new(cap: usize, unbounded: bool) -> Self {
+    fn new(cap: usize, unbounded: bool, what: [&'static str; 2]) -> Self {
         Self {
             held: Vec::new(),
             cap,
             unbounded,
             total: 0,
+            what: what[usize::from(unbounded)],
         }
     }
 
     /// Counts a row, and builds it only if it will be held.
-    fn push_with(&mut self, row: impl FnOnce() -> Vec<Cell>) {
+    fn push_with(&mut self, row: impl FnOnce(&Self) -> Result<Vec<Cell>>) -> Result<()> {
         self.total += 1;
         // One past the cap, so a section can still report that it was truncated.
-        if self.unbounded || self.held.len() <= self.cap {
-            self.held.push(row());
+        if !self.unbounded && self.held.len() > self.cap {
+            return Ok(());
         }
+        if self.held.len() == self.held.capacity() {
+            // Doubling, as `push` would, but never past the cap's one extra
+            // row: a 50,000-row list doubled to 65,536 rows' room.
+            let len = self.held.len();
+            let mut extra = len.max(4);
+            if !self.unbounded {
+                extra = extra.min(self.cap + 1 - len);
+            }
+            self.held
+                .try_reserve_exact(extra)
+                .map_err(|_| self.refusal((len + extra).saturating_mul(size_of::<Vec<Cell>>())))?;
+        }
+        let row = row(self)?;
+        self.held.push(row);
+        Ok(())
     }
+
+    /// The refusal of `bytes` for this list.
+    fn refusal(&self, bytes: usize) -> Error {
+        let or = if self.unbounded { "" } else { FEWER_ROWS };
+        refused_saying(self.what, bytes, "", or)
+    }
+
+    /// A cell's text, copied with this list's refusal.
+    fn text(&self, text: Option<&str>) -> Result<Val> {
+        copied(text, |bytes| self.refusal(bytes))
+    }
+
+    /// A row of `n` cells, asked for with this list's refusal.
+    fn row_of(&self, n: usize) -> Result<Vec<Cell>> {
+        let mut row = Vec::new();
+        row.try_reserve_exact(n)
+            .map_err(|_| self.refusal(n.saturating_mul(size_of::<Cell>())))?;
+        Ok(row)
+    }
+
+    /// The first `n` cells of `row`'s first row: an added or removed row.
+    fn cells_of(&self, row: &Packed, n: usize) -> Result<Vec<Cell>> {
+        let mut cells = self.row_of(n)?;
+        for i in 0..n {
+            cells.push(Cell::Value(self.text(row.cell(0, i))?));
+        }
+        Ok(cells)
+    }
+
+    /// A changed row: the key of `a`'s first row, then the compared cells
+    /// that differ between `a` and `b`, as the merge found them.
+    fn changed_row(
+        &self,
+        a: &Packed,
+        b: &Packed,
+        key_size: usize,
+        opt: &Options,
+    ) -> Result<Vec<Cell>> {
+        let mut row = self.row_of(key_size + 1)?;
+        for i in 0..key_size {
+            row.push(Cell::Value(self.text(a.cell(0, i))?));
+        }
+        let width = a.width();
+        let differ = |c: usize| {
+            a.cell_bytes(0, c) != b.cell_bytes(0, c)
+                && differs_text(a.cell(0, c), b.cell(0, c), opt)
+        };
+        let n = (key_size..width).filter(|&c| differ(c)).count();
+        let mut cells: Vec<CellDiff> = Vec::new();
+        cells
+            .try_reserve_exact(n)
+            .map_err(|_| self.refusal(n.saturating_mul(size_of::<CellDiff>())))?;
+        for c in (key_size..width).filter(|&c| differ(c)) {
+            cells.push(CellDiff {
+                column: c - key_size,
+                a: self.text(a.cell(0, c))?,
+                b: self.text(b.cell(0, c))?,
+            });
+        }
+        row.push(Cell::Diffs(cells));
+        Ok(row)
+    }
+}
+
+/// `text`, copied into a string asked for with `refusal`'s refusal.
+fn copied(text: Option<&str>, refusal: impl FnOnce(usize) -> Error) -> Result<Val> {
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    let mut s = String::new();
+    s.try_reserve_exact(text.len())
+        .map_err(|_| refusal(text.len()))?;
+    s.push_str(text);
+    Ok(Some(s))
 }
 
 /// The duplicate-key report, kept to the top `--max-rows` by count.
@@ -1746,16 +1842,7 @@ impl Dups {
         key.try_reserve_exact(self.key_size)
             .map_err(|_| refusal(self.key_size * size_of::<Val>()))?;
         for i in 0..self.key_size {
-            key.push(match row.cell(0, i) {
-                None => None,
-                Some(text) => {
-                    let mut s = String::new();
-                    s.try_reserve_exact(text.len())
-                        .map_err(|_| refusal(text.len()))?;
-                    s.push_str(text);
-                    Some(s)
-                }
-            });
+            key.push(copied(row.cell(0, i), refusal)?);
         }
         Ok(key)
     }
@@ -1825,7 +1912,7 @@ mod tests {
                 .iter()
                 .take(cap)
                 .map(|(key, count)| {
-                    let mut row = to_cells(key);
+                    let mut row: Vec<Cell> = key.iter().cloned().map(Cell::Value).collect();
                     row.push(Cell::Count(*count));
                     row
                 })
@@ -1843,6 +1930,85 @@ mod tests {
         let section = dups.section().unwrap();
         assert!(section.rows.is_empty() && !section.truncated);
         assert_eq!((dups.keys, dups.rows), (1, 3));
+    }
+
+    /// The report's row lists against what the join built before they were
+    /// copied from the packed rows: every cell decoded into a string, the
+    /// compared cells that differ kept with both sides. Absent and empty
+    /// cells, cells equal as text, and numbers within a tolerance.
+    #[test]
+    fn the_report_rows_are_the_rows_the_cells_give() {
+        let pool = [
+            None,
+            Some(""),
+            Some("1"),
+            Some("1.0"),
+            Some("x"),
+            Some("héllo"),
+        ];
+        for tolerance in [0.0, 0.5] {
+            let opt = Options {
+                tolerance,
+                ..Options::default()
+            };
+            let list = Capped::new(1000, false, CHANGED);
+            let (key_size, width) = (2, 4);
+            for i in 0..pool.len().pow(3) {
+                let pick = |n: usize| pool[(i / pool.len().pow(n as u32)) % pool.len()];
+                let a_cells = [Some("k"), pick(0), pick(1), pick(2)];
+                let b_cells = [Some("k"), pick(0), pick(2), pick(1)];
+                let (mut a, mut b) = (Packed::new(width), Packed::new(width));
+                a.push(a_cells).unwrap();
+                b.push(b_cells).unwrap();
+                let (arow, brow) = (a.row(0), b.row(0));
+
+                let got = list.cells_of(&a, width).unwrap();
+                let want: Vec<Cell> = arow.iter().cloned().map(Cell::Value).collect();
+                assert_eq!(got, want, "row {i}");
+
+                let mut want: Vec<Cell> =
+                    arow[..key_size].iter().cloned().map(Cell::Value).collect();
+                let diffs: Vec<CellDiff> = (key_size..width)
+                    .filter(|&c| crate::columns::differs(&arow[c], &brow[c], &opt))
+                    .map(|c| CellDiff {
+                        column: c - key_size,
+                        a: arow[c].clone(),
+                        b: brow[c].clone(),
+                    })
+                    .collect();
+                want.push(Cell::Diffs(diffs));
+                let got = list.changed_row(&a, &b, key_size, &opt).unwrap();
+                assert_eq!(got, want, "row {i}, tolerance {tolerance}");
+            }
+        }
+    }
+
+    /// A list holds one row past its cap, counts every row, and has asked
+    /// for no more room than the rows it holds; for an export, every row.
+    #[test]
+    fn a_row_list_stops_one_past_its_cap_and_keeps_counting() {
+        let mut row = Packed::new(1);
+        row.push([Some("r")]).unwrap();
+        for cap in [0, 1, 3, 4, 5, 100, 1000] {
+            let mut list = Capped::new(cap, false, ADDED);
+            let mut built = 0;
+            for _ in 0..1500 {
+                list.push_with(|list| {
+                    built += 1;
+                    list.cells_of(&row, 1)
+                })
+                .unwrap();
+            }
+            assert_eq!(list.total, 1500);
+            assert_eq!(list.held.len(), cap + 1, "cap {cap}");
+            assert_eq!(built, cap + 1, "cap {cap}: a row past the list was built");
+            assert_eq!(list.held.capacity(), cap + 1, "cap {cap}");
+        }
+        let mut list = Capped::new(3, true, ADDED);
+        for _ in 0..1500 {
+            list.push_with(|list| list.cells_of(&row, 1)).unwrap();
+        }
+        assert_eq!((list.total, list.held.len()), (1500, 1500));
     }
 
     /// The room the sort asks for a lower-cased row: no character's lower

@@ -247,8 +247,8 @@ pub fn normalise(v: Val, opt: &Options) -> Val {
 /// Deliberately stricter than [`f64::from_str`]: `inf` and `nan` are ordinary
 /// text in a CSV, and treating them as numbers would make two unequal strings
 /// compare equal.
-fn as_number(v: &Val) -> Option<f64> {
-    let s = v.as_deref()?.trim();
+fn as_number(v: Option<&str>) -> Option<f64> {
+    let s = v?.trim();
     if s.is_empty() {
         return None;
     }
@@ -433,6 +433,12 @@ fn digits_in(b: &[u8], r: std::ops::Range<usize>) -> bool {
 ///
 /// Two absent values are equal; one absent value differs from any present one.
 pub fn differs(a: &Val, b: &Val, opt: &Options) -> bool {
+    differs_text(a.as_deref(), b.as_deref(), opt)
+}
+
+/// [`differs`] on borrowed text, for an engine that reads cells in place and
+/// copies only the ones it keeps.
+pub fn differs_text(a: Option<&str>, b: Option<&str>, opt: &Options) -> bool {
     if a.is_none() && b.is_none() {
         return false;
     }
