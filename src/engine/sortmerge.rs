@@ -838,6 +838,16 @@ trait Cursor {
 /// How many rows a cursor running ahead hands over at a time.
 const AHEAD_ROWS: usize = 4096;
 
+/// The most blocks a read-ahead ever has. It makes a block only when none has
+/// come back, and then every other is in the channel to the reader (two) or
+/// with the reader (one): four in all. The channel they come back through has
+/// room for all of them from the start, so giving one back never allocates.
+/// It was a channel that grows, a list of slots asked for as it fills: at a
+/// heap full to the byte -- the report's lists, under a heap limit -- the
+/// reader aborted in giving a block back ("memory allocation of 2736 bytes
+/// failed", the 2M-row pair at 32 and 35 MB with `-o`, 16 threads).
+const AHEAD_BLOCKS: usize = 4;
+
 /// A cursor run on a thread of its own, a block of rows ahead of whoever reads
 /// it, so that both files' merges and the join run at once rather than in turn.
 ///
@@ -851,7 +861,7 @@ const AHEAD_ROWS: usize = 4096;
 struct Ahead {
     blocks: mpsc::Receiver<Result<Packed>>,
     /// Where a block read to its end goes back to be filled again.
-    spent: mpsc::Sender<Packed>,
+    spent: mpsc::SyncSender<Packed>,
     block: Packed,
     at: usize,
 }
@@ -866,7 +876,7 @@ impl Ahead {
         width: usize,
     ) -> Result<Box<dyn Cursor>> {
         let (to_join, blocks) = mpsc::sync_channel(2);
-        let (spent, returned) = mpsc::channel::<Packed>();
+        let (spent, returned) = mpsc::sync_channel::<Packed>(AHEAD_BLOCKS);
         // Handed over through a slot rather than moved: a refused spawn drops
         // its closure, and the cursor must outlive that.
         let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(inner)));
@@ -951,7 +961,12 @@ impl Ahead {
         self.at = 0;
         let done = std::mem::take(&mut self.block);
         if !done.is_empty() {
-            let _ = self.spent.send(done);
+            // Never full (`AHEAD_BLOCKS`); the suites run with debug
+            // assertions check that it is not.
+            if let Err(mpsc::TrySendError::Full(done)) = self.spent.try_send(done) {
+                debug_assert!(false, "more read-ahead blocks than AHEAD_BLOCKS");
+                let _ = self.spent.send(done);
+            }
         }
         if let Ok(block) = self.blocks.recv() {
             self.block = block?;
