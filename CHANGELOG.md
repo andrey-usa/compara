@@ -26,6 +26,16 @@ All notable changes to this project are documented here. The format follows
   kept. Its room is asked for with a refusal (exit 2, naming the limit, and
   a lower `--max-rows` as another way out), and a key that would not make
   the list is turned away without a copy.
+- With a report (`-o`), such a file still aborted under a heap limit, in
+  both engines: `sortmerge` built the report's lists of changed, added and
+  removed rows, and `turbo` kept the repeated keys' values and sorted the
+  report's rows, with allocations that cannot refuse, so `--engine auto`
+  aborted too rather than handing the pair on. They are now asked for with
+  a refusal (exit 2, naming the list and the limit, with a lower
+  `--max-rows` as another way out where it lists fewer), and `sortmerge`
+  copies a changed row only when the report's list holds it. With the heap
+  that full, `sortmerge` could also abort in giving a block of rows back to
+  the merge's read-ahead; that no longer allocates.
 - The refusal of a row the merge's read-ahead has no room for is written in
   the room set aside for it, as `sortmerge`'s other refusals at the limit
   are, where formatting it afresh could abort too.
