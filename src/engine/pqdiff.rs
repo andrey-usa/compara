@@ -1198,9 +1198,9 @@ const BLOCK: usize = 4096;
 ))]
 #[inline(always)]
 fn vector_nonzero(neq: &[u8], at: usize) -> u64 {
-    // No ci job builds for a vector unit, so no test there runs this; built
-    // with `-C target-cpu=x86-64-v3`, the suite does (`scan_mask`'s callers)
-    // and, with debug assertions, checks the bound here.
+    // Only a build for a vector unit compiles this: ci's x86-64-v3 step on
+    // the Linux x86-64 leg, where debug assertions check the bound here and
+    // `scan_mask`'s tests read against an unreadable page.
     debug_assert!(at + MASK_WIDTH <= neq.len());
     #[cfg(target_feature = "avx512bw")]
     // Safety: the caller has checked `at + 64 <= neq.len()`, and the build
@@ -2456,6 +2456,118 @@ mod tests {
                 let longer = [p.as_slice(), b"a"].concat();
                 assert!(!bytes_eq(&p, &longer));
             }
+        }
+    }
+
+    /// Where `neq` holds a byte that is not zero, a byte at a time.
+    fn nonzero_at(neq: &[u8], base: usize) -> Vec<usize> {
+        (0..neq.len())
+            .filter(|&i| neq[i] != 0)
+            .map(|i| base + i)
+            .collect()
+    }
+
+    fn scanned(neq: &[u8], base: usize) -> Vec<usize> {
+        let mut hits = Vec::new();
+        scan_mask(neq, base, |p| hits.push(p));
+        hits
+    }
+
+    /// The mismatch scan reports every byte that is not zero, once and in
+    /// order, as a walk a byte at a time does: at every length up to four of
+    /// the widest register and past it, with one changed cell in every
+    /// position, and at densities from none to all. The bytes end where an
+    /// unreadable page begins, so a register read past them faults. A build
+    /// for a vector unit (`-C target-cpu=x86-64-v3` or `-v4`) runs
+    /// `vector_nonzero` here; a baseline build, the eight-byte and byte loops.
+    #[test]
+    fn scan_mask_finds_what_a_walk_a_byte_at_a_time_finds() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let base = 3 * BLOCK + 5;
+        for n in (0..=4 * 64 + 9).chain([BLOCK - 1, BLOCK]) {
+            let mut g = crate::guarded::Guarded::ending(&vec![0u8; n]);
+            assert!(scanned(&g, base).is_empty(), "length {n}, all zero");
+            // One changed cell in each position, of each kind of byte: the
+            // AVX2 mask is the sign bit of a compare, so a byte with its own
+            // top bit set is a case of its own.
+            for at in 0..n {
+                for v in [1u8, 0x7f, 0x80, 0xff] {
+                    g.as_mut()[at] = v;
+                    assert_eq!(scanned(&g, base), [base + at], "length {n}, {v:#x} at {at}");
+                }
+                g.as_mut()[at] = 0;
+            }
+            g.as_mut().fill(1);
+            assert_eq!(
+                scanned(&g, base),
+                nonzero_at(&g, base),
+                "length {n}, all set"
+            );
+            for one_in in [2u64, 7, 64, 300] {
+                for b in g.as_mut().iter_mut() {
+                    let r = next();
+                    *b = if r.is_multiple_of(one_in) {
+                        (r >> 32) as u8 | 1
+                    } else {
+                        0
+                    };
+                }
+                assert_eq!(
+                    scanned(&g, base),
+                    nonzero_at(&g, base),
+                    "length {n}, one in {one_in}: {:?}",
+                    &g[..]
+                );
+            }
+        }
+    }
+
+    /// The register the scan reads gives bit `j` for byte `at + j` not being
+    /// zero: at every offset of the bytes, the last flush against an
+    /// unreadable page, and for every byte value in every lane.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_feature = "avx2", target_feature = "avx512bw")
+    ))]
+    #[test]
+    fn vector_nonzero_is_the_mask_a_byte_at_a_time() {
+        let mask = |neq: &[u8], at: usize| -> u64 {
+            (0..MASK_WIDTH)
+                .filter(|&j| neq[at + j] != 0)
+                .fold(0, |m, j| m | 1 << j)
+        };
+        let n = 3 * MASK_WIDTH + 7;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let bytes: Vec<u8> = (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                if seed.is_multiple_of(3) {
+                    (seed >> 40) as u8
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let g = crate::guarded::Guarded::ending(&bytes);
+        for at in 0..=n - MASK_WIDTH {
+            assert_eq!(vector_nonzero(&g, at), mask(&g, at), "at {at}");
+        }
+        let mut g = crate::guarded::Guarded::ending(&[0u8; MASK_WIDTH]);
+        assert_eq!(vector_nonzero(&g, 0), 0);
+        for lane in 0..MASK_WIDTH {
+            for v in 1..=255u8 {
+                g.as_mut()[lane] = v;
+                assert_eq!(vector_nonzero(&g, 0), 1 << lane, "{v:#x} in lane {lane}");
+            }
+            g.as_mut()[lane] = 0;
         }
     }
 }
