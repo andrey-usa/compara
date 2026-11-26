@@ -63,9 +63,11 @@ jobs:
         with:
           cache-on-failure: false
           # The keys from before cache-on-failure may hold that partial build.
-          # The Linux x86-64 build has debug assertions (below): a key of its
-          # own, so neither build is restored for the other.
-          cache-key: whole${{ matrix.os == 'ubuntu-24.04' && '-debug-assertions' || '' }}
+          # The Linux x86-64 build has debug assertions and a second build for
+          # x86-64-v3 (below): a key of its own, so neither is restored for
+          # the other, and a key that is saved with both builds in it (a key
+          # restored whole is not saved again).
+          cache-key: whole${{ matrix.os == 'ubuntu-24.04' && '-debug-assertions-x86-64-v3' || '' }}
       - run: cargo test --locked --profile ci
         env:
           # The `ci` profile inherits release, which compiles `debug_assert!`
@@ -77,6 +79,30 @@ jobs:
           # the scans' tests on bytes against an unreadable page, which
           # fault on an over-read with or without them.
           CARGO_PROFILE_CI_DEBUG_ASSERTIONS: ${{ matrix.os == 'ubuntu-24.04' }}
+      # A build for x86-64-v3 compiles the vector scans inline where the
+      # build above asks the CPU at run time, and pqdiff's mismatch scan
+      # (`vector_nonzero`) only there: no other build runs it. The suite
+      # again, built so, with debug assertions on. `--target` puts it in a
+      # directory of its own and keeps the flag off the build scripts and
+      # proc macros. The flag goes in RUSTFLAGS, with the -D warnings that
+      # setup-rust-toolchain puts there: cargo reads RUSTFLAGS, when it is
+      # set, in place of CARGO_TARGET_<triple>_RUSTFLAGS, not beside it.
+      - name: cargo test, built for x86-64-v3
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          /lib64/ld-linux-x86-64.so.2 --help | grep -q 'x86-64-v3 (supported' || {
+            echo "::error::this runner's CPU is not x86-64-v3 (AVX2, BMI2, FMA, ...): a build for it cannot run here; move this step to a runner that is"
+            exit 1
+          }
+          t=(--locked --profile ci --target x86_64-unknown-linux-gnu)
+          cargo test "${t[@]}"
+          cargo test "${t[@]}" --lib -- --list | grep -q '^engine::pqdiff::tests::vector_nonzero_is_the_mask_a_byte_at_a_time: test$' || {
+            echo "::error::the build for x86-64-v3 has no vector_nonzero test: the cfg on it no longer matches this build"
+            exit 1
+          }
+        env:
+          CARGO_PROFILE_CI_DEBUG_ASSERTIONS: true
+          RUSTFLAGS: -D warnings -C target-cpu=x86-64-v3
 
   # A small end-to-end run: generate a pair, compare it with every engine,
   # require identical counts and column statistics, and check the report
