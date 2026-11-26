@@ -1312,13 +1312,8 @@ impl RowIndex {
                             if self.keep_dup_keys {
                                 // A key that does not decode is left to the
                                 // section, which reports it.
-                                let values: Option<Vec<Val>> = probe[..key_size]
-                                    .iter()
-                                    .map(|f| {
-                                        value_checked(&side.slab, *f, opt, "a duplicated key").ok()
-                                    })
-                                    .collect();
-                                if let Some(values) = values {
+                                if let Some(values) = dup_values(side, &probe[..key_size], opt)? {
+                                    alloc::map_room(&mut self.dup_key_values, 1, DUP_VALUES)?;
                                     self.dup_key_values.insert(key as u32, values);
                                 }
                             }
@@ -1489,6 +1484,11 @@ impl RowIndex {
             for (row, n) in region.counts {
                 occurrences[position(row as usize)] = n;
             }
+            alloc::map_room(
+                &mut self.dup_key_values,
+                region.dup_values.len(),
+                DUP_VALUES,
+            )?;
             for (row, values) in region.dup_values {
                 self.dup_key_values
                     .insert(position(row as usize) as u32, values);
@@ -1614,12 +1614,8 @@ impl RowIndex {
         }
         for candidate in repeated {
             side.keys_at(self.row_at[candidate], key_size, &mut probe);
-            let values: Option<Vec<Val>> = probe[..key_size]
-                .iter()
-                .map(|f| value_checked(&side.slab, *f, opt, "a duplicated key").ok())
-                .collect();
-            if let Some(values) = values {
-                out.dup_values.push((candidate as i32, values));
+            if let Some(values) = dup_values(side, &probe[..key_size], opt)? {
+                alloc::push(&mut out.dup_values, (candidate as i32, values), DUP_VALUES)?;
             }
         }
         Ok(out)
@@ -3512,9 +3508,9 @@ fn join_tail(
         map_rows(keep_changed, threads, "a changed row", changed_of)?
     };
     phases.mark("  row values (par)");
-    sort_rows(&mut removed_rows, key_size);
-    sort_rows(&mut added_rows, key_size);
-    changed_rows.sort_by(|x, y| compare_keys(&x.0, &y.0, key_size));
+    sort_rows(&mut removed_rows, |r| r, key_size);
+    sort_rows(&mut added_rows, |r| r, key_size);
+    sort_rows(&mut changed_rows, |r| &r.0, key_size);
 
     phases.mark("  sorts (serial)");
     let mut changed_cells: Vec<Vec<Cell>> = alloc::sized(changed_rows.len(), "the changed rows")?;
@@ -4222,6 +4218,9 @@ fn compare_fused(
         stop.store(true, Ordering::Relaxed);
         built
     })?;
+    // B's decoded repeated keys go to its duplicate section, which reads
+    // them while the join still holds B's index.
+    let b_decoded = std::mem::take(&mut bi.dup_key_values);
     let mut fused = fused_join(&a, &b, &bi, opt, nc, total)?;
 
     let mut phases = Phases::new("");
@@ -4298,8 +4297,11 @@ fn compare_fused(
 
     let (dup_a, dup_b) = if opt.row_lists {
         (
-            duplicate_section(&a, &fused.ai, opt)?,
-            duplicate_section(&b, &bi, opt)?,
+            {
+                let decoded = std::mem::take(&mut fused.ai.dup_key_values);
+                duplicate_section(&a, &fused.ai, decoded, opt)?
+            },
+            duplicate_section(&b, &bi, b_decoded, opt)?,
         )
     } else {
         (empty_section(opt), empty_section(opt))
@@ -4315,8 +4317,56 @@ fn compare_fused(
     out
 }
 
-fn sort_rows(rows: &mut [Vec<Val>], key_size: usize) {
-    rows.sort_by(|x, y| compare_keys(x, y, key_size));
+/// Sorts a report's rows by key: see [`sort_distinct`].
+fn sort_rows<T>(rows: &mut [T], key: impl Fn(&T) -> &[Val], key_size: usize) {
+    sort_distinct(rows, |x, y| compare_keys(key(x), key(y), key_size));
+}
+
+/// Sorts `rows`, no two of which compare equal (each is a distinct key), so
+/// a stable and an unstable sort put them in the same order.
+///
+/// The stable sort asks for a scratch copy with no refusal: with a report,
+/// under a heap limit, it was what `turbo` aborted on ("memory allocation of
+/// ... bytes failed", the 200k-row pair at 20-22 MB). The unstable one asks
+/// for nothing, but does not take the runs that rows in a file's order come
+/// in: on a pair whose keys all repeat it cost 9% more instructions. So rows
+/// already in order are left as they are; otherwise the room the stable
+/// sort's copy takes is asked for first, with `try_reserve`, and given back
+/// for it, in a phase where no other thread is asking for any; and only
+/// without that room are the rows sorted in place, unstably.
+fn sort_distinct<T>(rows: &mut [T], cmp: impl Fn(&T, &T) -> std::cmp::Ordering) {
+    if rows.is_sorted_by(|x, y| cmp(x, y).is_lt()) {
+        return;
+    }
+    // What the standard library's stable sort takes: half the rows, or all of
+    // them up to 8 MB, and at least a small sort's worth.
+    let n = rows.len();
+    let full = (8_000_000 / size_of::<T>().max(1)).min(n);
+    let scratch = (n - n / 2).max(full).saturating_add(64);
+    let mut room: Vec<T> = Vec::new();
+    if room.try_reserve_exact(scratch).is_ok() {
+        drop(room);
+        rows.sort_by(cmp);
+    } else {
+        rows.sort_unstable_by(cmp);
+    }
+}
+
+/// What a repeated key's values are, in a refusal.
+const DUP_VALUES: &str = "a duplicated key's values";
+
+/// A repeated key's values, decoded from its fields into room asked for
+/// with a refusal; `None` for a key that does not decode, which is left to
+/// the section to report.
+fn dup_values(side: &Side, fields: &[Field], opt: &Options) -> Result<Option<Vec<Val>>> {
+    let mut values: Vec<Val> = alloc::sized(fields.len(), DUP_VALUES)?;
+    for f in fields {
+        match value_checked(&side.slab, *f, opt, "a duplicated key") {
+            Ok(v) => values.push(v),
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(Some(values))
 }
 
 /// The duplicate-key section a `--summary` run reports instead of building one.
@@ -4330,20 +4380,29 @@ fn empty_section(opt: &Options) -> Section {
 }
 
 /// The duplicate-key section: most duplicated first, then by key.
-fn duplicate_section(side: &Side, idx: &RowIndex, opt: &Options) -> Result<Section> {
+///
+/// `decoded` is the index's `dup_key_values`, taken out of it: they are moved
+/// into the section, not copied, since nothing reads them after it.
+fn duplicate_section(
+    side: &Side,
+    idx: &RowIndex,
+    mut decoded: HashMap<u32, Vec<Val>>,
+    opt: &Options,
+) -> Result<Section> {
     let key_size = opt.key.len();
     let mut entries: Vec<(Vec<Val>, i64)> = Vec::new();
     for (at, (row, n)) in idx.first_row.iter().zip(&idx.occurrences).enumerate() {
         if *n <= 1 {
             continue;
         }
-        let key = match idx.dup_key_values.get(&(at as u32)) {
-            Some(values) => values.clone(),
+        let key = match decoded.remove(&(at as u32)) {
+            Some(values) => values,
             None => key_values(side, idx, *row, opt)?,
         };
         alloc::push(&mut entries, (key, *n as i64), "a duplicated key")?;
     }
-    entries.sort_by(|x, y| {
+    // Keys are distinct, so the order is total.
+    sort_distinct(&mut entries, |x, y| {
         y.1.cmp(&x.1)
             .then_with(|| compare_keys(&x.0, &y.0, key_size))
     });
@@ -4801,8 +4860,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     // walks every duplicated key to decode one row for each of them.
     let (dup_a, dup_b) = if opt.row_lists {
         (
-            duplicate_section(&a, &ai, opt)?,
-            duplicate_section(&b, &bi, opt)?,
+            {
+                let decoded = std::mem::take(&mut ai.dup_key_values);
+                duplicate_section(&a, &ai, decoded, opt)?
+            },
+            {
+                let decoded = std::mem::take(&mut bi.dup_key_values);
+                duplicate_section(&b, &bi, decoded, opt)?
+            },
         )
     } else {
         (empty_section(opt), empty_section(opt))
@@ -5470,5 +5535,45 @@ mod append_tests {
         let room = full.capacity() - full.len();
         assert!(append_in_parallel(&mut full, vec![vec![0; room], vec![1]]).is_err());
         assert_eq!(full, [7]);
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+
+    /// Distinct keys come out in the order the stable sort gives, whichever
+    /// way they are sorted: in order already, in runs, reversed, shuffled.
+    #[test]
+    fn distinct_rows_sort_as_the_stable_sort_sorts_them() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for n in [0, 1, 2, 19, 21, 100, 5000] {
+            // In a file's order: runs, k1 to k9, then k10 to k99, ...
+            let runs: Vec<Vec<Val>> = (0..n).map(|i| vec![Some(format!("k{i}"))]).collect();
+            let mut sorted = runs.clone();
+            sorted.sort_by(|x, y| compare_keys(x, y, 1));
+            let mut shuffled = sorted.clone();
+            for i in (1..shuffled.len()).rev() {
+                shuffled.swap(i, (next() % (i as u64 + 1)) as usize);
+            }
+            let mut reversed = sorted.clone();
+            reversed.reverse();
+            for rows in [runs, sorted, shuffled, reversed] {
+                let mut want = rows.clone();
+                want.sort_by(|x, y| compare_keys(x, y, 1));
+                let mut got = rows.clone();
+                sort_rows(&mut got, |r| r, 1);
+                assert_eq!(got, want, "{n} rows");
+                let mut unstable = rows;
+                unstable.sort_unstable_by(|x, y| compare_keys(x, y, 1));
+                assert_eq!(unstable, want, "{n} rows, unstable");
+            }
+        }
     }
 }
